@@ -32,8 +32,9 @@ jobs:
         run: |
           mkdir -p /tmp/shipped
           git archive HEAD src | tar -x -C /tmp/shipped
-          uv run --with-editable . chamber scan /tmp/shipped/src
-          status=$?
+          # `|| status=$?` keeps the step's `set -e` from aborting on the
+          # tool's own non-zero exit (1 = FLAG is acceptable here).
+          uv run --with-editable . chamber scan /tmp/shipped/src && status=0 || status=$?
           if [ "$status" -ge 2 ]; then
             echo "::error::chamber scan reported FAIL on its own shipped source"
             exit 1
