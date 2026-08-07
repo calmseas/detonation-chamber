@@ -495,8 +495,14 @@ def check_encoded_blobs(path: str, text: str) -> list[Finding]:
 
 # --- R5: homoglyphs -----------------------------------------------------------
 
-# Scripts whose letters include ASCII look-alikes.
-_CONFUSABLE_SCRIPTS = ("LATIN", "CYRILLIC", "GREEK", "ARMENIAN")
+# Scripts treated as ASCII-confusable for the mixed-script rule. Cyrillic is the
+# reliable homoglyph vector -- it carries a full set of Latin look-alikes
+# (а е о р с х у і ѕ). Greek is deliberately EXCLUDED: its letters are
+# overwhelmingly maths symbols (π θ ζ ω Σ Γ) that resemble no ASCII letter, so
+# including it flagged every equation. The handful of genuinely-confusable Greek
+# letters (ο ρ ν) need a real Unicode confusables table -- a roadmap item -- not
+# a blanket script match that cries wolf on maths.
+_CONFUSABLE_SCRIPTS = ("LATIN", "CYRILLIC", "ARMENIAN")
 
 # Blocks whose whole purpose is styled Latin/digits -- a token drawn from these
 # reads as ASCII but is not ASCII (mathematical alphanumerics, fullwidth forms).
@@ -514,38 +520,42 @@ def _script(ch: str) -> str | None:
     return None
 
 
-def _confusable_with_ascii(ch: str) -> bool:
-    """A character that a reader would take for an ASCII letter but that is not
-    ASCII: a non-Latin confusable-script letter, or a styled-Latin look-alike."""
-    cp = ord(ch)
-    if cp < 0x80:
-        return False
-    if _in_ranges(cp, _STYLED_LATIN):
-        return True
-    s = _script(ch)
-    return s is not None and s != "LATIN"
-
-
 def check_mixed_script(path: str, text: str) -> list[Finding]:
-    """Homoglyph spoofing, in three forms the model resolves differently from
-    a human eye:
+    """Homoglyph spoofing, in the two forms with a clean discriminator:
 
-    - MIXED-script word: `cliеnt` with one Cyrillic е.
-    - WHOLE-token substitution: an all-Cyrillic word that looks entirely Latin
-      (`ѕtѕ_clients`). R5 used to miss this because the word was single-script.
-    - STYLED-Latin: mathematical or fullwidth look-alikes of ASCII letters.
+    - MIXED-script word: a look-alike substituted INTO an ASCII-shaped word,
+      `cliеnt` with one Cyrillic е, or `ѕtg_clients` with a Cyrillic ѕ. Requires
+      at least two ASCII letters in the token -- a lone Greek ζ or π used as a
+      maths symbol shares a "word" with parens and digits but is content, not a
+      spoof, and must not flag.
+    - STYLED-Latin token: built from the Mathematical Alphanumeric or Fullwidth
+      blocks, which exist ONLY as ASCII-letter look-alikes (`𝖼𝗅𝗂𝖾𝗇𝗍` reads
+      "client"). These ranges are specific and unambiguous, so this fires
+      regardless of the surrounding script mix.
 
-    The whole-token cases only signal in a predominantly-ASCII document -- a
-    genuine Russian or Greek artefact is not spoofing anything, so we do not
-    alarm on it.
+    Deliberately NOT attempted here: treating every non-Latin letter as an ASCII
+    confusable. Greek ζ and Cyrillic ж resemble no ASCII letter, and a blanket
+    rule false-positives on genuine maths and Russian. A full Unicode
+    confusables table is the roadmap item; until then this covers the reliable
+    cases and defers the rest rather than crying wolf.
     """
-    ascii_letters = sum(1 for c in text if c.isascii() and c.isalpha())
-    nonascii_letters = sum(1 for c in text if not c.isascii() and c.isalpha())
-    predominantly_ascii = ascii_letters >= 3 * max(nonascii_letters, 1)
-
     findings = []
     for n, raw in enumerate(text.splitlines(), 1):
+        flagged = False
         for word in re.findall(r"\S+", raw):
+            # Styled-Latin: any character from a look-alike-only block spoofs.
+            if any(_in_ranges(ord(c), _STYLED_LATIN) for c in word):
+                findings.append(Finding(
+                    "R5.homoglyph", FLAG, path, line=n,
+                    detail="token uses mathematical/fullwidth look-alikes of ASCII letters — "
+                           "reads as ASCII but compares unequal to the name it imitates",
+                    evidence=_escape(word, 40),
+                ))
+                flagged = True
+                break
+            # Mixed-script: needs an ASCII-shaped host word to be spoofing one.
+            if sum(1 for c in word if c.isascii() and c.isalpha()) < 2:
+                continue
             scripts = {s for s in (_script(c) for c in word) if s}
             if len(scripts) > 1:
                 findings.append(Finding(
@@ -554,20 +564,10 @@ def check_mixed_script(path: str, text: str) -> list[Finding]:
                            "read identically and compare unequal",
                     evidence=_escape(word, 40),
                 ))
+                flagged = True
                 break
-            # Whole-token / styled-Latin substitution: every non-ASCII letter in
-            # the word is an ASCII look-alike, and there is at least one.
-            letters = [c for c in word if c.isalpha()]
-            if (predominantly_ascii and letters
-                    and any(not c.isascii() for c in letters)
-                    and all(c.isascii() or _confusable_with_ascii(c) for c in letters)):
-                findings.append(Finding(
-                    "R5.homoglyph", FLAG, path, line=n,
-                    detail="token reads as ASCII but is built from look-alike characters — "
-                           "it compares unequal to the name it imitates",
-                    evidence=_escape(word, 40),
-                ))
-                break
+        if flagged:
+            continue  # one homoglyph finding per line is signal enough
     return findings
 
 

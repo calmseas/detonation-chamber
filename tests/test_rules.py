@@ -396,3 +396,9 @@ def test_adjacent_styled_emoji_do_not_fail():
     findings = [f for f in check_characters("SKILL.md", "✅️❌️ done")
                 if f.severity == FAIL]
     assert findings == [], "adjacent styled emoji must not FAIL"
+
+
+def test_mathematical_greek_does_not_flag_as_homoglyph():
+    """Greek letters used as maths symbols are content, not spoofing."""
+    maths = "Let ζ(s) = Σ 1/n^s, with ω and Γ analytic on the strip.\n"
+    assert check_mixed_script("SKILL.md", maths) == []
