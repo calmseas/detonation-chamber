@@ -1,0 +1,41 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uv run --python ${{ matrix.python }} --with-editable . --with pytest pytest -q
+
+  # The tool must survive being pointed at itself. A legibility checker that
+  # cannot pass its own check has no business gating anyone else's artefacts.
+  dogfood:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - name: chamber scan its own shipped source
+        # Scan the git-archived form -- exactly what ships, with none of the
+        # .pyc build artefacts `uv run` generates in the working tree (a
+        # committed .pyc correctly FAILs, so scanning the dirty tree is wrong).
+        # FLAG (exit 1) is acceptable: rules.py exceeds the review window and
+        # carries a deliberate Cyrillic homoglyph documenting the R5 attack.
+        run: |
+          mkdir -p /tmp/shipped
+          git archive HEAD src | tar -x -C /tmp/shipped
+          uv run --with-editable . chamber scan /tmp/shipped/src
+          status=$?
+          if [ "$status" -ge 2 ]; then
+            echo "::error::chamber scan reported FAIL on its own shipped source"
+            exit 1
+          fi
+          echo "chamber scan: exit $status (0=pass, 1=flag, both acceptable)"
