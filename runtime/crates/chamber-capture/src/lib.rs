@@ -29,8 +29,10 @@
 
 pub mod canary;
 pub mod dns;
+pub mod proxy;
 pub mod recorder;
 
 pub use canary::{Canary, CanarySet};
 pub use dns::DnsSink;
+pub use proxy::InterceptingProxy;
 pub use recorder::Recorder;

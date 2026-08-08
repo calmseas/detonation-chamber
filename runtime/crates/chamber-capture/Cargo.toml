@@ -13,6 +13,13 @@ percent-encoding = "2"
 hex = "0.4"
 hickory-server = "0.26"
 hickory-proto = "0.26"
-tokio = { version = "1", features = ["rt", "net", "macros", "time"] }
+tokio = { version = "1", features = ["rt", "net", "macros", "time", "rt-multi-thread"] }
 chamber-deadline = { version = "0.1.0", path = "../chamber-deadline" }
 async-trait = "0.1.92"
+hudsucker = "0.25"
+rcgen = "0.14"
+tokio-rustls = "0.26.4"
+rustls = "0.23.43"
+http-body-util = "0.1.4"
+hyper = "1.11.0"
+sha2 = "0.11.0"
