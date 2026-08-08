@@ -11,3 +11,8 @@ chamber-evidence = { path = "../chamber-evidence" }
 data-encoding = "2"
 percent-encoding = "2"
 hex = "0.4"
+hickory-server = "0.26"
+hickory-proto = "0.26"
+tokio = { version = "1", features = ["rt", "net", "macros", "time"] }
+chamber-deadline = { version = "0.1.0", path = "../chamber-deadline" }
+async-trait = "0.1.92"

@@ -175,6 +175,50 @@ impl CanarySet {
         hits
     }
 
+    /// Search a DNS name, honouring the case-insensitivity of DNS itself.
+    ///
+    /// This is not a convenience. A resolver is free to alter the case of a
+    /// name — many deliberately do — and an attacker can simply send the token
+    /// lower-cased, since `AKIA….evil.example` and `akia….evil.example`
+    /// resolve identically. A case-sensitive scan therefore misses DNS
+    /// exfiltration outright, which is exactly the channel most worth
+    /// catching, because it needs no reply to succeed.
+    ///
+    /// Only the forms that survive case-folding are matched loosely: the raw
+    /// token and the label-joined token, plus hex, which is already searched in
+    /// both cases. Base64 and percent-encoding stay case-sensitive — folding
+    /// them would compare strings that are not the same bytes, and an attacker
+    /// cannot use them through a case-insensitive channel anyway.
+    pub fn scan_dns_name(&self, name: &str) -> Vec<CanaryHit> {
+        let folded = name.to_ascii_lowercase();
+        let mut hits = self.scan(HitField::QName, name.as_bytes());
+
+        for canary in &self.canaries {
+            if hits.iter().any(|h| h.label == canary.label) {
+                continue; // already found in its exact form
+            }
+
+            let token = canary.token.to_ascii_lowercase();
+            if let Some(offset) = find(folded.as_bytes(), token.as_bytes()) {
+                hits.push(CanaryHit {
+                    label: canary.label.clone(),
+                    field: HitField::QName,
+                    encoding: HitEncoding::Raw,
+                    offset: offset as u64,
+                });
+            } else if let Some(offset) = find_across_labels(folded.as_bytes(), token.as_bytes()) {
+                hits.push(CanaryHit {
+                    label: canary.label.clone(),
+                    field: HitField::QName,
+                    encoding: HitEncoding::LabelJoin,
+                    offset: offset as u64,
+                });
+            }
+        }
+
+        hits
+    }
+
     /// Did anything match, without building the hit records?
     pub fn matches(&self, haystack: &[u8]) -> bool {
         !self.scan(HitField::Body, haystack).is_empty()
@@ -421,6 +465,47 @@ mod tests {
         let hits = set().scan(HitField::Sni, format!("{TOKEN}.evil.example").as_bytes());
         assert!(hits.iter().any(|h| h.encoding == HitEncoding::Raw));
         assert!(!hits.iter().any(|h| h.encoding == HitEncoding::LabelJoin));
+    }
+
+    /// DNS is case-insensitive, so an attacker can send the token folded and a
+    /// resolver may fold it regardless. A case-sensitive scan misses the one
+    /// channel that needs no reply to succeed.
+    #[test]
+    fn a_dns_name_matches_regardless_of_case() {
+        let lowered = format!("{}.attacker.example.", TOKEN.to_ascii_lowercase());
+        let hits = set().scan_dns_name(&lowered);
+        assert!(
+            hits.iter().any(|h| h.encoding == HitEncoding::Raw),
+            "lower-cased token in a DNS name missed: {hits:?}"
+        );
+
+        // And the same when split across labels.
+        let split = "akiaiosf.odnn7exa.mple.attacker.example.";
+        let hits = set().scan_dns_name(split);
+        assert!(
+            hits.iter().any(|h| h.encoding == HitEncoding::LabelJoin),
+            "lower-cased label-joined token missed: {hits:?}"
+        );
+    }
+
+    /// Case-folding must not turn one leak into two findings.
+    #[test]
+    fn an_exact_case_dns_name_is_reported_once() {
+        let exact = format!("{TOKEN}.attacker.example.");
+        let hits = set().scan_dns_name(&exact);
+        assert_eq!(
+            hits.iter().filter(|h| h.label == "aws-key").count(),
+            1,
+            "one token in one name is one finding: {hits:?}"
+        );
+    }
+
+    /// The loose match is confined to DNS. An HTTP body is case-sensitive
+    /// bytes and must not be folded.
+    #[test]
+    fn a_body_scan_stays_case_sensitive() {
+        let lowered = TOKEN.to_ascii_lowercase();
+        assert!(set().scan(HitField::Body, lowered.as_bytes()).is_empty());
     }
 
     #[test]

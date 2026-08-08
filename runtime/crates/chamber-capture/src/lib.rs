@@ -28,5 +28,9 @@
 //!    a working egress path.
 
 pub mod canary;
+pub mod dns;
+pub mod recorder;
 
 pub use canary::{Canary, CanarySet};
+pub use dns::DnsSink;
+pub use recorder::Recorder;
