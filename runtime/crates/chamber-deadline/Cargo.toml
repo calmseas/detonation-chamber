@@ -1,0 +1,13 @@
+[package]
+name = "chamber-deadline"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The wind-down window for a detonation run: one deadline, an ordered stage sequence, and a trace the caller keeps."
+
+[dependencies]
+tokio = { version = "1", features = ["time"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["time", "macros", "rt", "test-util"] }
