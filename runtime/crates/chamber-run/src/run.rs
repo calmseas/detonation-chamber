@@ -338,7 +338,14 @@ pub async fn run_detonation(
             }
         },
         || async {
-            let (state, log) = bundle::inspect_ledger(&ledger_path).map_err(|e| e.to_string())?;
+            let (state, mut log) =
+                bundle::inspect_ledger(&ledger_path).map_err(|e| e.to_string())?;
+            // The agent's own actions, folded in beside what the observer saw:
+            // the liveness witness and matrix row 3 read these from the sealed
+            // bundle. Redacted against the canary values so a hard-coded token
+            // could never ride into the artefact.
+            let secrets: Vec<String> = plan.canaries.iter().map(|c| c.value.clone()).collect();
+            bundle::record_guest_commands(&mut log, &transcript, &secrets);
             let observed = Observed {
                 boundary: state,
                 drops_collected: true,

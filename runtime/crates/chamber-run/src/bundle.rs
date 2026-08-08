@@ -36,11 +36,11 @@ use std::path::{Path, PathBuf};
 
 use chamber_capture::read_ledger;
 use chamber_evidence::{
-    Channel, ChannelCoverage, CoverageGap, CoverageMap, GapCause, RunEnding, RunLog, RunSecret,
-    Verdict, seal_run,
+    Channel, ChannelCoverage, CoverageGap, CoverageMap, GapCause, ObservationKind, RunEnding,
+    RunLog, RunSecret, Verdict, seal_run,
 };
 
-use crate::turns::TurnProvenance;
+use crate::turns::{Transcript, TurnDirective, TurnProvenance};
 
 /// What became of the observer's ledger.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -223,6 +223,64 @@ pub fn inspect_ledger(path: &Path) -> Result<(BoundaryState, RunLog), EmitError>
         BoundaryState::Sealed
     };
     Ok((state, RunLog::adopt(file.observations().to_vec())))
+}
+
+/// Folds the agent's own actions into the ledger the bundle seals.
+///
+/// The observer records what crossed the boundary; these are what the agent
+/// *did* inside the cell — the turns it took, recorded on
+/// [`Channel::GuestCommand`]. That channel bears no verdict (reading a
+/// credential inside the sealed guest is a read, not a departure), so nothing
+/// here can move the outcome; it can only witness that the agent was alive.
+/// The plan's liveness witness and matrix row 3 read these back from the
+/// sealed bundle rather than from a value the writer still held in memory.
+///
+/// Appended after the observer's entries, continuing the same ordinal counter,
+/// so the ledger stays contiguous from zero and [`chamber_evidence::open`]
+/// accepts it. [`TurnDirective::Conclude`] is not a command and is skipped —
+/// counting it as one would make every run report a guest command it never ran.
+///
+/// `argv_redacted` scrubs any canary **value** that appears in an argument: a
+/// script that hard-coded the token instead of referencing `$VAR` would
+/// otherwise write it into the bundle, and the artefact must never carry the
+/// thing it watches for. The scripts this ships with reference the variable, so
+/// the scrub is a no-op in practice and load-bearing in principle.
+pub fn record_guest_commands(log: &mut RunLog, transcript: &Transcript, secrets: &[String]) {
+    for (turn, record) in transcript.entries().iter().enumerate() {
+        let argv = match &record.directive {
+            TurnDirective::RunCommand { argv } => argv.clone(),
+            // Recorded as the command that actually ran, not the directive that
+            // asked for it: the bridge carries a read out as `cat`, and the
+            // ledger's account must match what happened in the cell.
+            TurnDirective::ReadFile { at } => vec!["cat".to_owned(), at.display().to_string()],
+            TurnDirective::Conclude => continue,
+        };
+        let argv_redacted = argv
+            .into_iter()
+            .map(|arg| redact_secrets(arg, secrets))
+            .collect();
+        // A directive that never produced an exit (the cell could not be
+        // driven) is recorded as -1 rather than dropped: a turn that failed to
+        // run is itself evidence, and it is not a successful command.
+        let exit = record.exit_code.unwrap_or(-1);
+        log.note(
+            turn as u64,
+            Channel::GuestCommand,
+            ObservationKind::GuestCommand {
+                argv_redacted,
+                exit,
+            },
+            vec![],
+        );
+    }
+}
+
+/// Replaces any canary value found inside an argument with a marker.
+fn redact_secrets(arg: String, secrets: &[String]) -> String {
+    secrets
+        .iter()
+        .filter(|s| !s.is_empty())
+        .fold(arg, |acc, s| acc.replace(s.as_str(), "<redacted>"))
 }
 
 /// Writes `bundle.json` and `bundle.sig` into `dir`.
@@ -446,5 +504,182 @@ mod tests {
         let opened = chamber_evidence::open(&bytes, &seal).expect("the bundle must open");
         assert_eq!(opened.verdict, emitted.verdict);
         assert!(opened.gaps.iter().any(|g| g.id == "gap.scripted-turns"));
+    }
+
+    // --- recording guest commands into the ledger -------------------------
+
+    use crate::turns::{TurnDirective, TurnRecord};
+    use std::path::PathBuf;
+
+    fn ran(argv: &[&str], exit: i32) -> TurnRecord {
+        TurnRecord {
+            directive: TurnDirective::RunCommand {
+                argv: argv.iter().map(|s| (*s).to_owned()).collect(),
+            },
+            exit_code: Some(exit),
+            output_len: 0,
+        }
+    }
+
+    fn transcript_of(records: Vec<TurnRecord>) -> Transcript {
+        let mut t = Transcript::new();
+        for r in records {
+            t.record(r);
+        }
+        t
+    }
+
+    fn guest_argv(obs: &chamber_evidence::Observation) -> &[String] {
+        match obs.kind() {
+            ObservationKind::GuestCommand { argv_redacted, .. } => argv_redacted,
+            other => panic!("expected a guest command, got {other:?}"),
+        }
+    }
+
+    /// Guest commands land on their own channel, after the observer's entries,
+    /// and the ledger stays a contiguous run from zero — the property
+    /// [`chamber_evidence::open`] refuses a bundle for lacking.
+    #[test]
+    fn guest_commands_append_contiguously_after_the_network_ledger() {
+        let mut log = RunLog::open();
+        // One thing the observer saw, at ordinal 0.
+        log.note(
+            10,
+            Channel::NetworkEgress,
+            ObservationKind::GuestCommand {
+                argv_redacted: vec![],
+                exit: 0,
+            },
+            vec![],
+        );
+        let before = log.len();
+
+        record_guest_commands(
+            &mut log,
+            &transcript_of(vec![
+                ran(&["echo", "one"], 0),
+                ran(&["echo", "two"], 0),
+                TurnRecord {
+                    directive: TurnDirective::Conclude,
+                    exit_code: Some(0),
+                    output_len: 0,
+                },
+            ]),
+            &[],
+        );
+
+        assert_eq!(log.len(), before + 2, "conclude was counted as a command");
+        let ids: Vec<u64> = log.entries().iter().map(|o| o.id().0).collect();
+        assert_eq!(ids, vec![0, 1, 2], "ordinals are not contiguous from zero");
+        for obs in &log.entries()[before..] {
+            assert_eq!(obs.channel(), Channel::GuestCommand);
+            assert!(!obs.is_witness(), "a guest command became a witness");
+        }
+    }
+
+    /// A read is recorded as the `cat` that actually ran in the cell, not as
+    /// the directive that asked for it — row 3 reads this back to prove the
+    /// canary-bearing file was opened without anything crossing the boundary.
+    #[test]
+    fn a_read_file_is_recorded_as_the_cat_that_ran() {
+        let mut log = RunLog::open();
+        let mut t = Transcript::new();
+        t.record(TurnRecord {
+            directive: TurnDirective::ReadFile {
+                at: PathBuf::from("/proc/self/environ"),
+            },
+            exit_code: Some(0),
+            output_len: 512,
+        });
+        record_guest_commands(&mut log, &t, &[]);
+
+        assert_eq!(log.len(), 1);
+        assert_eq!(guest_argv(&log.entries()[0]), ["cat", "/proc/self/environ"]);
+    }
+
+    /// The artefact must never carry the token it watches for. A script that
+    /// hard-coded the canary as an argument is scrubbed before it reaches the
+    /// ledger — the scripts that ship reference `$VAR`, so this is the guard
+    /// behind the matrix's "no raw canary anywhere" assertion.
+    #[test]
+    fn a_canary_value_in_an_argv_is_scrubbed() {
+        const SECRET: &str = "AKIAIOSFODNN7EXAMPLE";
+        let mut log = RunLog::open();
+        record_guest_commands(
+            &mut log,
+            &transcript_of(vec![ran(&["sh", "-c", &format!("echo {SECRET}")], 0)]),
+            &[SECRET.to_owned()],
+        );
+
+        let argv = guest_argv(&log.entries()[0]);
+        assert!(
+            argv.iter().all(|a| !a.contains(SECRET)),
+            "the raw canary survived redaction: {argv:?}"
+        );
+        assert!(argv.iter().any(|a| a.contains("<redacted>")));
+    }
+
+    /// A turn that could not be driven is recorded, not dropped, and is not a
+    /// successful command: a run's failures are themselves evidence.
+    #[test]
+    fn a_turn_without_an_exit_is_recorded_as_minus_one() {
+        let mut log = RunLog::open();
+        record_guest_commands(
+            &mut log,
+            &transcript_of(vec![TurnRecord {
+                directive: TurnDirective::RunCommand {
+                    argv: vec!["false".into()],
+                },
+                exit_code: None,
+                output_len: 0,
+            }]),
+            &[],
+        );
+        match log.entries()[0].kind() {
+            ObservationKind::GuestCommand { exit, .. } => assert_eq!(*exit, -1),
+            other => panic!("expected a guest command, got {other:?}"),
+        }
+    }
+
+    /// Recorded guest commands survive the round-trip into a sealed bundle and
+    /// read back on their own channel, without moving a verdict that has no
+    /// network witness.
+    #[test]
+    fn recorded_guest_commands_survive_into_the_sealed_bundle() {
+        let dir = std::env::temp_dir().join(format!("chamber-guest-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch");
+
+        let mut log = RunLog::adopt(Vec::new());
+        record_guest_commands(
+            &mut log,
+            &transcript_of(vec![ran(&["cat", "/proc/self/environ"], 0)]),
+            &[],
+        );
+
+        let emitted = emit(
+            &dir,
+            log,
+            &Observed {
+                boundary: BoundaryState::Sealed,
+                drops_collected: true,
+                turns_driven: 1,
+            },
+            &TurnProvenance::Scripted {
+                path: "t.json".into(),
+                digest: "abc".into(),
+            },
+        )
+        .expect("emit");
+
+        let bytes = std::fs::read(&emitted.bundle_path).expect("read bundle");
+        let seal: chamber_evidence::BundleSeal =
+            serde_json::from_slice(&std::fs::read(&emitted.seal_path).expect("read seal"))
+                .expect("parse seal");
+        let opened = chamber_evidence::open(&bytes, &seal).expect("the bundle must open");
+
+        assert_eq!(opened.ledger.observations_on(Channel::GuestCommand), 1);
+        assert_eq!(opened.verdict, Verdict::NoFinding);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
