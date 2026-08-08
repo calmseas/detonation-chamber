@@ -238,6 +238,30 @@ impl RunLog {
         &self.entries
     }
 
+    /// Rebuild a log from observations recorded in another process.
+    ///
+    /// The observer runs in a container and appends its observations to a file;
+    /// the host reads that file back and seals a bundle from it. This is that
+    /// step, and it is the one place ordinals arrive from outside rather than
+    /// being assigned by [`RunLog::note`].
+    ///
+    /// That reads like a hole in the "the caller does not choose the ordinal"
+    /// rule, so it is worth being exact about why it is not a *new* one. The
+    /// ledger crosses a process boundary as a file, so its contents were always
+    /// something the host accepts from elsewhere — [`Ledger`] derives
+    /// `Deserialize` for exactly that reason, and this constructor only makes
+    /// the step legible instead of a JSON round-trip. What defends the result
+    /// is downstream and unchanged: [`crate::open`] re-derives the verdict and
+    /// refuses a ledger whose ordinals are not contiguous from zero. Hand this
+    /// fabricated entries and you get a bundle saying precisely what those
+    /// entries support — which is what `gap.ledger-integrity` declares in every
+    /// bundle already: Slice 0 is not tamper-proof.
+    #[must_use]
+    pub fn adopt(entries: Vec<Observation>) -> Self {
+        let next = entries.len() as u64;
+        Self { entries, next }
+    }
+
     /// Freeze the log. Consumes `self`.
     pub(crate) fn into_ledger(self) -> Ledger {
         Ledger {

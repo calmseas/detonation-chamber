@@ -285,6 +285,7 @@ impl Warden {
             dns: vec![NetFabric::CAPTURE_IP.to_owned()],
             read_only: false,
             tmpfs: vec![],
+            volumes: vec![],
         })?;
         container.start()?;
         Ok(Self { container })

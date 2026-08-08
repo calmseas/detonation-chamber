@@ -407,6 +407,17 @@ pub struct ContainerSpec {
     pub dns: Vec<String>,
     /// `--read-only`, making the container's own rootfs immutable.
     pub read_only: bool,
+    /// Host bind mounts, as `host:container[:opts]`.
+    ///
+    /// **Never for the agent cell.** [`AgentCell`](crate::AgentCell) does not
+    /// set this and must not: a mount hands the artefact a handle on host
+    /// state, which is the thing the chamber exists to prevent.
+    ///
+    /// It exists for the *observer*, whose ledger has to outlive the chamber.
+    /// The wind-down tears containers down before it records the run, so
+    /// evidence living only inside a container would be destroyed a stage
+    /// before the bundle that reports it is written.
+    pub volumes: Vec<String>,
     /// Anonymous in-memory filesystems, as `--tmpfs <path>`.
     ///
     /// Not a bind mount and deliberately not one: a tmpfs gives the container
@@ -563,6 +574,10 @@ impl Container {
         for mount in &spec.tmpfs {
             argv.push("--tmpfs".into());
             argv.push(mount.clone());
+        }
+        for bind in &spec.volumes {
+            argv.push("--volume".into());
+            argv.push(bind.clone());
         }
         match &spec.attach {
             Attach::Network { network, ip } => {

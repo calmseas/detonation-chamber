@@ -112,6 +112,9 @@ impl AgentCell {
                 .map(|root| root.display().to_string())
                 .into_iter()
                 .collect(),
+            // Empty, and there is no code path that fills it. A mount here
+            // would hand the artefact a handle on host state.
+            volumes: vec![],
         })?;
         container.start()?;
 

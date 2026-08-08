@@ -141,6 +141,7 @@ impl Preflight {
             dns: vec![],
             read_only: false,
             tmpfs: vec![],
+            volumes: vec![],
         })?;
         container.start()?;
         container.wait(INSPECT_WINDOW)?;
@@ -168,6 +169,7 @@ impl Preflight {
             dns: vec![],
             read_only: false,
             tmpfs: vec![],
+            volumes: vec![],
         })?;
         container.start()?;
         container.wait(INSPECT_WINDOW)?;

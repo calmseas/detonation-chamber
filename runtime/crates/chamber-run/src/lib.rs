@@ -12,7 +12,10 @@
 //!   regardless of which of them failed.
 //! - [`exit_code_for`] — the mapping from verdict to process exit status.
 //!
-//! The turn driver, the tool bridge and bundle emission are not built yet.
+//! - [`bridge`] — carrying a turn out inside the cell.
+//! - [`bundle`] — coverage, gaps and the sealed artefact.
+//!
+//! `run_detonation` and the `chamber-detonate` binary are not built yet.
 //!
 //! # What this crate must never do
 //!
@@ -33,9 +36,13 @@
 //!   a model is a test that costs money and fails for reasons unrelated to the
 //!   code under test.
 
+pub mod bridge;
+pub mod bundle;
 pub mod turns;
 pub mod winddown;
 
+pub use bridge::{ToolBridge, TurnTarget};
+pub use bundle::{BoundaryState, Emitted, Observed, emit};
 pub use turns::{
     ScriptedTurns, Transcript, TurnDirective, TurnError, TurnProvenance, TurnRecord, TurnSource,
 };

@@ -254,6 +254,7 @@ fn containment_probe_is_capable_of_succeeding_when_unarmed() {
         dns: vec![],
         read_only: false,
         tmpfs: vec![],
+        volumes: vec![],
     })
     .expect("create the sink");
     sink.start().expect("start the sink");
@@ -292,6 +293,7 @@ fn containment_probe_is_capable_of_succeeding_when_unarmed() {
         dns: vec!["10.77.0.50".into()],
         read_only: false,
         tmpfs: vec![],
+        volumes: vec![],
     })
     .expect("create the probe");
     probe.start().expect("start the probe");
@@ -462,6 +464,7 @@ fn the_armed_chamber_blocks_and_records_what_the_baseline_reached() {
         dns: vec![],
         read_only: false,
         tmpfs: vec![],
+        volumes: vec![],
     })
     .expect("create the probe cell");
     cell.start().expect("start the probe cell");
@@ -769,6 +772,7 @@ fn the_observer_refuses_the_proxied_request_and_answers_every_name() {
         dns: vec![],
         read_only: false,
         tmpfs: vec!["/evidence".into()],
+        volumes: vec![],
     })
     .expect("create the observer");
     capture.start().expect("start the observer");
