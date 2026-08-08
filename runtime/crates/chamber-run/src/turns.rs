@@ -133,6 +133,21 @@ pub enum TurnError {
     ScriptExhausted {
         taken: usize,
     },
+    /// A live run reached one of the bounds it was armed with.
+    ///
+    /// Not a failure. It is the run being stopped where it was told to stop,
+    /// and — like exhaustion above — it ends the turns without ending the
+    /// evidence: the wind-down still runs and the bundle is still sealed.
+    BoundReached {
+        /// Which bound, for a reader who needs to know whether to raise the
+        /// cap or fix a loop.
+        bound: &'static str,
+        detail: String,
+    },
+    /// The model produced no choice.
+    ModelFailed {
+        detail: String,
+    },
 }
 
 impl std::fmt::Display for TurnError {
@@ -152,6 +167,12 @@ impl std::fmt::Display for TurnError {
                 "the turn script ran out after {taken} turn(s) without concluding; \
                  the run would be shorter than the script's author intended"
             ),
+            Self::BoundReached { bound, detail } => write!(
+                f,
+                "the live run reached its {bound} bound ({detail}); it stops here \
+                 and seals what it has"
+            ),
+            Self::ModelFailed { detail } => write!(f, "{detail}"),
         }
     }
 }
