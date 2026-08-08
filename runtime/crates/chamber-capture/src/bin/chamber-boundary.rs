@@ -48,6 +48,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chamber_capture::{Canary, CanarySet, DnsSink, InterceptingProxy, LedgerWriter, Recorder};
+use chamber_evidence::{CanaryHit, HitField};
 use hickory_server::Server;
 use hudsucker::Proxy;
 use hudsucker::certificate_authority::RcgenAuthority;
@@ -103,6 +104,43 @@ fn canaries_from_env() -> Vec<Canary> {
         .into_iter()
         .map(|(label, value)| Canary::new(label, value))
         .collect()
+}
+
+/// The synthetic token the boundary plants in its own self-test. Deliberately
+/// not a real credential shape, and never placed in a cell, so a hit on it can
+/// only ever come from the self-test itself.
+const SELFTEST_PROBE: &str = "CHAMBER-SELFTEST-CANARY-DO-NOT-PLANT";
+
+/// Runs the matcher over a synthetic token in every field a real one could
+/// leave by, returning the number of checks that passed or the first that did
+/// not. Exercises the real [`CanarySet`], not a stand-in.
+fn run_selftest(matcher: &CanarySet, probe: &str) -> Result<usize, String> {
+    let checks: [(&str, Vec<CanaryHit>); 4] = [
+        ("body", matcher.scan(HitField::Body, probe.as_bytes())),
+        (
+            "url",
+            matcher.scan(HitField::Target, format!("/x?d={probe}").as_bytes()),
+        ),
+        ("header", matcher.scan(HitField::Header, probe.as_bytes())),
+        ("sni", matcher.scan_sni(&format!("{probe}.exfil.example"))),
+    ];
+    for (field, hits) in &checks {
+        if hits.is_empty() {
+            return Err(format!("the matcher missed the token in a {field}"));
+        }
+    }
+    Ok(checks.len())
+}
+
+/// Proves the canary matcher is live before the run begins.
+///
+/// A matcher that has silently broken reports every real run as no finding — a
+/// false clean, the worst outcome this tool has. So the observer feeds its own
+/// matcher a synthetic token and a boundary whose self-test fails refuses to
+/// start rather than watch a run it cannot see.
+fn self_test() -> Result<usize, String> {
+    let matcher = CanarySet::new(vec![Canary::new("selftest", SELFTEST_PROBE)]);
+    run_selftest(&matcher, SELFTEST_PROBE)
 }
 
 /// A per-run certificate authority.
@@ -165,6 +203,24 @@ async fn main() -> ExitCode {
         );
         return ExitCode::FAILURE;
     }
+
+    // Before anything is watched, prove the thing doing the watching works. A
+    // matcher that has silently broken would pass the whole run as no finding;
+    // catching that here makes it a refusal to arm rather than a false clean.
+    match self_test() {
+        Ok(n) => say(&format!(
+            "chamber-boundary: matcher self-test passed ({n} checks)"
+        )),
+        Err(e) => {
+            eprintln!(
+                "chamber-boundary: matcher self-test FAILED: {e}. Refusing to start, \
+                 because a matcher that misses a synthetic token would miss a real one \
+                 and report the run as no finding."
+            );
+            return ExitCode::FAILURE;
+        }
+    }
+
     // Owned, so reporting the labels does not keep the set borrowed past the
     // point it is handed to the observers.
     let labels: Vec<String> = canaries.iter().map(|c| c.label().to_owned()).collect();
@@ -322,5 +378,30 @@ async fn wait_for_shutdown() {
     #[cfg(not(unix))]
     {
         let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_self_test_passes_with_a_working_matcher() {
+        assert_eq!(
+            self_test().expect("a real matcher must pass its own self-test"),
+            4
+        );
+    }
+
+    /// The self-test earns its place only if it fails when the matcher would
+    /// miss. A matcher that catches nothing is exactly the silent break the
+    /// startup gate exists to turn into a refusal rather than a false clean.
+    #[test]
+    fn the_self_test_fails_when_the_matcher_finds_nothing() {
+        let blind = CanarySet::new(vec![]);
+        assert!(
+            run_selftest(&blind, SELFTEST_PROBE).is_err(),
+            "a matcher that catches nothing passed the self-test"
+        );
     }
 }
