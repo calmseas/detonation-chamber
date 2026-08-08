@@ -18,7 +18,9 @@ pub mod seal;
 pub mod verdict;
 
 pub use bundle::{DecodeRefusal, OpenedBundle, RunEnding, SCHEMA, SealedBundle, open, seal_run};
-pub use coverage::{Channel, ChannelCoverage, CoverageGap, CoverageMap, GapCause};
+pub use coverage::{
+    Channel, ChannelCoverage, CoverageDefect, CoverageGap, CoverageMap, GapCause, RawCoverageMap,
+};
 pub use ledger::{
     CanaryHit, CapturedBody, Digest32, HitEncoding, HitField, Ledger, Observation, ObservationKind,
     Ordinal, RunLog,

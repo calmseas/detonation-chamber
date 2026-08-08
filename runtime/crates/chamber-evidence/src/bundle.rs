@@ -14,10 +14,28 @@
 //! - A bundle carrying a **weaker** claim is corrected **upward**, and the
 //!   discrepancy is reported. Deleting the accusation from the file must not
 //!   delete it from the answer.
+//!
+//! # A sealed bundle is sensitive, and this crate cannot make it otherwise
+//!
+//! A bundle retains captured requests in full — that is what makes a finding
+//! checkable rather than asserted. So a bundle that caught an exfiltration
+//! **contains the exfiltrated material**, in URLs, headers, hostnames and
+//! bodies. Treat one as you would treat the guest it came from.
+//!
+//! Redaction is not this crate's job and cannot be. [`crate::CanaryHit`] carries
+//! a label, a field, an encoding and an offset — never the bytes — and
+//! [`seal_run`] receives an already-populated log, so nothing here ever learns
+//! what a label expands to. **The capture layer must redact before it records.**
+//!
+//! Nor should sealing scrub the retained capture afterwards: the verdict trusts
+//! the hit records rather than re-scanning bodies, so the retained request is
+//! the only means by which a third party can check that a hit was not
+//! fabricated. Blanking it would leave the offsets pointing at nothing and make
+//! the bundle unfalsifiable.
 
 use serde::{Deserialize, Serialize};
 
-use crate::coverage::{Channel, CoverageGap, CoverageMap};
+use crate::coverage::{Channel, CoverageDefect, CoverageGap, CoverageMap, RawCoverageMap};
 use crate::ledger::{Ledger, Ordinal, RunLog};
 use crate::seal::{BundleSeal, RunKeyId, RunSecret, SealError, verify_sealed_bundle};
 use crate::verdict::{self, Verdict};
@@ -66,7 +84,9 @@ struct WireBundle {
     schema: String,
     run: RunKeyId,
     ending: RunEnding,
-    coverage: CoverageMap,
+    /// Unchecked on the way in — see [`RawCoverageMap`]. Serialises identically
+    /// to a real [`CoverageMap`], so the canonical round-trip is unaffected.
+    coverage: RawCoverageMap,
     gaps: Vec<CoverageGap>,
     ledger: Ledger,
     verdict: Verdict,
@@ -159,6 +179,11 @@ pub enum DecodeRefusal {
     CoverageIncomplete {
         missing: Vec<Channel>,
     },
+    /// A channel appears more than once, so a lookup could contradict the
+    /// verdict sitting beside it.
+    CoverageDuplicated {
+        channel: Channel,
+    },
     /// The ordinals are not a contiguous run from zero.
     LedgerNotContiguous,
     /// A witness names an entry that is not in the ledger.
@@ -185,6 +210,13 @@ impl core::fmt::Display for DecodeRefusal {
             }
             Self::CoverageIncomplete { missing } => {
                 write!(f, "coverage map omits {} channel(s)", missing.len())
+            }
+            Self::CoverageDuplicated { channel } => {
+                write!(
+                    f,
+                    "coverage map lists {} more than once",
+                    channel.wire_tag()
+                )
             }
             Self::LedgerNotContiguous => {
                 f.write_str("ledger ordinals are not contiguous from zero")
@@ -228,16 +260,16 @@ pub fn open(bytes: &[u8], seal: &BundleSeal) -> Result<OpenedBundle, DecodeRefus
         return Err(DecodeRefusal::NotCanonical);
     }
 
-    let missing = wire.coverage.missing_channels();
-    if !missing.is_empty() {
-        return Err(DecodeRefusal::CoverageIncomplete { missing });
-    }
+    let coverage = wire.coverage.validate().map_err(|d| match d {
+        CoverageDefect::Missing(missing) => DecodeRefusal::CoverageIncomplete { missing },
+        CoverageDefect::Duplicated(channel) => DecodeRefusal::CoverageDuplicated { channel },
+    })?;
 
     if !wire.ledger.is_contiguous() {
         return Err(DecodeRefusal::LedgerNotContiguous);
     }
 
-    let derived = verdict::derive(&wire.ledger, &wire.coverage);
+    let derived = verdict::derive(&wire.ledger, &coverage);
 
     if let Verdict::Detonated { witnesses } = &derived {
         for w in witnesses {
@@ -262,7 +294,7 @@ pub fn open(bytes: &[u8], seal: &BundleSeal) -> Result<OpenedBundle, DecodeRefus
     Ok(OpenedBundle {
         run: wire.run,
         ending: wire.ending,
-        coverage: wire.coverage,
+        coverage,
         gaps: wire.gaps,
         ledger: wire.ledger,
         verdict: derived,
@@ -338,16 +370,41 @@ mod tests {
         assert!(matches!(opened.verdict, Verdict::Detonated { .. }));
     }
 
+    /// Edit a field while keeping the bytes valid JSON in canonical field
+    /// order, so the change reaches the signature check instead of dying at the
+    /// parser.
+    ///
+    /// This is the crate's trust anchor and it must be pinned from the
+    /// *untrusted-input* path, not only from `seal.rs`. An earlier version of
+    /// this test flipped a byte near the end of the bundle — which is
+    /// deterministically the `]` of the witness list, so it always failed at
+    /// `serde_json::from_slice` and never reached `verify_sealed_bundle` at
+    /// all. Deleting the seal check outright left the whole suite green.
     #[test]
-    fn a_flipped_byte_is_rejected() {
+    fn a_tampered_field_is_refused_by_the_seal() {
+        let (bundle, seal) = sealed_with_hit();
+        let text = String::from_utf8(bundle.to_canonical_bytes()).unwrap();
+        // Same length, still valid JSON, still canonical order.
+        let tampered = text.replace("collector.example", "collector.examp1e");
+        assert_ne!(tampered, text, "the fixture must actually contain the host");
+
+        assert_eq!(
+            open(tampered.as_bytes(), &seal),
+            Err(DecodeRefusal::Seal(SealError::SignatureRejected))
+        );
+    }
+
+    /// The other half of the split: malformed bytes fail as malformed, and the
+    /// two refusals stay distinguishable.
+    #[test]
+    fn a_truncated_bundle_is_not_json() {
         let (bundle, seal) = sealed_with_hit();
         let mut bytes = bundle.to_canonical_bytes();
-        let last = bytes.len() - 3;
-        bytes[last] ^= 0x20;
+        bytes.truncate(bytes.len() - 4);
 
         assert!(matches!(
             open(&bytes, &seal),
-            Err(DecodeRefusal::NotJson(_)) | Err(DecodeRefusal::Seal(_))
+            Err(DecodeRefusal::NotJson(_))
         ));
     }
 
@@ -358,20 +415,36 @@ mod tests {
     /// the result is refused as non-canonical before the verdict is ever
     /// compared, and the test would pass for a reason other than the one it
     /// names. Building the wire type directly is what makes these tests bite.
-    fn forge_verdict(bundle: &SealedBundle, verdict: Verdict) -> (Vec<u8>, BundleSeal) {
-        let secret = RunSecret::mint().unwrap();
-        let wire = WireBundle {
+    fn wire_of(bundle: &SealedBundle) -> WireBundle {
+        // Round-tripping the coverage map is how a `CoverageMap` becomes the
+        // unchecked wire form; it is exactly what real bytes go through.
+        let coverage: RawCoverageMap =
+            serde_json::from_str(&serde_json::to_string(&bundle.coverage).unwrap()).unwrap();
+        WireBundle {
             schema: bundle.schema.to_owned(),
-            run: secret.key_id().clone(),
+            run: bundle.run.clone(),
             ending: bundle.ending,
-            coverage: bundle.coverage.clone(),
+            coverage,
             gaps: bundle.gaps.clone(),
             ledger: bundle.ledger.clone(),
-            verdict,
-        };
+            verdict: bundle.verdict.clone(),
+        }
+    }
+
+    /// Sign an edited wire bundle with a key the forger holds, so the signature
+    /// is never what rejects it.
+    fn reseal(mut wire: WireBundle) -> (Vec<u8>, BundleSeal) {
+        let secret = RunSecret::mint().unwrap();
+        wire.run = secret.key_id().clone();
         let bytes = serde_json::to_vec(&wire).unwrap();
         let seal = secret.seal(&bytes);
         (bytes, seal)
+    }
+
+    fn forge_verdict(bundle: &SealedBundle, verdict: Verdict) -> (Vec<u8>, BundleSeal) {
+        let mut wire = wire_of(bundle);
+        wire.verdict = verdict;
+        reseal(wire)
     }
 
     /// The forgery is well-formed, canonical, and correctly signed by a key the
@@ -538,14 +611,117 @@ mod tests {
         ));
     }
 
-    /// The bundle must not become a second copy of the secret it caught.
+    /// A hit record names the planted token by label and never reproduces it.
+    ///
+    /// Note carefully what this does **not** say. The surrounding observation
+    /// absolutely can carry the token — that is the whole point of capturing a
+    /// request — and this test plants one in a body, a URL, a header and a
+    /// hostname to prove the `CanaryHit` stays clean while they do not. See the
+    /// module note on redaction.
     #[test]
-    fn the_bundle_never_carries_the_token_itself() {
-        let (bundle, _) = sealed_with_hit();
-        let text = String::from_utf8(bundle.to_canonical_bytes()).unwrap();
-        assert!(text.contains("aws-key"), "the label is recorded");
-        // Only the label and the position; the crate has no field that could
-        // hold the token's value.
-        assert!(!text.contains("AKIA"));
+    fn the_hit_record_names_the_label_not_the_token() {
+        const TOKEN: &str = "AKIAIOSFODNN7EXAMPLE";
+
+        let mut log = RunLog::open();
+        log.note(
+            10,
+            Channel::NetworkEgress,
+            ObservationKind::HttpExchange {
+                method: "POST".into(),
+                authority: format!("{TOKEN}.collector.example"),
+                sni: Some("collector.example".into()),
+                target: format!("/ingest?k={TOKEN}"),
+                headers: vec![("x-data".into(), TOKEN.into())],
+                body: CapturedBody::Whole {
+                    bytes: format!("key={TOKEN}").into_bytes(),
+                },
+            },
+            vec![hit()],
+        );
+        let (bundle, _) = seal_run(
+            log,
+            RunEnding::Completed,
+            all_watched(),
+            vec![],
+            RunSecret::mint().unwrap(),
+        );
+
+        let hits = serde_json::to_string(bundle.ledger().entries()[0].canary_hits()).unwrap();
+        assert!(hits.contains("aws-key"), "the label is recorded");
+
+        // The hit record must not carry the token in ANY form the matcher can
+        // report. Checking only the plaintext would be blind to the body, which
+        // goes out hex-encoded.
+        for (name, form) in [
+            ("raw", TOKEN.to_owned()),
+            ("hex", hex::encode(TOKEN)),
+            ("percent", TOKEN.replace('7', "%37")),
+        ] {
+            assert!(
+                !hits.contains(&form),
+                "hit record leaked the token in {name} form: {hits}"
+            );
+        }
+    }
+
+    /// A hole in the sequence means an entry was removed. Refused.
+    #[test]
+    fn a_ledger_with_a_hole_is_refused() {
+        let (bundle, _) = sealed_clean();
+        let mut wire = wire_of(&bundle);
+
+        // Renumber the only entry so the run no longer starts at zero.
+        let text = serde_json::to_string(&wire.ledger)
+            .unwrap()
+            .replace("\"id\":0", "\"id\":2");
+        wire.ledger = serde_json::from_str(&text).unwrap();
+
+        let (bytes, seal) = reseal(wire);
+        assert_eq!(open(&bytes, &seal), Err(DecodeRefusal::LedgerNotContiguous));
+    }
+
+    /// Silence is not coverage: an omitted channel would otherwise read as
+    /// watched.
+    #[test]
+    fn a_coverage_map_with_a_channel_removed_is_refused() {
+        let (bundle, _) = sealed_clean();
+        let mut wire = wire_of(&bundle);
+
+        let mut value: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&wire.coverage).unwrap()).unwrap();
+        value["entries"].as_array_mut().unwrap().pop();
+        wire.coverage = serde_json::from_value(value).unwrap();
+
+        let (bytes, seal) = reseal(wire);
+        assert_eq!(
+            open(&bytes, &seal),
+            Err(DecodeRefusal::CoverageIncomplete {
+                missing: vec![Channel::GuestCommand]
+            })
+        );
+    }
+
+    /// A duplicated channel could report as watched while the verdict beside it
+    /// named that same channel blind.
+    #[test]
+    fn a_coverage_map_naming_a_channel_twice_is_refused() {
+        let (bundle, _) = sealed_clean();
+        let mut wire = wire_of(&bundle);
+
+        let mut value: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&wire.coverage).unwrap()).unwrap();
+        value["entries"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!([Channel::NetworkEgress, {"state": "watched"}]));
+        wire.coverage = serde_json::from_value(value).unwrap();
+
+        let (bytes, seal) = reseal(wire);
+        assert_eq!(
+            open(&bytes, &seal),
+            Err(DecodeRefusal::CoverageDuplicated {
+                channel: Channel::NetworkEgress
+            })
+        );
     }
 }

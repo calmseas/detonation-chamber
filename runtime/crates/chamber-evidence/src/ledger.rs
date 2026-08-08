@@ -91,9 +91,12 @@ pub enum HitEncoding {
 
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub struct CanaryHit {
-    /// Which planted token, by label. Never the token itself — the bundle is
-    /// shared, and a bundle that carries the secret it caught leaving is a
-    /// second copy of the leak.
+    /// Which planted token, by label — never the token itself.
+    ///
+    /// This is a statement about the hit *record*, not about the bundle. The
+    /// observation this hit points into may well contain the token, since a
+    /// captured request is retained in full. See the redaction note on
+    /// [`crate::bundle`].
     pub label: String,
     pub field: HitField,
     pub encoding: HitEncoding,

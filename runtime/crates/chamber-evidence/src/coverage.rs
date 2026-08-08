@@ -121,13 +121,66 @@ pub struct CoverageGap {
 }
 
 /// The coverage of every channel, total by construction.
-#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+///
+/// Serialisable but deliberately **not** deserialisable. A derived
+/// `Deserialize` would accept any list at all — including an empty one, or one
+/// naming a channel twice — and every claim below about totality would be false
+/// for maps that arrived from outside. Untrusted bytes come in as
+/// [`RawCoverageMap`] and must pass [`RawCoverageMap::validate`] first.
+#[derive(Clone, PartialEq, Eq, Debug, Serialize)]
 pub struct CoverageMap {
     entries: Vec<(Channel, ChannelCoverage)>,
 }
 
+/// A coverage map as it arrives from untrusted bytes, before checking.
+///
+/// Serialises byte-identically to [`CoverageMap`], so routing a bundle through
+/// it does not disturb the canonical form that was signed.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawCoverageMap {
+    entries: Vec<(Channel, ChannelCoverage)>,
+}
+
+/// Why a coverage map from the wire was refused.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum CoverageDefect {
+    /// Channels the map does not mention. Silence is not coverage: an omitted
+    /// channel would read as watched.
+    Missing(Vec<Channel>),
+    /// A channel listed more than once. Whichever entry a lookup happened to
+    /// find would decide the answer, so a map could report a channel as watched
+    /// while the verdict beside it named that same channel as blind.
+    Duplicated(Channel),
+}
+
+impl RawCoverageMap {
+    /// Check totality and uniqueness, then hand back a real [`CoverageMap`].
+    pub fn validate(self) -> Result<CoverageMap, CoverageDefect> {
+        for (i, (channel, _)) in self.entries.iter().enumerate() {
+            if self.entries[..i].iter().any(|(seen, _)| seen == channel) {
+                return Err(CoverageDefect::Duplicated(*channel));
+            }
+        }
+
+        let missing: Vec<Channel> = Channel::ALL
+            .iter()
+            .filter(|c| !self.entries.iter().any(|(have, _)| have == *c))
+            .copied()
+            .collect();
+        if !missing.is_empty() {
+            return Err(CoverageDefect::Missing(missing));
+        }
+
+        Ok(CoverageMap {
+            entries: self.entries,
+        })
+    }
+}
+
 impl CoverageMap {
-    /// The only way to build one.
+    /// Build one in-process. The other way in is
+    /// [`RawCoverageMap::validate`], for maps that arrived as bytes.
     ///
     /// The closure is invoked once per [`Channel::ALL`], so adding a channel
     /// breaks every construction site at compile time instead of leaving the
@@ -138,12 +191,14 @@ impl CoverageMap {
         }
     }
 
+    /// Infallible: every construction path covers every channel — `build`
+    /// by iterating [`Channel::ALL`], and the wire path by validation.
     pub fn status(&self, channel: Channel) -> &ChannelCoverage {
         self.entries
             .iter()
             .find(|(c, _)| *c == channel)
             .map(|(_, s)| s)
-            .expect("CoverageMap::build covers every channel")
+            .expect("every CoverageMap covers every channel")
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (Channel, &ChannelCoverage)> {
@@ -172,16 +227,6 @@ impl CoverageMap {
             .iter()
             .all(|(_, s)| !matches!(s, ChannelCoverage::Watched))
     }
-
-    /// Present but incomplete — used at decode to refuse a bundle whose
-    /// coverage map had a channel removed.
-    pub(crate) fn missing_channels(&self) -> Vec<Channel> {
-        Channel::ALL
-            .iter()
-            .filter(|c| !self.entries.iter().any(|(have, _)| have == *c))
-            .copied()
-            .collect()
-    }
 }
 
 #[cfg(test)]
@@ -191,10 +236,68 @@ mod tests {
     #[test]
     fn build_covers_every_channel() {
         let map = CoverageMap::build(|_| ChannelCoverage::Watched);
-        assert!(map.missing_channels().is_empty());
         for &c in Channel::ALL {
             assert_eq!(map.status(c), &ChannelCoverage::Watched);
         }
+    }
+
+    fn raw(json: &str) -> RawCoverageMap {
+        serde_json::from_str(json).expect("test json parses")
+    }
+
+    /// A map that arrived from bytes and covers everything is accepted.
+    #[test]
+    fn a_total_wire_map_validates() {
+        let built = CoverageMap::build(|_| ChannelCoverage::Watched);
+        let text = serde_json::to_string(&built).unwrap();
+        assert_eq!(raw(&text).validate(), Ok(built));
+    }
+
+    /// Silence is not coverage. An omitted channel would read as watched.
+    #[test]
+    fn an_empty_wire_map_is_refused_rather_than_panicking() {
+        assert_eq!(
+            raw(r#"{"entries":[]}"#).validate(),
+            Err(CoverageDefect::Missing(Channel::ALL.to_vec()))
+        );
+    }
+
+    #[test]
+    fn a_wire_map_missing_one_channel_is_refused() {
+        let built = CoverageMap::build(|_| ChannelCoverage::Watched);
+        let mut value: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&built).unwrap()).unwrap();
+        value["entries"].as_array_mut().unwrap().remove(0);
+
+        assert_eq!(
+            raw(&value.to_string()).validate(),
+            Err(CoverageDefect::Missing(vec![Channel::NetworkEgress]))
+        );
+    }
+
+    /// The dangerous shape: a map could otherwise report a channel as watched
+    /// while the verdict beside it named that same channel as blind.
+    #[test]
+    fn a_wire_map_naming_a_channel_twice_is_refused() {
+        let built = CoverageMap::build(|c| match c {
+            Channel::NetworkEgress => ChannelCoverage::Absent {
+                cause: GapCause::ObserverFailed,
+                detail: "capture died".into(),
+            },
+            _ => ChannelCoverage::Watched,
+        });
+        let mut value: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&built).unwrap()).unwrap();
+        // Append a second, contradicting entry for the same channel.
+        value["entries"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!([Channel::NetworkEgress, {"state": "watched"}]));
+
+        assert_eq!(
+            raw(&value.to_string()).validate(),
+            Err(CoverageDefect::Duplicated(Channel::NetworkEgress))
+        );
     }
 
     /// The regression guard for the failure mode where every run detonates
