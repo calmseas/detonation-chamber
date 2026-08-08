@@ -1,0 +1,4 @@
+[
+  {"do": "read_file", "at": "/proc/self/environ"},
+  {"do": "conclude"}
+]

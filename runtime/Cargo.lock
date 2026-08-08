@@ -310,6 +310,7 @@ dependencies = [
  "chamber-evidence",
  "chamber-isolation",
  "chamber-run",
+ "serde_json",
  "tokio",
 ]
 

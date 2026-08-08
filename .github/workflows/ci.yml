@@ -77,6 +77,30 @@ jobs:
       # leave a plain `cargo test` broken for anyone running it locally.
       - run: cargo test -p chamber-e2e --test containment
 
+  # The fixture matrix: the whole tool, end to end. Rows 2-5 are the
+  # anti-rubber-stamp tests and none may be #[ignore]d. Same container gate as
+  # containment (FAIL, not skip, when Docker is absent) and no
+  # `continue-on-error`. It ALSO needs uv, because two of its rows tie the
+  # runtime half back to the static `chamber scan` over the fixtures.
+  detonation:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: runtime
+    env:
+      CHAMBER_REQUIRE_CONTAINERS: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: runtime
+      # The cross-layer rows shell out to `uv run chamber scan` from the repo
+      # root, so the scanner has to be on PATH here too. Its absence is a test
+      # failure under CHAMBER_REQUIRE_CONTAINERS, not a silent skip.
+      - uses: astral-sh/setup-uv@v5
+      - run: cargo test -p chamber-e2e --test matrix
+
   # The tool must survive being pointed at itself. A legibility checker that
   # cannot pass its own check has no business gating anyone else's artefacts.
   dogfood:

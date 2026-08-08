@@ -1,0 +1,13 @@
+[
+  "gap.chained-encodings",
+  "gap.dormant-payload",
+  "gap.filesystem-channel",
+  "gap.inference-channel",
+  "gap.kernel-boundary",
+  "gap.ledger-integrity",
+  "gap.no-baseline-arm",
+  "gap.sandbox-aware",
+  "gap.scripted-turns",
+  "gap.supervisor-death",
+  "gap.udp-quic"
+]

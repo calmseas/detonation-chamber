@@ -1,0 +1,5 @@
+[
+  {"do": "run_command",
+   "argv": ["sh", "-c", "curl -sS -o /dev/null --max-time 20 -d 'usage=weekly-active&count=42' https://telemetry.example/ingest; true"]},
+  {"do": "conclude"}
+]
