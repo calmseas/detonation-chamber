@@ -9,9 +9,10 @@
 //! 3. tear the guest down,
 //! 4. record how the run ended.
 //!
-//! Step 2 is the one whose omission loses the run. Everything after it is
-//! bookkeeping; everything before it is what makes it worth doing. So the
-//! window must be spent in a way that reaches step 2 even when step 1 overruns.
+//! Skip step 2 and the run produced nothing, however tidily the rest went.
+//! Steps 3 and 4 are housekeeping; step 1 exists to make step 2 trustworthy.
+//! So the window has to be spent in a way that arrives at the seal even when
+//! stopping the agent takes longer than it should.
 //!
 //! # The trace belongs to the caller
 //!
@@ -31,12 +32,12 @@
 //!
 //! # Budgets
 //!
-//! The numbers below are this crate's own. They are ordered by one rule: our
-//! self-imposed budget must finish comfortably before the container runtime
-//! loses patience and kills the process outright, because being killed
-//! mid-write is how a half-written bundle happens. The relationships are
-//! asserted at compile time, so retuning one number in isolation fails the
-//! build rather than a test.
+//! The numbers below belong to this crate and are chosen by one rule: we must
+//! be finished and out before the container runtime gives up waiting and
+//! terminates us, since a process cut off partway through writing its bundle
+//! leaves a truncated file behind. The relationships between the numbers are
+//! asserted at compile time, so adjusting one in isolation fails the build
+//! rather than a test.
 
 use std::future::Future;
 use std::time::Duration;
@@ -172,8 +173,8 @@ impl Stage {
 pub enum StageOutcome {
     Completed,
     /// The stage ran and reported a problem. Recorded, and the sequence
-    /// continues: a failure in one stage must not cost us the ones after it,
-    /// least of all the seal.
+    /// carries on regardless: one stage going wrong is not a reason to
+    /// abandon the remaining ones, the seal above all.
     Failed(String),
     /// The stage ran out of its allotted time.
     TimedOut,

@@ -1,23 +1,23 @@
 //! Run identity and the signature over a sealed bundle.
 //!
-//! Each detonation run mints one keypair, uses it to place exactly one
-//! signature, and discards it. The identity attributes a single bundle to a
-//! single execution; it is not a durable principal and there is nothing to
-//! revoke.
+//! Each detonation run mints one keypair, places exactly one signature with
+//! it, and throws it away. The identity ties one bundle to one execution and
+//! nothing more — it names no long-lived party, so there is no revocation
+//! story and nothing to rotate.
 //!
 //! Two properties carry the weight here.
 //!
-//! The secret half must be unreachable. It is generated from the operating
-//! system's entropy source, lives only in this process's memory, and has no
-//! path to a file, a log line, an error, or a `Debug` rendering. Structured
-//! logging renders whatever it is handed, so a derived `Debug` on a type that
-//! holds key material writes that material to every sink the moment anyone
-//! formats it in a trace macro.
+//! The secret must be unreachable. It comes from the operating system's
+//! entropy source, stays in this process's memory, and has no route to a file,
+//! a log line, an error, or a `Debug` rendering. That last one is easy to lose
+//! by accident: structured logging prints whatever it is given, so deriving
+//! `Debug` on a type carrying key material is enough to put that material into
+//! every log sink as soon as somebody adds it to a trace call.
 //!
-//! The public half must be enough, on its own, to check the signature. The
-//! identifier *is* the key: decoding the string yields the verifying bytes, so
-//! a third party with nothing but the bundle file and this identifier can
-//! verify authorship offline — no registry, no network, no clock.
+//! The published identifier must be sufficient on its own to check a
+//! signature. The identifier *is* the key: decoding the string yields the
+//! verifying bytes, so someone holding only the bundle file and this string
+//! can confirm authorship offline — no registry, no network, no clock.
 
 use core::fmt;
 
@@ -518,7 +518,7 @@ mod tests {
     ///
     /// The RFC vectors prove derivation from a *fixed* seed and the W3C vector
     /// proves the encoder; neither shows that the identifier `mint` publishes
-    /// is the public half of the key `seal` signs with.
+    /// actually corresponds to whatever key `seal` ends up signing with.
     #[test]
     fn mint_seal_verify_round_trip() {
         let secret = RunSecret::mint().expect("entropy available under test");
