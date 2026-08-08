@@ -28,13 +28,17 @@
 //!    a working egress path.
 
 pub mod canary;
+#[cfg(feature = "observer")]
 pub mod dns;
+#[cfg(feature = "observer")]
 pub mod proxy;
 pub mod recorder;
 pub mod writer;
 
 pub use canary::{Canary, CanarySet};
+#[cfg(feature = "observer")]
 pub use dns::DnsSink;
+#[cfg(feature = "observer")]
 pub use proxy::InterceptingProxy;
 pub use recorder::Recorder;
 pub use writer::{LedgerFile, LedgerWriter, read_ledger};

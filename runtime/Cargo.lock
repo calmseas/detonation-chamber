@@ -334,6 +334,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "chamber-run"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chamber-capture",
+ "chamber-deadline",
+ "chamber-evidence",
+ "chamber-isolation",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+]
+
+[[package]]
 name = "cmake"
 version = "0.1.58"
 source = "registry+https://github.com/rust-lang/crates.io-index"

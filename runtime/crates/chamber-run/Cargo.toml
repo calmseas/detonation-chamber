@@ -1,0 +1,27 @@
+[package]
+name = "chamber-run"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The composition root: drives an artefact through its turns inside the chamber, winds the run down, and emits a sealed bundle."
+
+[dependencies]
+chamber-evidence = { path = "../chamber-evidence" }
+chamber-deadline = { path = "../chamber-deadline" }
+chamber-isolation = { path = "../chamber-isolation" }
+
+# TYPES ONLY. `default-features = false` drops the observer, which is what keeps
+# hudsucker, hickory and rustls out of the host binary's closure — the
+# artefact-facing proxy runs in a container, not here. `tests/no_proxy_stack.rs`
+# asserts it rather than trusting this line.
+chamber-capture = { path = "../chamber-capture", default-features = false }
+
+async-trait = "0.1.92"
+sha2 = "0.11.0"
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+tokio = { version = "1", features = ["rt", "macros", "time", "rt-multi-thread"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

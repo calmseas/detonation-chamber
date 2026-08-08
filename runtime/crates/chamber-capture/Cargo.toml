@@ -6,25 +6,56 @@ license.workspace = true
 repository.workspace = true
 description = "The boundary observer: canary matching, and (later slices) the intercepting proxy and DNS sink."
 
+[features]
+# Everything needed to OBSERVE: the intercepting proxy and the DNS sink, with
+# the ~200 transitive crates they carry. On by default, because that is what
+# this crate is for.
+default = ["observer"]
+observer = [
+    "dep:hickory-server",
+    "dep:hickory-proto",
+    "dep:hudsucker",
+    "dep:rcgen",
+    "dep:tokio-rustls",
+    "dep:rustls",
+    "dep:http-body-util",
+    "dep:hyper",
+    "dep:async-trait",
+    "dep:tokio",
+]
+
+# The split exists for one reason: the HOST orchestrator must read the ledger
+# this crate writes, and must NOT link the proxy stack. `chamber-run` therefore
+# depends on this crate with `default-features = false`, which leaves the
+# canary matcher, the recorder and the ledger reader/writer -- and nothing that
+# can open a socket. A test in chamber-run asserts hyper is absent from its
+# closure, so the boundary is checked rather than intended.
+
 [dependencies]
 chamber-evidence = { path = "../chamber-evidence" }
+chamber-deadline = { version = "0.1.0", path = "../chamber-deadline" }
 data-encoding = "2"
 percent-encoding = "2"
 hex = "0.4"
-hickory-server = "0.26"
-hickory-proto = "0.26"
-tokio = { version = "1", features = ["rt", "net", "macros", "time", "rt-multi-thread"] }
-chamber-deadline = { version = "0.1.0", path = "../chamber-deadline" }
-async-trait = "0.1.92"
-hudsucker = "0.25"
-rcgen = "0.14"
-tokio-rustls = "0.26.4"
-rustls = "0.23.43"
-http-body-util = "0.1.4"
-hyper = "1.11.0"
 sha2 = "0.11.0"
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
+
+hickory-server = { version = "0.26", optional = true }
+hickory-proto = { version = "0.26", optional = true }
+tokio = { version = "1", features = ["rt", "net", "macros", "time", "rt-multi-thread"], optional = true }
+async-trait = { version = "0.1.92", optional = true }
+hudsucker = { version = "0.25", optional = true }
+rcgen = { version = "0.14", optional = true }
+tokio-rustls = { version = "0.26.4", optional = true }
+rustls = { version = "0.23.43", optional = true }
+http-body-util = { version = "0.1.4", optional = true }
+hyper = { version = "1.11.0", optional = true }
+
+# The observer binary cannot be built without the observer.
+[[bin]]
+name = "chamber-boundary"
+required-features = ["observer"]
 
 [dev-dependencies]
 reqwest = "0.13"

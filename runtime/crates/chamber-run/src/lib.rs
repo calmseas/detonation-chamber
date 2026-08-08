@@ -1,0 +1,118 @@
+//! The composition root.
+//!
+//! Everything else in this workspace is a wall or an observer; this crate is
+//! what puts them together and drives an artefact through the chamber.
+//!
+//! # Built so far
+//!
+//! - [`turns`] — where the artefact's actions come from, and the provenance
+//!   stamped into the bundle so a replayed sequence never reads as a model's
+//!   decisions.
+//! - [`exit_code_for`] — the mapping from verdict to process exit status.
+//!
+//! The turn driver, the tool bridge, the wind-down and bundle emission are not
+//! built yet.
+//!
+//! # What this crate must never do
+//!
+//! - **Link the proxy stack.** The artefact-facing proxy runs in a container.
+//!   The dependency on `chamber-capture` is types-only
+//!   (`default-features = false`), and `tests/no_proxy_stack.rs` asserts it —
+//!   the wall is checked, not intended.
+//! - **Emit an unsigned bundle.** Signing is fail-*closed*. This deliberately
+//!   inverts the fail-open credential path it was modelled on, which was
+//!   justified by a fallback the chamber does not have: there is no degraded
+//!   mode in which an unsigned artefact is better than none.
+//! - **Return `Ok` from the wind-down.** The wind-down reports what it managed
+//!   to do; a caller that cannot tell a complete seal from a partial one will
+//!   report the partial one as complete.
+//! - **Proceed when the host cannot host a chamber.** If egress denial cannot
+//!   be enforced, there is no run to have.
+//! - **Default to a live model in a test profile.** A test that quietly reaches
+//!   a model is a test that costs money and fails for reasons unrelated to the
+//!   code under test.
+
+pub mod turns;
+
+pub use turns::{
+    ScriptedTurns, Transcript, TurnDirective, TurnError, TurnProvenance, TurnRecord, TurnSource,
+};
+
+use chamber_evidence::Verdict;
+
+/// The process exit status a verdict maps to.
+///
+/// Distinct values, because the caller of a detonation is usually a pipeline
+/// and the three outcomes need different responses:
+///
+/// | code | verdict | what it means |
+/// |---|---|---|
+/// | 2 | `Detonated` | a planted token crossed the boundary |
+/// | 1 | `InsufficientCoverage` | the run reached no conclusion |
+/// | 0 | `NoFinding` | nothing was seen crossing the channels that were watched |
+///
+/// **Zero is not a pass.** It says nothing was observed on the channels that
+/// were watched, which is a much narrower claim than the absence of a problem —
+/// and the bundle beside it lists what was not watched at all. `1` is
+/// deliberately not folded into `0`: a run that reached no conclusion and a run
+/// that concluded nothing were seen are different, and the whole design fails
+/// the moment those are treated as the same.
+#[must_use]
+pub fn exit_code_for(verdict: &Verdict) -> i32 {
+    match verdict {
+        Verdict::Detonated { .. } => 2,
+        Verdict::InsufficientCoverage { .. } => 1,
+        Verdict::NoFinding => 0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chamber_evidence::Ordinal;
+
+    #[test]
+    fn each_verdict_maps_to_its_own_code() {
+        assert_eq!(
+            exit_code_for(&Verdict::Detonated {
+                witnesses: vec![Ordinal(0)]
+            }),
+            2
+        );
+        assert_eq!(
+            exit_code_for(&Verdict::InsufficientCoverage {
+                blind_channels: vec!["network_egress".into()]
+            }),
+            1
+        );
+        assert_eq!(exit_code_for(&Verdict::NoFinding), 0);
+    }
+
+    /// The collapse that would make the tool useless: a run that reached no
+    /// conclusion exiting the same as one that concluded nothing was seen.
+    #[test]
+    fn insufficient_coverage_never_exits_like_no_finding() {
+        let blind = exit_code_for(&Verdict::InsufficientCoverage {
+            blind_channels: vec!["network_egress".into()],
+        });
+        assert_ne!(blind, exit_code_for(&Verdict::NoFinding));
+        assert_ne!(
+            blind,
+            exit_code_for(&Verdict::Detonated {
+                witnesses: vec![Ordinal(0)]
+            })
+        );
+    }
+
+    /// A detonation must be loud to anything reading exit codes, which is most
+    /// pipelines.
+    #[test]
+    fn a_detonation_is_non_zero() {
+        assert_ne!(
+            exit_code_for(&Verdict::Detonated {
+                witnesses: vec![Ordinal(3)]
+            }),
+            0
+        );
+    }
+}
