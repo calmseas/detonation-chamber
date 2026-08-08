@@ -38,11 +38,14 @@
 //! - the armed run: nine rows, corroborated by counters and captured frames
 //! - the observed rows: the proxy refuses with 403 and every name resolves to
 //!   the observer, with the exchange recovered in the ledger
+//! - inbound refusal (row 7): a dialer off the namespace cannot reach the cell,
+//!   and `c_drop_in` counts the refusal rather than dropping it blind
 //!
-//! One row of the plan's table is still **absent** rather than quietly passing:
-//! row 7 (inbound refusal) needs a listener alive in the cell *and* a dialer
-//! outside the namespace. The warden shares the cell's namespace, so a dial
-//! from it traverses `iif "lo" accept` and would prove nothing.
+//! Every row of the plan's table now runs. Row 7 was the last holdout, because
+//! it cannot be driven from inside the cell — the warden shares the cell's
+//! namespace, so a dial from it traverses `iif "lo" accept` and proves nothing.
+//! It is a dialer genuinely off the namespace instead, corroborated by the
+//! counter rather than by a listener.
 //!
 //! # Blocked is not the same as observed
 //!
@@ -573,6 +576,99 @@ fn the_armed_chamber_blocks_and_records_what_the_baseline_reached() {
     );
 }
 
+/// Row 7 of the probe table: inbound refusal. The one row that cannot run from
+/// inside the cell — the warden shares the cell's namespace, so a dial from it
+/// traverses `iif "lo" accept` and proves nothing. The dialer here is genuinely
+/// off the namespace: its own address on the chamber network, opening a TCP
+/// connection to the cell's address (the warden's, since they share a netns).
+///
+/// No listener and no separate unarmed run are needed, and `c_drop_in` is why.
+/// A failed dial could fail for reasons that have nothing to do with
+/// containment — a typo'd address, no route, a closed port answering RST. What
+/// distinguishes "the chamber refused it" is that the SYN reached the warden's
+/// `input` hook and was dropped THERE: the counter moving is at once the proof
+/// the packet arrived and the proof it was refused, which is why the dial's
+/// failure alone would be a vacuous assertion and the counter is not.
+#[test]
+fn an_inbound_connection_to_the_cell_is_refused_and_counted() {
+    let Some(_engine) = require_containers() else {
+        return;
+    };
+    ensure_images();
+    let _serialised = chamber_subnet_lock();
+
+    let mut chamber = ChamberTeardown::default();
+    let fabric = NetFabric::raise().expect("raise the chamber fabric");
+    let warden = Warden::start(&fabric, "chamber-warden:test").expect("start the warden");
+    let warden = warden
+        .load_ruleset(&images_dir().join("chamber.nft"))
+        .expect("load the ruleset");
+    let warden = warden
+        .start_drop_collector()
+        .expect("the NFLOG collector must be confirmed listening");
+    warden.add_tarpit_route().expect("add the tarpit route");
+
+    chamber.fabric = Some(fabric);
+    chamber.warden = Some(warden);
+    let warden = chamber.warden.as_ref().unwrap();
+
+    let before = warden.counters().expect("read counters");
+
+    // A dialer with its own address on the chamber network, genuinely outside
+    // the warden's namespace. `nc -z` is a connect-and-close: exit 0 means the
+    // handshake completed, non-zero means it did not.
+    let dialer = Container::create(&ContainerSpec {
+        image: "chamber-probe:test".into(),
+        attach: Attach::Network {
+            network: NetFabric::NETWORK.to_owned(),
+            ip: Some("10.66.0.20".into()),
+        },
+        cap_add: vec![],
+        argv: vec![
+            "sh".into(),
+            "-c".into(),
+            format!(
+                "nc -w 5 -z {} 9999; echo \"dial-exit=$?\"",
+                NetFabric::WARDEN_IP
+            ),
+        ],
+        sysctls: vec![],
+        env_file: None,
+        dns: vec![],
+        read_only: false,
+        tmpfs: vec![],
+        volumes: vec![],
+    })
+    .expect("create the dialer");
+    dialer.start().expect("start the dialer");
+    dialer
+        .wait(PROBE_WINDOW)
+        .expect("the dialer ran to completion");
+    let logs = dialer.logs().expect("read the dialer's output");
+    chamber.cells.push(dialer);
+
+    eprintln!("dialer output:\n{}", logs.stdout);
+
+    // The connection did not complete.
+    assert!(
+        logs.stdout.contains("dial-exit=") && !logs.stdout.contains("dial-exit=0"),
+        "an inbound connection to the cell was NOT refused:\n{}",
+        logs.stdout
+    );
+
+    // And the chamber counted the refusal rather than dropping it blind. Read
+    // immediately around the dial, so the increment is attributable to it.
+    let after = warden.counters().expect("read counters after the dial");
+    eprintln!("counters: before={before:?} after={after:?}");
+    assert!(
+        after.drop_in > before.drop_in,
+        "c_drop_in did not increase ({} -> {}): the inbound SYN never reached the \
+         chamber's input hook, so the failed dial proves nothing about containment.",
+        before.drop_in,
+        after.drop_in
+    );
+}
+
 /// The agent cell holds nothing, receives its sealed environment, and does not
 /// spill that environment into the host's process table.
 ///
@@ -912,9 +1008,13 @@ fn await_listening(container: &Container) {
     }
 }
 
-/// Every row the armed run exercises. Rows 5, 6 and 7 are deliberately absent —
-/// see the module note; they need infrastructure that does not exist yet, and
-/// including them would mean asserting something weaker than it appears.
+/// Every row the probe.sh armed run exercises from inside the cell. Rows 5, 6
+/// and 7 are absent from THIS list because they cannot be driven from inside
+/// the cell — 5 and 6 (the observed rows) are proved by
+/// `the_observer_refuses_the_proxied_request_and_answers_every_name`, and 7
+/// (inbound refusal) by `an_inbound_connection_to_the_cell_is_refused_and_counted`,
+/// which needs a dialer off the namespace. They are driven differently, not
+/// skipped.
 const ARMED_ROWS: &[&str] = &[
     "tcp_ip_literal",
     "udp_dns_direct",
