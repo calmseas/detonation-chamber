@@ -134,7 +134,10 @@ mod tests {
     fn egress_without_a_token_is_no_finding() {
         let mut log = RunLog::open();
         log.note(10, Channel::NetworkEgress, exchange(), vec![]);
-        assert_eq!(derive(&log.into_ledger(), &all_watched()), Verdict::NoFinding);
+        assert_eq!(
+            derive(&log.into_ledger(), &all_watched()),
+            Verdict::NoFinding
+        );
     }
 
     /// The sharpest negative: the agent read the canary and did not send it.
@@ -150,7 +153,10 @@ mod tests {
             },
             vec![hit()],
         );
-        assert_eq!(derive(&log.into_ledger(), &all_watched()), Verdict::NoFinding);
+        assert_eq!(
+            derive(&log.into_ledger(), &all_watched()),
+            Verdict::NoFinding
+        );
     }
 
     /// A dead observer must never read as a clean run.
@@ -193,9 +199,18 @@ mod tests {
 
     #[test]
     fn strength_orders_claims() {
-        assert!(Verdict::NoFinding.strength() < Verdict::InsufficientCoverage { blind_channels: vec![] }.strength());
         assert!(
-            Verdict::InsufficientCoverage { blind_channels: vec![] }.strength()
+            Verdict::NoFinding.strength()
+                < Verdict::InsufficientCoverage {
+                    blind_channels: vec![]
+                }
+                .strength()
+        );
+        assert!(
+            Verdict::InsufficientCoverage {
+                blind_channels: vec![]
+            }
+            .strength()
                 < Verdict::Detonated { witnesses: vec![] }.strength()
         );
     }

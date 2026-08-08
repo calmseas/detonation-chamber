@@ -16,6 +16,32 @@ jobs:
       - uses: astral-sh/setup-uv@v5
       - run: uv run --python ${{ matrix.python }} --with-editable . --with pytest pytest -q
 
+  # The runtime half. `chamber scan` is the static layer; `runtime/` is the
+  # behavioural one.
+  #
+  # These are the container-free levels: everything that can be proved without
+  # a Linux guest. The containment and end-to-end suites arrive with the
+  # crates that need them, and when they do they must FAIL rather than skip
+  # when Docker is absent -- a suite that no-ops without a guest makes a green
+  # tick mean nothing.
+  runtime:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: runtime
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          # rust-toolchain.toml pins the version; components are named here.
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: runtime
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+
   # The tool must survive being pointed at itself. A legibility checker that
   # cannot pass its own check has no business gating anyone else's artefacts.
   dogfood:

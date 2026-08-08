@@ -34,9 +34,9 @@ impl<'de> Deserialize<'de> for Digest32 {
         use serde::de::Error as _;
         let text = String::deserialize(d)?;
         let raw = hex::decode(&text).map_err(D::Error::custom)?;
-        raw.try_into()
-            .map(Digest32)
-            .map_err(|v: Vec<u8>| D::Error::custom(format!("digest is {} bytes, expected 32", v.len())))
+        raw.try_into().map(Digest32).map_err(|v: Vec<u8>| {
+            D::Error::custom(format!("digest is {} bytes, expected 32", v.len()))
+        })
     }
 }
 
@@ -135,10 +135,7 @@ pub enum ObservationKind {
     ///
     /// Retained rather than dropped. A reader that silently discards what it
     /// cannot parse turns a newer capture layer's finding into no finding.
-    Unrecognised {
-        tag: String,
-        raw: serde_json::Value,
-    },
+    Unrecognised { tag: String, raw: serde_json::Value },
 }
 
 /// One thing that happened at the boundary.
@@ -275,7 +272,10 @@ impl Ledger {
     }
 
     pub fn observations_on(&self, channel: Channel) -> usize {
-        self.entries.iter().filter(|o| o.channel() == channel).count()
+        self.entries
+            .iter()
+            .filter(|o| o.channel() == channel)
+            .count()
     }
 
     /// Are the ordinals 0..n with no gaps and no reordering?

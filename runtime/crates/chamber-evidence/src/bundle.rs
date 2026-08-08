@@ -153,15 +153,24 @@ pub struct OpenedBundle {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum DecodeRefusal {
     NotJson(String),
-    SchemaUnsupported { found: String },
-    CoverageIncomplete { missing: Vec<Channel> },
+    SchemaUnsupported {
+        found: String,
+    },
+    CoverageIncomplete {
+        missing: Vec<Channel>,
+    },
     /// The ordinals are not a contiguous run from zero.
     LedgerNotContiguous,
     /// A witness names an entry that is not in the ledger.
-    WitnessNotInLedger { witness: Ordinal },
+    WitnessNotInLedger {
+        witness: Ordinal,
+    },
     /// The file claims more than its evidence supports. Refused, never
     /// silently downgraded.
-    CarriedClaimExceedsEvidence { carried: String, derived: String },
+    CarriedClaimExceedsEvidence {
+        carried: String,
+        derived: String,
+    },
     /// Semantically equivalent but not the byte sequence that was signed.
     NotCanonical,
     Seal(SealError),
@@ -177,7 +186,9 @@ impl core::fmt::Display for DecodeRefusal {
             Self::CoverageIncomplete { missing } => {
                 write!(f, "coverage map omits {} channel(s)", missing.len())
             }
-            Self::LedgerNotContiguous => f.write_str("ledger ordinals are not contiguous from zero"),
+            Self::LedgerNotContiguous => {
+                f.write_str("ledger ordinals are not contiguous from zero")
+            }
             Self::WitnessNotInLedger { witness } => {
                 write!(f, "witness {witness:?} is not present in the ledger")
             }
