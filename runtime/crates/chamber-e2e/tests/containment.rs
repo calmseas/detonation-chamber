@@ -36,15 +36,21 @@
 //! - the three structural asserts, measured and not assumed
 //! - the unarmed positive control
 //! - the armed run: nine rows, corroborated by counters and captured frames
+//! - the observed rows: the proxy refuses with 403 and every name resolves to
+//!   the observer, with the exchange recovered in the ledger
 //!
-//! Three rows of the plan's table are **absent** rather than quietly passing:
+//! One row of the plan's table is still **absent** rather than quietly passing:
+//! row 7 (inbound refusal) needs a listener alive in the cell *and* a dialer
+//! outside the namespace. The warden shares the cell's namespace, so a dial
+//! from it traverses `iif "lo" accept` and would prove nothing.
 //!
-//! - rows 5 and 6 (proxy 403; `getaddrinfo` resolving to the capture address)
-//!   need the capture process running in the chamber. `chamber-capture` has no
-//!   bin target yet, so there is nothing to put at `10.66.0.10`.
-//! - row 7 (inbound refusal) needs a listener alive in the cell *and* a dialer
-//!   outside the namespace. The warden shares the cell's namespace, so a dial
-//!   from it traverses `iif "lo" accept` and would prove nothing.
+//! # Blocked is not the same as observed
+//!
+//! The armed rows prove the cell cannot get out. The observed rows prove that
+//! what it *is* permitted to do is seen: a request decrypted and read in full
+//! before it is refused, and a name recovered whether or not anything answered
+//! it. A chamber that only blocked would be a firewall, and a firewall produces
+//! no evidence.
 
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
@@ -54,6 +60,7 @@ use chamber_isolation::{
     AgentCell, Attach, CanaryPlacements, Container, ContainerSpec, Docker, EMPTY_BOUNDING_SET,
     EnvDraft, EnvFile, GuestImage, GuestRoot, NetFabric, Network, NetworkSpec, Preflight,
     ProbeReport, Rationale, Reach, RowId, VarName, Warden, build_image,
+    build_image_with_dockerfile,
 };
 
 const OP_WINDOW: Duration = Duration::from_secs(90);
@@ -105,6 +112,23 @@ fn ensure_images() {
         build_image(&dir, &format!("chamber-{name}:test"))
             .unwrap_or_else(|e| panic!("could not build the {name} image from {dir:?}: {e}"));
     }
+
+    // The capture image is the odd one out: its Dockerfile lives under
+    // images/capture/ but it compiles the workspace, so its context is
+    // runtime/. It is also the slow one — ~290 crates and a cmake C build —
+    // which is why the whole of `ensure_images` is memoised rather than run per
+    // test.
+    let runtime = images_dir()
+        .parent()
+        .expect("images/ sits under runtime/")
+        .to_path_buf();
+    build_image_with_dockerfile(
+        &runtime,
+        &images_dir().join("capture").join("Dockerfile"),
+        "chamber-capture:test",
+    )
+    .expect("could not build the capture image");
+
     *done = true;
 }
 
@@ -262,7 +286,7 @@ fn containment_probe_is_capable_of_succeeding_when_unarmed() {
         // with capabilities the real cell will not have would make the baseline
         // unattainable by the thing it is a baseline for.
         cap_add: vec![],
-        argv: vec!["unarmed".into()],
+        argv: vec!["probe".into(), "unarmed".into()],
         sysctls: vec![],
         env_file: Some(probe_env.path().clone()),
         dns: vec!["10.77.0.50".into()],
@@ -430,7 +454,9 @@ fn the_armed_chamber_blocks_and_records_what_the_baseline_reached() {
             container_id: warden.container_id().to_owned(),
         },
         cap_add: vec![],
-        argv: ARMED_ROWS.iter().map(|s| (*s).to_owned()).collect(),
+        argv: std::iter::once("probe".to_owned())
+            .chain(ARMED_ROWS.iter().map(|s| (*s).to_owned()))
+            .collect(),
         sysctls: vec![],
         env_file: None,
         dns: vec![],
@@ -695,6 +721,191 @@ fn the_agent_cell_holds_nothing_and_leaks_nothing_to_the_host() {
     );
 
     chamber.agent = Some(agent);
+}
+
+/// The two rows that need an observer in the chamber: the proxy refuses, and
+/// every name resolves to it.
+///
+/// These are the rows the tool exists for. Rows 1-4 and 8-11 prove the cell
+/// cannot get out; these two prove that what it *is* permitted to do is
+/// observed — a request decrypted and read before it is refused, and a name
+/// recovered whether or not it was ever answered. A chamber that only blocked
+/// would be a firewall.
+#[test]
+fn the_observer_refuses_the_proxied_request_and_answers_every_name() {
+    let Some(_engine) = require_containers() else {
+        return;
+    };
+    ensure_images();
+    let _serialised = chamber_subnet_lock();
+
+    const CANARY: &str = "AKIAIOSFODNN7EXAMPLE";
+    let mut chamber = ChamberTeardown::default();
+    let fabric = NetFabric::raise().expect("raise the chamber fabric");
+
+    // The observer, at the address the ruleset accepts and the resolver points
+    // at. /evidence is a tmpfs: this container writes the ledger and the host
+    // reads it back, and neither needs a handle on the other's filesystem.
+    let capture_env = EnvFile::write(&[
+        ("CHAMBER_CANARY_AWS_KEY".into(), CANARY.into()),
+        ("CHAMBER_LEDGER".into(), "/evidence/ledger.jsonl".into()),
+        ("CHAMBER_CA_OUT".into(), "/evidence/chamber-ca.pem".into()),
+        ("CHAMBER_ANSWER_WITH".into(), NetFabric::CAPTURE_IP.into()),
+        ("CHAMBER_PROXY_ADDR".into(), "0.0.0.0:3128".into()),
+        ("CHAMBER_DNS_ADDR".into(), "0.0.0.0:53".into()),
+    ])
+    .expect("write the capture env file");
+
+    let capture = Container::create(&ContainerSpec {
+        image: "chamber-capture:test".into(),
+        attach: Attach::Network {
+            network: fabric.egress().name().to_owned(),
+            ip: Some(NetFabric::CAPTURE_IP.to_owned()),
+        },
+        cap_add: vec![],
+        argv: vec![],
+        sysctls: vec![],
+        env_file: Some(capture_env.path().clone()),
+        dns: vec![],
+        read_only: false,
+        tmpfs: vec!["/evidence".into()],
+    })
+    .expect("create the observer");
+    capture.start().expect("start the observer");
+    await_listening(&capture);
+
+    let warden = Warden::start(&fabric, "chamber-warden:test").expect("start the warden");
+    let warden = warden
+        .load_ruleset(&images_dir().join("chamber.nft"))
+        .expect("load the ruleset");
+    let warden = warden
+        .start_drop_collector()
+        .expect("collector must be confirmed listening");
+    warden.add_tarpit_route().expect("add the tarpit route");
+
+    chamber.fabric = Some(fabric);
+    chamber.warden = Some(warden);
+    chamber.cells.push(capture);
+    let warden = chamber.warden.as_ref().unwrap();
+    let capture = chamber.cells.last().unwrap();
+
+    // The per-run CA, read out of the observer and placed in the cell's tmpfs.
+    // The private key never leaves the observer; only this certificate moves.
+    let ca_pem = capture
+        .exec(&["cat", "/evidence/chamber-ca.pem"], OP_WINDOW)
+        .expect("read the per-run CA");
+    assert!(
+        ca_pem.stdout.contains("BEGIN CERTIFICATE"),
+        "the observer did not produce a CA: {ca_pem:?}"
+    );
+
+    let anchor_path = std::path::Path::new("/work/chamber-ca.pem");
+    let mut draft = EnvDraft::empty();
+    draft
+        .redirect_scratch(&GuestRoot::at("/work"))
+        .expect("redirect scratch");
+    // Bound before anything else could claim these names.
+    draft
+        .place_trust_anchor(anchor_path)
+        .expect("place the trust anchor");
+    let why = Rationale {
+        reason: "the artefact's egress must go through the observer to be seen",
+        required_by: "chamber-e2e::the_observer_refuses_the_proxied_request",
+    };
+    for var in ["https_proxy", "http_proxy", "HTTPS_PROXY", "HTTP_PROXY"] {
+        draft
+            .set(
+                VarName::parse(var).expect("well-formed"),
+                format!("http://{}:3128", NetFabric::CAPTURE_IP),
+                why,
+            )
+            .expect("bind the proxy variable");
+    }
+    let sealed = draft
+        .seal(&CanaryPlacements::none())
+        .expect("seal the environment");
+
+    let cell = AgentCell::start(warden, &sealed, &GuestImage::tagged("chamber-probe:test"))
+        .expect("start the cell");
+    cell.write_file(anchor_path, ca_pem.stdout.as_bytes())
+        .expect("place the CA in the cell");
+
+    let outcome = cell
+        .exec(&["probe", "https", "getaddrinfo"], PROBE_WINDOW)
+        .expect("run the two observed rows");
+    eprintln!("observed rows:\n{}", outcome.stdout);
+    let report = ProbeReport::parse(&outcome.stdout)
+        .unwrap_or_else(|e| panic!("{e}\nstderr:\n{}", outcome.stderr));
+    chamber.agent = Some(cell);
+
+    // Row 5. Not merely blocked — REFUSED, with a status the cell can read.
+    // A dropped packet would be containment; a 403 is containment plus an
+    // observer that decrypted the request, read the whole body, and declined.
+    let https = report
+        .require(RowId::Https)
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert!(
+        https.detail.contains("http_code=403"),
+        "the proxy did not refuse with 403 — a different code means the request \
+         went somewhere, and a TLS error means it was never decrypted at all: {}",
+        https.detail
+    );
+
+    // Row 6. Every name resolves to the observer, so a lookup is recorded even
+    // when the destination is never reached.
+    let resolved = report
+        .require(RowId::Getaddrinfo)
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(resolved.reach(), Reach::Reached, "{}", resolved.detail);
+    assert!(
+        resolved
+            .detail
+            .contains(&format!("resolved_to={}", NetFabric::CAPTURE_IP)),
+        "a name resolved somewhere other than the observer: {}",
+        resolved.detail
+    );
+
+    // The ledger is the point. Both channels, one sequence, and the request the
+    // proxy refused is in it with its plaintext recovered.
+    let ledger = capture
+        .exec(&["cat", "/evidence/ledger.jsonl"], OP_WINDOW)
+        .expect("read the ledger")
+        .stdout;
+    assert!(
+        ledger.contains("\"channel\":\"dns_resolution\""),
+        "no DNS observation reached the ledger:\n{ledger}"
+    );
+    assert!(
+        ledger.contains("\"channel\":\"network_egress\""),
+        "no egress observation reached the ledger:\n{ledger}"
+    );
+    assert!(
+        ledger.contains("\"kind\":\"http_exchange\""),
+        "the refused request was not recorded as an exchange:\n{ledger}"
+    );
+}
+
+/// Waits until a container prints the line that means its listeners are up.
+///
+/// The observer must be listening before anything runs against it: an artefact
+/// started first does its most interesting work unobserved, and nothing later
+/// can recover it.
+fn await_listening(container: &Container) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let logs = container
+            .logs()
+            .map(|l| l.stdout + &l.stderr)
+            .unwrap_or_default();
+        if logs.contains("LISTENING") {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the observer never reported LISTENING. Its output:\n{logs}"
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    }
 }
 
 /// Every row the armed run exercises. Rows 5, 6 and 7 are deliberately absent —

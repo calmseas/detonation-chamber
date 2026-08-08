@@ -19,4 +19,9 @@ RUN apk add --no-cache \
       nftables
 COPY probe.sh /usr/local/bin/probe
 RUN chmod 0755 /usr/local/bin/probe
-ENTRYPOINT ["/usr/local/bin/probe"]
+
+# Deliberately no ENTRYPOINT. The probe runs two ways: as a one-shot container
+# that executes its rows and exits, and as a long-lived cell in the agent's
+# position that is exec'd into after the per-run CA has been placed inside it.
+# An entrypoint would make the second impossible without an override, and the
+# rows that need a trust anchor are exactly the ones that matter most.

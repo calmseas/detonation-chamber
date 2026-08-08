@@ -96,12 +96,12 @@ row_icmp_echo() {
 }
 
 row_https() {
-    code=$(curl -sS --max-time "$TIMEOUT" -o /dev/null -w '%{http_code}' "$T_HTTPS_URL" 2>/tmp/curl.err)
+    code=$(curl -sS --max-time "$TIMEOUT" -o /dev/null -w '%{http_code}' "$T_HTTPS_URL" 2>"${TMPDIR:-/tmp}/curl.err")
     rc=$?
     if [ $rc -eq 0 ]; then
         emit https true "$T_HTTPS_URL" "http_code=$code"
     else
-        emit https false "$T_HTTPS_URL" "rc=$rc $(cat /tmp/curl.err) code=$code"
+        emit https false "$T_HTTPS_URL" "rc=$rc $(cat "${TMPDIR:-/tmp}/curl.err") code=$code"
     fi
 }
 
