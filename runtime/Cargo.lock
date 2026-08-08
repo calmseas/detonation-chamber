@@ -49,6 +49,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
 
 [[package]]
+name = "chamber-capture"
+version = "0.1.0"
+dependencies = [
+ "chamber-evidence",
+ "data-encoding",
+ "hex",
+ "percent-encoding",
+]
+
+[[package]]
 name = "chamber-deadline"
 version = "0.1.0"
 dependencies = [
@@ -290,6 +300,12 @@ dependencies = [
  "data-encoding",
  "data-encoding-macro",
 ]
+
+[[package]]
+name = "percent-encoding"
+version = "2.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
 name = "pin-project-lite"

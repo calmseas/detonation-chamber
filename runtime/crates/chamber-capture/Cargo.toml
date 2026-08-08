@@ -1,0 +1,13 @@
+[package]
+name = "chamber-capture"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The boundary observer: canary matching, and (later slices) the intercepting proxy and DNS sink."
+
+[dependencies]
+chamber-evidence = { path = "../chamber-evidence" }
+data-encoding = "2"
+percent-encoding = "2"
+hex = "0.4"
