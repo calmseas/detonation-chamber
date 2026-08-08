@@ -327,8 +327,10 @@ dependencies = [
 name = "chamber-isolation"
 version = "0.1.0"
 dependencies = [
+ "chamber-evidence",
  "serde",
  "serde_json",
+ "sha2",
 ]
 
 [[package]]

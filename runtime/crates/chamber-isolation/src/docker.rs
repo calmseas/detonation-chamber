@@ -405,6 +405,15 @@ pub struct ContainerSpec {
     pub env_file: Option<PathBuf>,
     /// Resolvers, as `--dns`. Empty leaves the engine's default in place.
     pub dns: Vec<String>,
+    /// `--read-only`, making the container's own rootfs immutable.
+    pub read_only: bool,
+    /// Anonymous in-memory filesystems, as `--tmpfs <path>`.
+    ///
+    /// Not a bind mount and deliberately not one: a tmpfs gives the container
+    /// somewhere to write without giving it a handle on any host directory.
+    /// With a read-only rootfs it is the *only* writable place, which is what
+    /// makes "what did the artefact leave behind" a bounded question.
+    pub tmpfs: Vec<String>,
 }
 
 /// A `KEY=VALUE` file that is removed when dropped.
@@ -521,6 +530,13 @@ impl Container {
         for resolver in &spec.dns {
             argv.push("--dns".into());
             argv.push(resolver.clone());
+        }
+        if spec.read_only {
+            argv.push("--read-only".into());
+        }
+        for mount in &spec.tmpfs {
+            argv.push("--tmpfs".into());
+            argv.push(mount.clone());
         }
         match &spec.attach {
             Attach::Network { network, ip } => {

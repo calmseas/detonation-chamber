@@ -273,6 +273,8 @@ impl Warden {
             sysctls: vec![],
             env_file: None,
             dns: vec![],
+            read_only: false,
+            tmpfs: vec![],
         })?;
         container.start()?;
         Ok(Self { container })

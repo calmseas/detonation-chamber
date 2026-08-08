@@ -7,5 +7,7 @@ repository.workspace = true
 description = "The boundary itself: the networks, the warden that owns the netns, the agent cell, and the preflight asserts that must hold before any of it is trusted."
 
 [dependencies]
+chamber-evidence = { path = "../chamber-evidence" }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = "0.11.0"

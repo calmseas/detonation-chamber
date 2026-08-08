@@ -51,8 +51,9 @@ use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use chamber_isolation::{
-    Attach, Container, ContainerSpec, Docker, EnvFile, NetFabric, Network, NetworkSpec, Preflight,
-    ProbeReport, Reach, RowId, Warden, build_image,
+    AgentCell, Attach, CanaryPlacements, Container, ContainerSpec, Docker, EMPTY_BOUNDING_SET,
+    EnvDraft, EnvFile, GuestImage, GuestRoot, NetFabric, Network, NetworkSpec, Preflight,
+    ProbeReport, Rationale, Reach, RowId, VarName, Warden, build_image,
 };
 
 const OP_WINDOW: Duration = Duration::from_secs(90);
@@ -227,6 +228,8 @@ fn containment_probe_is_capable_of_succeeding_when_unarmed() {
         sysctls: vec![],
         env_file: Some(sink_env.path().clone()),
         dns: vec![],
+        read_only: false,
+        tmpfs: vec![],
     })
     .expect("create the sink");
     sink.start().expect("start the sink");
@@ -263,6 +266,8 @@ fn containment_probe_is_capable_of_succeeding_when_unarmed() {
         sysctls: vec![],
         env_file: Some(probe_env.path().clone()),
         dns: vec!["10.77.0.50".into()],
+        read_only: false,
+        tmpfs: vec![],
     })
     .expect("create the probe");
     probe.start().expect("start the probe");
@@ -343,6 +348,7 @@ fn await_sink(sink: &Container) {
 #[derive(Default)]
 struct ChamberTeardown {
     cells: Vec<Container>,
+    agent: Option<AgentCell>,
     warden: Option<chamber_isolation::ObservedWarden>,
     fabric: Option<NetFabric>,
 }
@@ -351,6 +357,9 @@ impl Drop for ChamberTeardown {
     fn drop(&mut self) {
         for cell in self.cells.drain(..) {
             let _ = cell.destroy(OP_WINDOW);
+        }
+        if let Some(agent) = self.agent.take() {
+            let _ = agent.destroy(OP_WINDOW);
         }
         if let Some(warden) = self.warden.take() {
             let _ = warden.destroy();
@@ -425,6 +434,8 @@ fn the_armed_chamber_blocks_and_records_what_the_baseline_reached() {
         sysctls: vec![],
         env_file: None,
         dns: vec![],
+        read_only: false,
+        tmpfs: vec![],
     })
     .expect("create the probe cell");
     cell.start().expect("start the probe cell");
@@ -531,6 +542,159 @@ fn the_armed_chamber_blocks_and_records_what_the_baseline_reached() {
         "the collector captured nothing at all despite reporting that it was \
          listening"
     );
+}
+
+/// The agent cell holds nothing, receives its sealed environment, and does not
+/// spill that environment into the host's process table.
+///
+/// The last of those is plan risk 14, and it is the reason `-e KEY=VALUE` does
+/// not exist in this crate's engine API: it would put every value — planted
+/// canaries included — in `ps` output for the container's whole lifetime, where
+/// any user on the machine can read it. The chamber would then be the leak it
+/// exists to detect.
+#[test]
+fn the_agent_cell_holds_nothing_and_leaks_nothing_to_the_host() {
+    let Some(_engine) = require_containers() else {
+        return;
+    };
+    ensure_images();
+    let _serialised = chamber_subnet_lock();
+
+    let mut chamber = ChamberTeardown::default();
+    let fabric = NetFabric::raise().expect("raise the chamber fabric");
+
+    let warden = Warden::start(&fabric, "chamber-warden:test").expect("start the warden");
+    let warden = warden
+        .load_ruleset(&images_dir().join("chamber.nft"))
+        .expect("load the ruleset");
+    let warden = warden
+        .start_drop_collector()
+        .expect("collector must be confirmed listening");
+    warden.add_tarpit_route().expect("add the tarpit route");
+
+    chamber.fabric = Some(fabric);
+    chamber.warden = Some(warden);
+    let warden = chamber.warden.as_ref().unwrap();
+
+    // Distinctive enough that finding it in `ps` output is unambiguous.
+    let canary_value = format!("chamber-canary-{}-do-not-leak", std::process::id());
+    let token = VarName::parse("CHAMBER_TOKEN").expect("well-formed");
+    let why = Rationale {
+        reason: "the planted canary this run watches for",
+        required_by: "chamber-e2e::the_agent_cell_holds_nothing_and_leaks_nothing_to_the_host",
+    };
+
+    let mut draft = EnvDraft::empty();
+    // Trust anchor first, so a later host adoption that would redirect it is
+    // already a duplicate-name error rather than a silent override.
+    draft
+        .place_trust_anchor(std::path::Path::new("/work/chamber-ca.pem"))
+        .expect("place the trust anchor");
+    draft
+        .redirect_scratch(&GuestRoot::at("/work"))
+        .expect("redirect scratch");
+    draft
+        .set(token.clone(), canary_value.clone(), why)
+        .expect("plant the canary");
+
+    let mut canaries = CanaryPlacements::none();
+    canaries.plant_env("test-token", token.clone());
+    let sealed = draft.seal(&canaries).expect("seal the environment");
+
+    let agent = AgentCell::start(warden, &sealed, &GuestImage::tagged("chamber-guest:test"))
+        .expect("start the agent cell");
+
+    // Read from /proc, not inferred from the flags we passed: what was asked
+    // for and what the kernel granted are different claims.
+    let bounding = agent
+        .capability_bounding_set()
+        .expect("read the bounding set");
+    assert_eq!(
+        bounding, EMPTY_BOUNDING_SET,
+        "the cell holds capabilities: a root shell inside it could regain \
+         NET_ADMIN and rewrite the rules containing it"
+    );
+
+    // The sealed environment actually arrived.
+    let seen = agent
+        .exec(&["sh", "-c", "printf %s \"$CHAMBER_TOKEN\""], OP_WINDOW)
+        .expect("read the canary back");
+    assert_eq!(
+        seen.stdout, canary_value,
+        "the planted canary did not reach the cell; the run would have nothing \
+         to find and would report no finding"
+    );
+
+    let anchor = agent
+        .exec(&["sh", "-c", "printf %s \"$SSL_CERT_FILE\""], OP_WINDOW)
+        .expect("read the anchor back");
+    assert_eq!(anchor.stdout, "/work/chamber-ca.pem");
+
+    // Risk 14. `--env-file` keeps the value out of the host process table;
+    // `-e` would not.
+    let host_ps = std::process::Command::new("ps")
+        .args(["-axww", "-o", "command"])
+        .output()
+        .expect("read the host process table");
+    let host_ps = String::from_utf8_lossy(&host_ps.stdout);
+    // Absence proves nothing if we did not actually read a process table: a
+    // failed `ps` returns empty, and "the canary is not in this empty string"
+    // passes forever.
+    //
+    // The proof is that THIS process is visible. It is the right control
+    // because it is the process a `-e` leak would have shown up in — the
+    // harness is what invokes the engine. Looking for "docker" instead would be
+    // unreliable: the CLI processes have already exited by now, which made this
+    // check pass only intermittently.
+    let own_exe = std::env::current_exe().expect("current exe");
+    let own_name = own_exe
+        .file_name()
+        .expect("exe has a file name")
+        .to_string_lossy()
+        .into_owned();
+    assert!(
+        host_ps.contains(&own_name),
+        "the host process table does not even show this test process ({own_name}), \
+         so the leak check below would pass vacuously. Read {} lines.",
+        host_ps.lines().count()
+    );
+    assert!(
+        !host_ps.contains(&canary_value),
+        "the canary is visible in the HOST process table — any user on this \
+         machine can read it out of `ps`. This is what `-e KEY=VALUE` does and \
+         why the engine API here has no such option."
+    );
+
+    // Files arrive over stdin, never as an argument and never through a mount.
+    agent
+        .write_file(
+            std::path::Path::new("/work/planted.env"),
+            b"API_KEY=placeholder\n",
+        )
+        .expect("write a file into the cell");
+    let back = agent
+        .exec(&["cat", "/work/planted.env"], OP_WINDOW)
+        .expect("read it back");
+    assert!(back.stdout.contains("API_KEY=placeholder"), "{:?}", back);
+
+    // The rootfs is immutable, so what the artefact leaves behind is bounded to
+    // the tmpfs and dies with the container. Asserted from inside the cell
+    // rather than trusted from the flag that was passed: what was requested and
+    // what the kernel enforced are different claims.
+    let rootfs = agent
+        .exec(
+            &["sh", "-c", "touch /etc/chamber-escape 2>&1; echo rc=$?"],
+            OP_WINDOW,
+        )
+        .expect("attempt a rootfs write");
+    assert!(
+        rootfs.stdout.contains("rc=1") && rootfs.stdout.contains("Read-only"),
+        "the cell's rootfs is writable, so the artefact can modify the image it \
+         runs in and the blast radius is not bounded. Got: {:?}",
+        rootfs.stdout
+    );
+
+    chamber.agent = Some(agent);
 }
 
 /// Every row the armed run exercises. Rows 5, 6 and 7 are deliberately absent —

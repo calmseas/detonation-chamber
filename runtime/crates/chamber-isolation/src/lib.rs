@@ -16,8 +16,14 @@
 //! - [`warden`] — the namespace owner: the fabric, the ruleset, the NFLOG
 //!   collector and the tarpit route, with the ordering between them encoded as
 //!   types rather than as a convention.
+//! - [`env`] — the environment the artefact runs in, where nothing is
+//!   inherited and every binding is named, justified and sealed.
+//! - [`cell`] — the agent cell, which can only be started into a chamber that
+//!   is already armed and already being observed.
 //!
-//! The agent cell and the sealed environment are **not built yet**.
+//! What remains: `probe_host`/`adjudicate` (deciding whether this host can host
+//! a chamber at all), and the seal-before-teardown token, which cannot be
+//! minted honestly until the capture layer runs in the chamber. See [`cell`].
 //!
 //! # The ordering constraint that cannot be recovered
 //!
@@ -56,14 +62,21 @@
 //!    live ruleset says so itself: *"table ip nat is managed by iptables-nft,
 //!    do not touch!"*. Only `table inet chamber; delete table inet chamber;`.
 
+pub mod cell;
 pub mod docker;
+pub mod env;
 pub mod preflight;
 pub mod probe;
 pub mod warden;
 
+pub use cell::{AgentCell, EMPTY_BOUNDING_SET, GuestImage};
 pub use docker::{
     Attach, Container, ContainerSpec, Docker, DockerUnavailable, EngineError, EnvFile, ExecOutcome,
     Network, NetworkSpec, build_image,
+};
+pub use env::{
+    AdoptError, AnchorPlacement, BindError, CanaryPlacements, EnvDraft, EnvSealError, GuestRoot,
+    NameError, PlantSite, Rationale, SealedEnv, VarName,
 };
 pub use preflight::{AssertOutcome, Preflight, PreflightFailure, StructuralAssert};
 pub use probe::{MalformedRow, ProbeReport, ProbeRow, Reach, RowId};

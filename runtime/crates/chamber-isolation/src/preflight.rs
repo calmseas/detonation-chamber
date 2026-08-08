@@ -139,6 +139,8 @@ impl Preflight {
             sysctls: vec![],
             env_file: None,
             dns: vec![],
+            read_only: false,
+            tmpfs: vec![],
         })?;
         container.start()?;
         container.wait(INSPECT_WINDOW)?;
@@ -164,6 +166,8 @@ impl Preflight {
             sysctls: vec![],
             env_file: None,
             dns: vec![],
+            read_only: false,
+            tmpfs: vec![],
         })?;
         container.start()?;
         container.wait(INSPECT_WINDOW)?;
