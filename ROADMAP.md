@@ -12,13 +12,19 @@ one layer of a larger design:
 
 ```
 chamber scan       static legibility checks    — SHIPPED
-chamber detonate   runtime behavioural review  — SPECIFIED, not built
+chamber detonate   runtime behavioural review  — SLICE 0 BUILT (walking skeleton)
 ```
 
 `scan` is the cheap deterministic gate that runs first. `detonate` is the expensive behavioural
 layer that observes what an artefact actually does. Neither is a trust gate on its own; together
 they close the specific holes the published bypasses exploit, which is more than any single
 shipping tool does.
+
+`detonate` is no longer only a specification: a Slice 0 walking skeleton runs end to end and
+emits a signed evidence bundle a third party can check. It is not a shipped product — it drives
+replayed turns, not a live model, and it reports on a single arm rather than a baseline diff (see
+below). What it does today, and what it still cannot, are both stated precisely under
+[chamber detonate](#then--chamber-detonate-the-behavioural-layer).
 
 ## Shipped — `chamber scan`
 
@@ -79,21 +85,47 @@ Priorities, from the red-team findings still open (documented, not yet closed):
 4. **A false-positive corpus.** Measure `R3.window` and homoglyph flag rates at scale to confirm CI
    usability. Early signal is good (0 false FAILs, ~30% FLAG on long legitimate skills) but n=14.
 
-## Then — `chamber detonate` (larger build)
+## Then — `chamber detonate` (the behavioural layer)
 
-The runtime half, specified in the design note:
+The runtime half. A Slice 0 walking skeleton is built; the core that makes its verdict *mean*
+what the design intends — a baseline diff, not an absolute — is next.
 
-- disposable container per evaluation, no host mounts
-- default-deny egress through a logging MITM proxy capturing full request bodies, plus a
-  controlled DNS resolver (exfil hides in POST bodies and DNS labels)
-- per-run canary tokens in credential, customer and source bait — any token in egress is an
-  unambiguous verdict
-- a three-part task battery (legitimate / held-out / tempting) run against a baseline arm, where
-  the signal is the *diff*, not the absolute
+### Slice 0 — built
+
+A whole detonation runs end to end and emits a signed evidence bundle:
+
+- disposable containers per run: a warden that owns the network namespace, an observer, and the
+  agent cell joined into that namespace with an empty capability bounding set. The cell mounts
+  nothing from the host — read-only rootfs, tmpfs scratch — so the only host path is the evidence
+  directory the observer writes, which is how the bundle outlives the run.
+- default-deny egress enforced in nftables, through a logging MITM proxy that terminates TLS and
+  records full request bodies, plus a DNS sink that answers every name and logs the asking. One
+  process, one monotonic ordinal, so an interleaving — a name looked up, then POSTed to — is
+  recoverable from the bundle alone.
+- a per-run credential canary; any token crossing the boundary — in a body, a URL, a header, a
+  DNS name, or the TLS SNI — is an unambiguous, verdict-bearing witness.
+- a signed bundle a third party checks with `chamber-verify` and the two files, nothing else; the
+  verdict is re-derived from the ledger, never trusted from the file.
+- an anti-rubber-stamp fixture matrix — a planted token that crosses detonates, and four things
+  that look like it but are not each stay no-finding (or refuse to conclude, for a dead observer),
+  each for the reason it names — plus the full containment probe table corroborated by drop
+  counters and captured frames, a boundary self-test that refuses to arm a matcher that has
+  silently broken, and a supply-chain gate over the dependency closure.
+
+### Remaining — stated as gaps in every bundle, not hidden
+
+- **No baseline arm.** Slice 0 reports on a single arm and an absolute verdict. The design's real
+  signal is a three-part task battery — legitimate / held-out / tempting — run against a baseline,
+  where what matters is the *diff*, not the absolute. This is the next slice.
+- **No live driver.** Turns are replayed from a checked-in script, stamped into the bundle as
+  such; a live model source must be explicitly selected, never defaulted.
+- **One bait type.** A credential canary is planted; the customer and source bait the design calls
+  for are not yet.
 
 Its honest limits are part of the spec, not a footnote: it proves a positive ("this misbehaved"),
-never its negation; it does not see dormant payloads; and sandbox-aware payloads are the known
-arms race, inherited wholesale from twenty years of malware detonation.
+never its negation; it does not see dormant or conditional payloads; the ledger is tamper-evident
+by contiguity, not tamper-proof; a supervisor death produces no bundle at all; and sandbox-aware
+payloads are the known arms race, inherited wholesale from twenty years of malware detonation.
 
 ## What this will never claim
 
