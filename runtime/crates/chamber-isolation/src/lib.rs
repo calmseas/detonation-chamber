@@ -1,0 +1,65 @@
+//! The boundary itself.
+//!
+//! Everything here needs a Linux guest, which is why it is a crate rather than
+//! a module: it means `cargo test -p chamber-evidence` stays container-free and
+//! the container gate is a crate boundary rather than a runtime `if`.
+//!
+//! # Built so far
+//!
+//! - [`docker`] — the container engine, driven by its CLI. Containers are
+//!   destroyed by the id captured at create, never by name or label.
+//! - [`preflight`] — the three structural asserts that must pass before any
+//!   containment claim is believable. All three are version-dependent and all
+//!   three fail silently if merely assumed.
+//! - [`probe`] — the outcome vocabulary the adversary probe reports in, and the
+//!   reader for it.
+//!
+//! The nftables ruleset, the tarpit route, the NFLOG collector, the agent cell
+//! and the sealed environment are **not built yet**, and the order in which
+//! they arrive is not arbitrary.
+//!
+//! # The ordering constraint that cannot be recovered
+//!
+//! **The unarmed positive control is written before the first nftables rule.**
+//!
+//! Once a ruleset exists there is no way back to a state in which the probe
+//! could have been observed succeeding. A probe broken by a typo — a wrong
+//! hostname, a port that was never listening, an image that lacks the tool it
+//! shells out to — fails for its own reasons and passes every containment test
+//! anyone will ever write against it. Eleven confident greens, none of which
+//! distinguish "the chamber blocked it" from "it never ran".
+//!
+//! So the baseline comes first: the same probe, the same targets, on a network
+//! with nothing blocking it, and it must *succeed*. Every armed assertion is
+//! then written as a delta against that baseline rather than as an absolute.
+//! See `chamber-e2e`'s containment suite, where the control lives.
+//!
+//! # Two things that will look wrong later and are not
+//!
+//! Recorded here because both are load-bearing and both read as mistakes to
+//! someone tidying up:
+//!
+//! 1. **The tarpit route** (`ip route add default via <capture>`) will be added
+//!    once the ruleset exists. Without it an off-subnet packet is rejected by
+//!    the *routing* layer with `ENETUNREACH` and never reaches netfilter — so
+//!    the drop counter stays at exactly zero and no frame is ever logged. The
+//!    chamber is contained and **blind**, which does not demonstrate anything.
+//!    It is safe only because containment does not depend on it: the output
+//!    policy is `drop`, forwarding is off, and no NAT exists for the subnet.
+//!
+//! 2. **The reset is scoped, never `flush ruleset`.** A full flush destroys
+//!    Docker's own `ip nat` table — the one that DNATs `127.0.0.11` to the
+//!    embedded resolver — and kills DNS for the entire network namespace. The
+//!    live ruleset says so itself: *"table ip nat is managed by iptables-nft,
+//!    do not touch!"*. Only `table inet chamber; delete table inet chamber;`.
+
+pub mod docker;
+pub mod preflight;
+pub mod probe;
+
+pub use docker::{
+    Attach, Container, ContainerSpec, Docker, DockerUnavailable, EngineError, EnvFile, ExecOutcome,
+    Network, NetworkSpec, build_image,
+};
+pub use preflight::{AssertOutcome, Preflight, PreflightFailure, StructuralAssert};
+pub use probe::{MalformedRow, ProbeReport, ProbeRow, Reach, RowId};

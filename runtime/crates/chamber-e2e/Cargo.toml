@@ -1,0 +1,23 @@
+[package]
+name = "chamber-e2e"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "The container gate: the containment probe suite and the fixture matrix. Tests only."
+
+# No lib and no bin target, deliberately: nothing can accidentally depend on
+# this crate, which is what makes `cargo test --workspace --exclude chamber-e2e`
+# a reliable name for the suite that needs no Linux guest. The test targets are
+# declared explicitly because a package with no `src/` has no target otherwise.
+[[test]]
+name = "containment"
+path = "tests/containment.rs"
+
+[[test]]
+name = "no_flush_ruleset"
+path = "tests/no_flush_ruleset.rs"
+
+[dev-dependencies]
+chamber-isolation = { path = "../chamber-isolation" }

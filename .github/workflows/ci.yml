@@ -20,10 +20,9 @@ jobs:
   # behavioural one.
   #
   # These are the container-free levels: everything that can be proved without
-  # a Linux guest. The containment and end-to-end suites arrive with the
-  # crates that need them, and when they do they must FAIL rather than skip
-  # when Docker is absent -- a suite that no-ops without a guest makes a green
-  # tick mean nothing.
+  # a Linux guest. The containment suite is the `containment` job below, and it
+  # FAILS rather than skips when Docker is absent -- a suite that no-ops
+  # without a guest makes a green tick mean nothing.
   runtime:
     runs-on: ubuntu-latest
     defaults:
@@ -41,7 +40,41 @@ jobs:
           workspaces: runtime
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo test --workspace
+      # chamber-e2e is excluded by NAME rather than by a runtime skip, which is
+      # what makes "the no-Docker suite" something you can actually name and
+      # run rather than something that quietly shrinks when a tool is missing.
+      - run: cargo test --workspace --exclude chamber-e2e
+      # ...except this one, which lives in chamber-e2e because it guards the
+      # containment work, but is a source scan and needs no engine at all.
+      - run: cargo test -p chamber-e2e --test no_flush_ruleset
+
+  # The container gate.
+  #
+  # This job must FAIL rather than skip when Docker is absent, which is what
+  # CHAMBER_REQUIRE_CONTAINERS flips on. No `continue-on-error`, deliberately:
+  # a containment result that can silently not-run is not a result.
+  containment:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: runtime
+    env:
+      CHAMBER_REQUIRE_CONTAINERS: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: runtime
+      # The unarmed positive control needs real egress. Rows 1, 2, 4 and 11
+      # keep their armed targets (8.8.8.8, 1.1.1.1) precisely so a typo'd
+      # destination cannot pass as containment -- which means the baseline run
+      # has to be able to reach them. If this job ever fails on those rows
+      # alone, suspect the runner's network before suspecting the chamber.
+      #
+      # Serialised: both tests raise fixed subnets, and in parallel they
+      # contend for engine-wide state.
+      - run: cargo test -p chamber-e2e --test containment -- --test-threads=1
 
   # The tool must survive being pointed at itself. A legibility checker that
   # cannot pass its own check has no business gating anyone else's artefacts.

@@ -304,6 +304,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "chamber-e2e"
+version = "0.1.0"
+dependencies = [
+ "chamber-isolation",
+]
+
+[[package]]
 name = "chamber-evidence"
 version = "0.1.0"
 dependencies = [
@@ -314,6 +321,14 @@ dependencies = [
  "serde",
  "serde_json",
  "zeroize",
+]
+
+[[package]]
+name = "chamber-isolation"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
