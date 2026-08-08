@@ -466,9 +466,35 @@ impl Drop for EnvFile {
 /// is where a missing package or a failed `apk add` actually says so.
 pub fn build_image(context_dir: &std::path::Path, tag: &str) -> Result<(), EngineError> {
     let dir = context_dir.to_string_lossy().into_owned();
-    must_run(&["build", "-t", tag, &dir], Duration::from_secs(15 * 60))?;
+    must_run(&["build", "-t", tag, &dir], BUILD_WINDOW)?;
     Ok(())
 }
+
+/// Builds an image whose Dockerfile lives outside its build context.
+///
+/// The capture image needs this: its Dockerfile sits in `images/capture/` but
+/// it compiles the workspace, so its context must be `runtime/`. Pointing the
+/// context at the Dockerfile's own directory instead would produce a build that
+/// cannot see a single crate.
+///
+/// # Errors
+/// [`EngineError`] carrying the builder's stderr, which is where a missing
+/// package or a failed compile actually says so.
+pub fn build_image_with_dockerfile(
+    context_dir: &std::path::Path,
+    dockerfile: &std::path::Path,
+    tag: &str,
+) -> Result<(), EngineError> {
+    let dir = context_dir.to_string_lossy().into_owned();
+    let file = dockerfile.to_string_lossy().into_owned();
+    must_run(&["build", "-f", &file, "-t", tag, &dir], BUILD_WINDOW)?;
+    Ok(())
+}
+
+/// Generous on purpose. The capture image compiles ~290 crates including two
+/// crypto backends, one of which is a cmake + C build, and a cold build on a
+/// CI runner is minutes rather than seconds.
+const BUILD_WINDOW: Duration = Duration::from_secs(30 * 60);
 
 /// Where a container's network stack comes from.
 #[derive(Debug, Clone)]

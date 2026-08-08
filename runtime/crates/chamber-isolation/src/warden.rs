@@ -272,7 +272,17 @@ impl Warden {
             argv: vec!["sleep".into(), "infinity".into()],
             sysctls: vec![],
             env_file: None,
-            dns: vec![],
+            // The resolver is configured HERE, not on the agent cell, and that
+            // is forced rather than preferred: a container joining another's
+            // namespace cannot carry its own resolver, and the engine rejects
+            // the attempt outright — "conflicting options: dns and the network
+            // mode". Such a cell inherits the resolver configuration of the
+            // container whose namespace it joined, which is this one.
+            //
+            // So an artefact's name lookups reach the observer because the
+            // warden points at it. The ruleset's accept for the capture address
+            // on port 53 is what lets the forwarded query leave.
+            dns: vec![NetFabric::CAPTURE_IP.to_owned()],
             read_only: false,
             tmpfs: vec![],
         })?;

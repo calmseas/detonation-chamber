@@ -1,0 +1,9 @@
+# The capture image builds with `runtime/` as its context, so everything here
+# is sent to the daemon unless excluded.
+#
+# `target/` is the one that matters: on CI it is gigabytes of build output, and
+# copying it in would both slow the build and risk a stale artifact being
+# picked up instead of one built inside the image.
+target/
+images/
+.dockerignore
