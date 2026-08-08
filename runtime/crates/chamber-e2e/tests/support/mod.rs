@@ -138,6 +138,19 @@ pub fn chamber_subnet_lock() -> MutexGuard<'static, ()> {
         .unwrap_or_else(|e| e.into_inner())
 }
 
+/// Whether the chamber's egress network currently exists.
+///
+/// A leaked container attached to it keeps it un-removable, so its survival
+/// past a refusal is the visible symptom of an arming teardown that missed
+/// something.
+pub fn chamber_network_exists() -> bool {
+    Command::new("docker")
+        .args(["network", "inspect", "chamber-egress"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
 /// Container ids currently running from an image tag, via the engine's own ps.
 ///
 /// Row 5 uses this to find and kill the observer mid-run. Safe because the

@@ -148,23 +148,50 @@ pub struct RunEpilogue {
 /// is up.
 #[derive(Default)]
 struct ArmingGuard {
+    cell: Option<AgentCell>,
     capture: Option<Container>,
+    warden: Option<ObservedWarden>,
     fabric: Option<NetFabric>,
 }
 
 impl ArmingGuard {
-    fn disarm(&mut self) -> (Option<Container>, Option<NetFabric>) {
-        (self.capture.take(), self.fabric.take())
+    #[allow(clippy::type_complexity)]
+    fn disarm(
+        &mut self,
+    ) -> (
+        Option<AgentCell>,
+        Option<Container>,
+        Option<ObservedWarden>,
+        Option<NetFabric>,
+    ) {
+        (
+            self.cell.take(),
+            self.capture.take(),
+            self.warden.take(),
+            self.fabric.take(),
+        )
     }
 }
 
 impl Drop for ArmingGuard {
     fn drop(&mut self) {
-        // Containers first: a network with something attached cannot be
-        // removed, and the resulting error would be reported in place of
-        // whatever actually went wrong.
+        // Everything raised, innermost out, and every container before the
+        // network. The cell joins the warden's netns, so it goes first; the
+        // warden and observer are endpoints on the fabric, so both go before
+        // it. A network with an endpoint still attached cannot be removed —
+        // leaving it behind for the next run to trip over as `chamber-egress
+        // already exists`, a second error that hides the one that actually
+        // refused. Guarding only some of what was raised is how that leak got
+        // in: a refusal after the warden was up left the warden, and the
+        // network with it.
+        if let Some(cell) = self.cell.take() {
+            let _ = cell.destroy(OP_WINDOW);
+        }
         if let Some(capture) = self.capture.take() {
             let _ = capture.destroy(OP_WINDOW);
+        }
+        if let Some(warden) = self.warden.take() {
+            let _ = warden.destroy();
         }
         if let Some(fabric) = self.fabric.take() {
             let _ = fabric.destroy();
@@ -221,52 +248,65 @@ pub async fn run_detonation(
     arming.capture = Some(start_observer(plan, fabric, &ledger_path)?);
     let capture = arming.capture.as_ref().expect("just set");
 
-    let warden = arm_warden(plan, fabric).map_err(ArmingRefusal::Chamber)?;
+    // All of it under the guard from here: a refusal after the warden is raised
+    // must not leave the warden — and the network it is attached to — behind.
+    arming.warden = Some(arm_warden(plan, fabric).map_err(ArmingRefusal::Chamber)?);
     let sealed_env = seal_cell_environment(plan, capture).map_err(ArmingRefusal::Environment)?;
 
     let cell = AgentCell::start(
-        &warden,
+        arming.warden.as_ref().expect("just set"),
         &sealed_env.env,
         &GuestImage::tagged(&plan.images.guest),
     )
     .map_err(|e| ArmingRefusal::Chamber(e.to_string()))?;
-    cell.write_file(&sealed_env.anchor_path, sealed_env.ca_pem.as_bytes())
+    arming.cell = Some(cell);
+    arming
+        .cell
+        .as_ref()
+        .expect("just set")
+        .write_file(&sealed_env.anchor_path, sealed_env.ca_pem.as_bytes())
         .map_err(|e| ArmingRefusal::Chamber(format!("placing the trust anchor: {e}")))?;
 
-    // ---- armed. From here nothing aborts the run. --------------------------
+    // ---- armed. From here nothing aborts the run. The guard stays armed
+    //      through the turn loop, so an unexpected early exit still tears the
+    //      chamber down; it is disarmed only when ownership passes to the
+    //      wind-down. -------------------------------------------------------
 
     let mut transcript = Transcript::new();
     let bridge = ToolBridge::new();
-    for _ in 0..plan.max_turns {
-        let directive = match turns.next_turn(&transcript).await {
-            Ok(d) => d,
-            // A turn source that cannot produce a turn ends the run; it does
-            // not end the evidence. The wind-down still happens below.
-            Err(e) => {
-                eprintln!("chamber: turn source stopped: {e}");
+    {
+        let cell = arming.cell.as_ref().expect("armed");
+        for _ in 0..plan.max_turns {
+            let directive = match turns.next_turn(&transcript).await {
+                Ok(d) => d,
+                // A turn source that cannot produce a turn ends the run; it does
+                // not end the evidence. The wind-down still happens below.
+                Err(e) => {
+                    eprintln!("chamber: turn source stopped: {e}");
+                    break;
+                }
+            };
+            let concluding = matches!(directive, TurnDirective::Conclude);
+            match bridge.carry_out(cell, &directive) {
+                Ok(record) => transcript.record(record),
+                Err(e) => {
+                    eprintln!("chamber: the cell could not be driven: {e}");
+                    break;
+                }
+            }
+            if concluding {
                 break;
             }
-        };
-        let concluding = matches!(directive, TurnDirective::Conclude);
-        match bridge.carry_out(&cell, &directive) {
-            Ok(record) => transcript.record(record),
-            Err(e) => {
-                eprintln!("chamber: the cell could not be driven: {e}");
-                break;
-            }
-        }
-        if concluding {
-            break;
         }
     }
 
     // The chamber is up and its ownership moves to the wind-down, so the
     // arming guard must not destroy any of it.
     let turns_taken = transcript.len();
-    let (capture, fabric) = arming.disarm();
+    let (cell, capture, warden, fabric) = arming.disarm();
     let chamber = RefCell::new(LiveChamber {
-        cell: Some(cell),
-        warden: Some(warden),
+        cell,
+        warden,
         capture,
         fabric,
     });

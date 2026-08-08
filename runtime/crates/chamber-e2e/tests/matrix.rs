@@ -588,6 +588,68 @@ fn a_chamber_that_cannot_be_raised_refuses_rather_than_reporting_nothing() {
     let _ = std::fs::remove_dir_all(&evidence);
 }
 
+/// A refusal AFTER the warden is raised must leave nothing behind.
+///
+/// The arming guard has to tear down everything it raised, not just the pieces
+/// it happens to hold: a warden left attached to `chamber-egress` keeps the
+/// network un-removable, and the next run then refuses on `network already
+/// exists` — a second, unrelated error that hides the first. An invalid canary
+/// variable name raises the fabric, the observer and the warden, then refuses
+/// at the environment seal — the exact late-refusal window this guards.
+#[test]
+fn a_refusal_after_the_warden_is_raised_leaves_no_chamber_behind() {
+    let Some(_engine) = require_containers() else {
+        return;
+    };
+    ensure_images();
+    let _serial = chamber_subnet_lock();
+
+    // Clean slate, so a surviving network can only be this run's leak.
+    let _ = Command::new("docker")
+        .args(["network", "rm", "chamber-egress"])
+        .output();
+
+    let evidence = shared_scratch(&format!("late-refusal-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&evidence);
+    let mut turns = ScriptedTurns::from_bytes("t.json", b"[{\"do\":\"conclude\"}]").expect("parse");
+
+    // A valid label (so the observer starts) but an invalid variable name, so
+    // the seal refuses at VarName::parse — after arm_warden has run.
+    let plan = plan_with(
+        evidence.clone(),
+        vec![PlantedCanary {
+            label: "aws-key".into(),
+            value: CANARY.into(),
+            var: "9-not-a-valid-env-name".into(),
+        }],
+    );
+
+    let refusal = block_on(async {
+        tokio::time::timeout(Duration::from_secs(300), run_detonation(&plan, &mut turns))
+            .await
+            .expect("the refusal must not hang")
+    })
+    .expect_err("an invalid canary variable must refuse, not run");
+    assert!(refusal.to_string().contains("REFUSED TO ARM"), "{refusal}");
+
+    // The teardown the guard owes: nothing it raised may survive the refusal.
+    assert!(
+        !chamber_network_exists(),
+        "the chamber-egress network survived a late refusal; the warden it holds \
+         will make the next run fail on `network already exists`"
+    );
+    assert!(
+        running_ids_from_image("chamber-warden:test").is_empty(),
+        "the warden leaked past the refusal"
+    );
+    assert!(
+        running_ids_from_image("chamber-capture:test").is_empty(),
+        "the observer leaked past the refusal"
+    );
+
+    let _ = std::fs::remove_dir_all(&evidence);
+}
+
 // ---- Cross-layer: the static and runtime halves, tied together -------------
 
 /// Runs the Python `chamber scan` over a fixture and returns its exit code.
