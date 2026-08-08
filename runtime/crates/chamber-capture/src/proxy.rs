@@ -132,7 +132,7 @@ impl InterceptingProxy {
         // TLS, so it carries none — which is correct, not a gap.
         let sni = self.sni.clone();
         if let Some(name) = &sni {
-            hits.extend(self.canaries.scan_dns_name(name));
+            hits.extend(self.canaries.scan_sni(name));
         }
 
         self.recorder.note(
@@ -380,6 +380,14 @@ mod tests {
         assert!(
             r.observations()[0].is_witness(),
             "a token carried in the SNI slipped past as no finding"
+        );
+        assert!(
+            r.observations()[0]
+                .canary_hits()
+                .iter()
+                .any(|h| h.field == chamber_evidence::HitField::Sni),
+            "the SNI hit was recorded on the wrong field, so a fronted request \
+             would read as a DNS exfil"
         );
     }
 

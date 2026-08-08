@@ -175,23 +175,38 @@ impl CanarySet {
         hits
     }
 
-    /// Search a DNS name, honouring the case-insensitivity of DNS itself.
+    /// Search a DNS query name, recording hits on [`HitField::QName`].
+    pub fn scan_dns_name(&self, name: &str) -> Vec<CanaryHit> {
+        self.scan_hostname(name, HitField::QName)
+    }
+
+    /// Search a TLS server name, recording hits on [`HitField::Sni`].
     ///
-    /// This is not a convenience. A resolver is free to alter the case of a
-    /// name — many deliberately do — and an attacker can simply send the token
-    /// lower-cased, since `AKIA….evil.example` and `akia….evil.example`
-    /// resolve identically. A case-sensitive scan therefore misses DNS
-    /// exfiltration outright, which is exactly the channel most worth
-    /// catching, because it needs no reply to succeed.
+    /// SNI is a case-insensitive hostname exactly like a DNS name, so it is
+    /// folded the same way; the only difference is the field the hit records,
+    /// and that difference is the whole point — it tells a token leaving in a
+    /// DNS query apart from one leaving in the SNI of a fronted request.
+    pub fn scan_sni(&self, name: &str) -> Vec<CanaryHit> {
+        self.scan_hostname(name, HitField::Sni)
+    }
+
+    /// Search a case-insensitive hostname — a DNS name or a TLS SNI.
+    ///
+    /// The case-folding is not a convenience. A resolver is free to alter the
+    /// case of a name — many deliberately do — and an attacker can simply send
+    /// the token lower-cased, since `AKIA….evil.example` and
+    /// `akia….evil.example` resolve identically. A case-sensitive scan
+    /// therefore misses hostname exfiltration outright, which is exactly the
+    /// channel most worth catching, because it needs no reply to succeed.
     ///
     /// Only the forms that survive case-folding are matched loosely: the raw
     /// token and the label-joined token, plus hex, which is already searched in
     /// both cases. Base64 and percent-encoding stay case-sensitive — folding
     /// them would compare strings that are not the same bytes, and an attacker
     /// cannot use them through a case-insensitive channel anyway.
-    pub fn scan_dns_name(&self, name: &str) -> Vec<CanaryHit> {
+    fn scan_hostname(&self, name: &str, field: HitField) -> Vec<CanaryHit> {
         let folded = name.to_ascii_lowercase();
-        let mut hits = self.scan(HitField::QName, name.as_bytes());
+        let mut hits = self.scan(field.clone(), name.as_bytes());
 
         for canary in &self.canaries {
             if hits.iter().any(|h| h.label == canary.label) {
@@ -202,14 +217,14 @@ impl CanarySet {
             if let Some(offset) = find(folded.as_bytes(), token.as_bytes()) {
                 hits.push(CanaryHit {
                     label: canary.label.clone(),
-                    field: HitField::QName,
+                    field: field.clone(),
                     encoding: HitEncoding::Raw,
                     offset: offset as u64,
                 });
             } else if let Some(offset) = find_across_labels(folded.as_bytes(), token.as_bytes()) {
                 hits.push(CanaryHit {
                     label: canary.label.clone(),
-                    field: HitField::QName,
+                    field: field.clone(),
                     encoding: HitEncoding::LabelJoin,
                     offset: offset as u64,
                 });
