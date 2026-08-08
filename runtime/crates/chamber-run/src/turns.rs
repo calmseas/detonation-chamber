@@ -158,6 +158,26 @@ impl std::fmt::Display for TurnError {
 
 impl std::error::Error for TurnError {}
 
+/// What the cell returned for the turn just carried out, raw.
+///
+/// The counterpart to [`TurnRecord`], and the difference between them is the
+/// point. A record is what the run will be *accountable* for, so it is
+/// length-only and travels into the bundle. This is what a live driver needs to
+/// *think* with — a model that cannot see what its last command printed is not
+/// choosing anything — so it is the output verbatim, borrowed for the length of
+/// the call and never stored by the loop.
+///
+/// Nothing here reaches the bundle. A driver that keeps it keeps it in its own
+/// working memory, which is where the design puts the boundary.
+#[derive(Copy, Clone, Debug)]
+pub struct CellOutput<'a> {
+    pub directive: &'a TurnDirective,
+    pub stdout: &'a str,
+    pub stderr: &'a str,
+    /// `None` when the command produced no exit status at all.
+    pub exit_code: Option<i32>,
+}
+
 /// Decides what the artefact does next.
 #[async_trait::async_trait]
 pub trait TurnSource: Send {
@@ -168,6 +188,17 @@ pub trait TurnSource: Send {
     /// Stamped into the bundle. Not derived from anything the run does, so it
     /// cannot drift from the truth.
     fn provenance(&self) -> TurnProvenance;
+
+    /// What the cell returned for the turn just carried out.
+    ///
+    /// Called once per turn that actually reached the cell — never for
+    /// [`TurnDirective::Conclude`], which runs nothing, and so would otherwise
+    /// hand a driver an exchange that did not happen.
+    ///
+    /// Ignored by default, because a replay does not react to what happened and
+    /// requiring it to say so would be ceremony. A live source overrides this;
+    /// it is the only way the raw output reaches one.
+    fn observe(&mut self, _outcome: &CellOutput<'_>) {}
 }
 
 /// Replays a checked-in JSON sequence.

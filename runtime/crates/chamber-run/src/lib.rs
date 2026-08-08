@@ -42,13 +42,14 @@ pub mod run;
 pub mod turns;
 pub mod winddown;
 
-pub use bridge::{ToolBridge, TurnTarget};
+pub use bridge::{CarriedTurn, ToolBridge, TurnTarget};
 pub use bundle::{BoundaryState, Emitted, Observed, emit};
 pub use run::{
     ArmingRefusal, DetonationPlan, ImageTags, PlantedCanary, RunEpilogue, run_detonation,
 };
 pub use turns::{
-    ScriptedTurns, Transcript, TurnDirective, TurnError, TurnProvenance, TurnRecord, TurnSource,
+    CellOutput, ScriptedTurns, Transcript, TurnDirective, TurnError, TurnProvenance, TurnRecord,
+    TurnSource,
 };
 pub use winddown::wind_down;
 

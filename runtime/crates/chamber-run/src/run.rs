@@ -36,10 +36,10 @@ use chamber_isolation::{
     GuestImage, GuestRoot, NetFabric, ObservedWarden, Preflight, Rationale, VarName, Warden,
 };
 
-use crate::bridge::ToolBridge;
+use crate::bridge::{ToolBridge, TurnTarget};
 use crate::bundle::{self, Observed};
 use crate::exit_code_for;
-use crate::turns::{Transcript, TurnDirective, TurnSource};
+use crate::turns::{CellOutput, Transcript, TurnDirective, TurnSource};
 use crate::winddown::wind_down;
 
 const OP_WINDOW: Duration = Duration::from_secs(120);
@@ -272,33 +272,10 @@ pub async fn run_detonation(
     //      chamber down; it is disarmed only when ownership passes to the
     //      wind-down. -------------------------------------------------------
 
-    let mut transcript = Transcript::new();
-    let bridge = ToolBridge::new();
-    {
+    let transcript = {
         let cell = arming.cell.as_ref().expect("armed");
-        for _ in 0..plan.max_turns {
-            let directive = match turns.next_turn(&transcript).await {
-                Ok(d) => d,
-                // A turn source that cannot produce a turn ends the run; it does
-                // not end the evidence. The wind-down still happens below.
-                Err(e) => {
-                    eprintln!("chamber: turn source stopped: {e}");
-                    break;
-                }
-            };
-            let concluding = matches!(directive, TurnDirective::Conclude);
-            match bridge.carry_out(cell, &directive) {
-                Ok(record) => transcript.record(record),
-                Err(e) => {
-                    eprintln!("chamber: the cell could not be driven: {e}");
-                    break;
-                }
-            }
-            if concluding {
-                break;
-            }
-        }
-    }
+        drive_turns(turns, &ToolBridge::new(), cell, plan.max_turns).await
+    };
 
     // The chamber is up and its ownership moves to the wind-down, so the
     // arming guard must not destroy any of it.
@@ -417,6 +394,57 @@ pub async fn run_detonation(
         trace,
         turns_taken,
     })
+}
+
+/// Drives the artefact for up to `max_turns`, or until it concludes.
+///
+/// Split out of [`run_detonation`] so the loop's behaviour — what it does with
+/// a source that stops, a cell that cannot be driven, a `Conclude` — is
+/// testable without a Linux guest, the same reason [`TurnTarget`] exists.
+///
+async fn drive_turns(
+    turns: &mut dyn TurnSource,
+    bridge: &ToolBridge,
+    target: &impl TurnTarget,
+    max_turns: u32,
+) -> Transcript {
+    let mut transcript = Transcript::new();
+    for _ in 0..max_turns {
+        let directive = match turns.next_turn(&transcript).await {
+            Ok(d) => d,
+            // A turn source that cannot produce a turn ends the run; it does
+            // not end the evidence. The wind-down still happens.
+            Err(e) => {
+                eprintln!("chamber: turn source stopped: {e}");
+                break;
+            }
+        };
+        let concluding = matches!(directive, TurnDirective::Conclude);
+        match bridge.carry_out_observed(target, &directive) {
+            Ok(carried) => {
+                // The driver first, then the transcript: it chooses its next
+                // action from what this one printed. Concluding ran nothing,
+                // so there is no exchange to show it.
+                if !concluding {
+                    turns.observe(&CellOutput {
+                        directive: &directive,
+                        stdout: carried.stdout(),
+                        stderr: carried.stderr(),
+                        exit_code: carried.record().exit_code,
+                    });
+                }
+                transcript.record(carried.into_record());
+            }
+            Err(e) => {
+                eprintln!("chamber: the cell could not be driven: {e}");
+                break;
+            }
+        }
+        if concluding {
+            break;
+        }
+    }
+    transcript
 }
 
 /// The observer, at the address the ruleset accepts and the resolver points at.
@@ -582,4 +610,188 @@ fn seal_cell_environment(
         anchor_path,
         ca_pem,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::turns::{CellOutput, TurnError, TurnProvenance};
+    use chamber_isolation::{CellError, ExecOutcome};
+
+    /// Answers every command with the same canned output.
+    struct EchoCell {
+        stdout: String,
+        stderr: String,
+    }
+
+    impl EchoCell {
+        fn printing(stdout: &str) -> Self {
+            Self {
+                stdout: stdout.to_owned(),
+                stderr: String::new(),
+            }
+        }
+    }
+
+    impl TurnTarget for EchoCell {
+        fn run(&self, _argv: &[&str], _within: Duration) -> Result<ExecOutcome, CellError> {
+            Ok(ExecOutcome {
+                status: Some(0),
+                stdout: self.stdout.clone(),
+                stderr: self.stderr.clone(),
+            })
+        }
+    }
+
+    /// Runs a fixed plan and remembers everything the loop showed it.
+    #[derive(Default)]
+    struct SpySource {
+        plan: Vec<TurnDirective>,
+        next: usize,
+        seen: Vec<(String, Option<i32>)>,
+    }
+
+    impl SpySource {
+        fn running(plan: Vec<TurnDirective>) -> Self {
+            Self {
+                plan,
+                ..Self::default()
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl TurnSource for SpySource {
+        async fn next_turn(&mut self, _t: &Transcript) -> Result<TurnDirective, TurnError> {
+            let directive = self
+                .plan
+                .get(self.next)
+                .cloned()
+                .ok_or(TurnError::ScriptExhausted { taken: self.next })?;
+            self.next += 1;
+            Ok(directive)
+        }
+
+        fn provenance(&self) -> TurnProvenance {
+            TurnProvenance::Live {
+                model: "spy".to_owned(),
+            }
+        }
+
+        fn observe(&mut self, outcome: &CellOutput<'_>) {
+            self.seen
+                .push((outcome.stdout.to_owned(), outcome.exit_code));
+        }
+    }
+
+    /// A source that overrides nothing, to pin the default down.
+    #[derive(Default)]
+    struct DeafSource {
+        turns_asked: usize,
+    }
+
+    #[async_trait::async_trait]
+    impl TurnSource for DeafSource {
+        async fn next_turn(&mut self, _t: &Transcript) -> Result<TurnDirective, TurnError> {
+            self.turns_asked += 1;
+            Ok(TurnDirective::Conclude)
+        }
+
+        fn provenance(&self) -> TurnProvenance {
+            TurnProvenance::Scripted {
+                path: "none".to_owned(),
+                digest: String::new(),
+            }
+        }
+    }
+
+    /// D8. Without this the model chooses its next action blind, and the
+    /// artefact's power to suborn it cannot be observed at all.
+    #[tokio::test]
+    async fn the_loop_hands_the_raw_output_to_the_turn_source() {
+        let cell = EchoCell::printing("AWS_SECRET_ACCESS_KEY=AKIAIOSFODNN7EXAMPLE");
+        let mut source = SpySource::running(vec![
+            TurnDirective::ReadFile {
+                at: PathBuf::from("/work/.env"),
+            },
+            TurnDirective::Conclude,
+        ]);
+
+        drive_turns(&mut source, &ToolBridge::new(), &cell, 8).await;
+
+        assert_eq!(
+            source.seen,
+            vec![(
+                "AWS_SECRET_ACCESS_KEY=AKIAIOSFODNN7EXAMPLE".to_owned(),
+                Some(0)
+            )],
+            "the driver was not shown what the cell printed"
+        );
+    }
+
+    /// Concluding runs nothing, so there is no exchange to observe. Handing the
+    /// driver an empty one would put a turn that never happened into the
+    /// history it builds its next prompt from.
+    #[tokio::test]
+    async fn concluding_is_not_an_observed_exchange() {
+        let cell = EchoCell::printing("ignored");
+        let mut source = SpySource::running(vec![TurnDirective::Conclude]);
+
+        drive_turns(&mut source, &ToolBridge::new(), &cell, 8).await;
+
+        assert!(source.seen.is_empty(), "{:?}", source.seen);
+    }
+
+    /// The transcript's account stays length-only however much the cell
+    /// printed. This is the invariant the whole raw-output path is arranged
+    /// around: the driver sees the output, the bundle never does.
+    #[tokio::test]
+    async fn what_the_driver_sees_does_not_reach_the_transcript() {
+        let cell = EchoCell::printing("AKIAIOSFODNN7EXAMPLE");
+        let mut source = SpySource::running(vec![
+            TurnDirective::ReadFile {
+                at: PathBuf::from("/work/.env"),
+            },
+            TurnDirective::Conclude,
+        ]);
+
+        let transcript = drive_turns(&mut source, &ToolBridge::new(), &cell, 8).await;
+
+        let printed = format!("{:?}", transcript.entries());
+        assert!(
+            !printed.contains("AKIAIOSFODNN7EXAMPLE"),
+            "the transcript carries the output itself: {printed}"
+        );
+        assert_eq!(transcript.entries()[0].output_len, 20);
+    }
+
+    /// A replay does not react to what happened, so it must not have to say so.
+    /// The default keeps `ScriptedTurns` — and any future source — unchanged.
+    #[tokio::test]
+    async fn observing_is_optional() {
+        let cell = EchoCell::printing("whatever");
+        let mut source = DeafSource::default();
+
+        let transcript = drive_turns(&mut source, &ToolBridge::new(), &cell, 8).await;
+
+        assert_eq!(source.turns_asked, 1);
+        assert_eq!(transcript.len(), 1);
+    }
+
+    /// The cap is the cap, even for a source that never concludes.
+    #[tokio::test]
+    async fn the_turn_cap_stops_a_source_that_runs_forever() {
+        let cell = EchoCell::printing("out");
+        let mut source = SpySource::running(vec![
+            TurnDirective::RunCommand {
+                argv: vec!["true".to_owned()],
+            };
+            50
+        ]);
+
+        let transcript = drive_turns(&mut source, &ToolBridge::new(), &cell, 3).await;
+
+        assert_eq!(transcript.len(), 3);
+        assert_eq!(source.seen.len(), 3);
+    }
 }

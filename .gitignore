@@ -9,3 +9,5 @@ build/
 .DS_Store
 target/
 .plans/
+mutants.out/
+mutants.out.old/
