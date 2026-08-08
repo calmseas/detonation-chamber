@@ -1,0 +1,49 @@
+# Supply-chain gate for the runtime workspace. CI runs `cargo deny check
+# advisories bans`. The crates this protects are the ones whose whole job is to
+# eat hostile input -- the intercepting TLS proxy, the HTTP stack, the DNS
+# resolver, the per-run CA -- so a silently-introduced second major of any of
+# them is exactly the drift worth failing a build over.
+
+[graph]
+# Pin the graph to the CI target so this check gives the same answer on a
+# developer's macOS as on the Linux runner. Duplicate versions are
+# platform-conditional (Windows and macOS shims pull their own), and a skip list
+# tuned to the host would pass locally and fail in CI, or the reverse. The
+# audit job runs on ubuntu-latest, so that is the graph that governs.
+targets = ["x86_64-unknown-linux-gnu"]
+
+[advisories]
+version = 2
+# hickory 0.26.0 carried RUSTSEC-2026-0119 and -0120, both DoS bugs in the
+# resolver -- the component that parses untrusted DNS. In v2 an advisory match
+# is a hard failure, so this check IS the pin: a downgrade to 0.26.0 stops the
+# build. Nothing is ignored; a new advisory against the stack should too.
+ignore = []
+
+[bans]
+# A second major of anything is denied. The critical stack (rustls, hyper,
+# tokio, rcgen, hickory-*) carries none, and this keeps it that way. The few
+# platform / proc-macro crates that legitimately carry two on the Linux graph
+# are skipped by exact version below -- each a reviewed exception.
+multiple-versions = "deny"
+skip = [
+    "getrandom@0.2.17",     # older entropy path; rand vs the newer std path
+    "syn@2.0.119",          # proc-macro crates split across syn 2 and 3
+    "webpki-roots@0.26.11", # rustls root bundle carries two majors in the tree
+]
+
+[licenses]
+# Not exercised by the CI `check advisories bans` invocation; a permissive set
+# so a bare `cargo deny check` run does not error on an unconfigured section.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    "MPL-2.0",
+    "CC0-1.0",
+]

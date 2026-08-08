@@ -125,3 +125,18 @@ jobs:
             exit 1
           fi
           echo "chamber scan: exit $status (0=pass, 1=flag, both acceptable)"
+
+  # Nothing scanned the dependency closure until now. `runtime/deny.toml` denies
+  # a second major of anything (the TLS/HTTP/DNS/cert stack has none, and this
+  # keeps it so) and, via the advisories check, hard-fails on a known-vulnerable
+  # dependency -- the hickory 0.26.0 DoS advisories being the concrete reason.
+  # The graph in deny.toml is pinned to this runner's target so the result here
+  # matches a developer's local `cargo deny`.
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          manifest-path: runtime/Cargo.toml
+          command: check advisories bans
