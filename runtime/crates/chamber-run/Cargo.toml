@@ -24,4 +24,6 @@ serde_json = { workspace = true }
 tokio = { version = "1", features = ["rt", "macros", "time", "rt-multi-thread"] }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+# `test-util` is what gives the wind-down tests a paused clock, so a sequence
+# built around a real time budget is exercised without spending one.
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "test-util"] }

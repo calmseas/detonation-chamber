@@ -8,10 +8,11 @@
 //! - [`turns`] — where the artefact's actions come from, and the provenance
 //!   stamped into the bundle so a replayed sequence never reads as a model's
 //!   decisions.
+//! - [`winddown`] — halt, seal, tear down, record, in that order and all four
+//!   regardless of which of them failed.
 //! - [`exit_code_for`] — the mapping from verdict to process exit status.
 //!
-//! The turn driver, the tool bridge, the wind-down and bundle emission are not
-//! built yet.
+//! The turn driver, the tool bridge and bundle emission are not built yet.
 //!
 //! # What this crate must never do
 //!
@@ -33,10 +34,12 @@
 //!   code under test.
 
 pub mod turns;
+pub mod winddown;
 
 pub use turns::{
     ScriptedTurns, Transcript, TurnDirective, TurnError, TurnProvenance, TurnRecord, TurnSource,
 };
+pub use winddown::wind_down;
 
 use chamber_evidence::Verdict;
 
