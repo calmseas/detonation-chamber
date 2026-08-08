@@ -173,6 +173,18 @@ fn total_canary_hits(b: &OpenedBundle) -> usize {
         .sum()
 }
 
+/// Every SNI the observer recorded across the run's HTTP exchanges.
+fn recorded_snis(b: &OpenedBundle) -> Vec<String> {
+    b.ledger
+        .entries()
+        .iter()
+        .filter_map(|o| match o.kind() {
+            ObservationKind::HttpExchange { sni, .. } => sni.clone(),
+            _ => None,
+        })
+        .collect()
+}
+
 /// The line a human reads first. The one place a `no_finding` could be dressed
 /// up as reassurance, so it is the one place the words are forbidden.
 fn verdict_line(report: &str) -> String {
@@ -291,6 +303,16 @@ fn row1_a_planted_token_that_crosses_detonates() {
         TurnProvenance::Scripted { .. }
     ));
     assert_no_raw_canary(&ep);
+
+    // The observer recovered the name the guest negotiated in TLS, not just the
+    // request line. The exfil went to https://collector.example, so its SNI
+    // must be in the ledger — the end-to-end proof that ClientHello extraction
+    // reaches the observation, which no in-process test can give.
+    assert!(
+        recorded_snis(&b).iter().any(|s| s == "collector.example"),
+        "the observer recorded no SNI for the TLS exfil: {:?}",
+        recorded_snis(&b)
+    );
 
     let _ = std::fs::remove_dir_all(&evidence);
 }

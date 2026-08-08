@@ -43,10 +43,19 @@ use crate::recorder::Recorder;
 const MAX_RETAINED_BODY: usize = 64 * 1024;
 
 /// Records everything that reaches it, and lets nothing through.
+///
+/// hudsucker clones the handler once per connection, so `sni` is per-connection
+/// state: [`should_intercept_tls`](HttpHandler::should_intercept_tls) reads the
+/// server name out of the TLS ClientHello and stashes it here, and the requests
+/// that follow on that same connection carry it into their observations. It is
+/// recorded *separately* from the request authority on purpose — a CONNECT to
+/// one host with an SNI for another is domain fronting, and only keeping both
+/// can tell them apart.
 #[derive(Clone)]
 pub struct InterceptingProxy {
     recorder: Arc<Recorder>,
     canaries: CanarySet,
+    sni: Option<String>,
 }
 
 impl InterceptingProxy {
@@ -61,7 +70,11 @@ impl InterceptingProxy {
     pub const INTERCEPT_EVERYTHING: bool = true;
 
     pub fn new(recorder: Arc<Recorder>, canaries: CanarySet) -> Self {
-        Self { recorder, canaries }
+        Self {
+            recorder,
+            canaries,
+            sni: None,
+        }
     }
 
     /// Record a request and decide its fate.
@@ -114,12 +127,20 @@ impl InterceptingProxy {
         let mut hits = self.scan_metadata(&target, &authority, &headers);
         hits.extend(self.canaries.scan(HitField::Body, &raw));
 
+        // The name from the ClientHello of the connection this request arrived
+        // on, if it was an intercepted TLS one. A CONNECT arrives before any
+        // TLS, so it carries none — which is correct, not a gap.
+        let sni = self.sni.clone();
+        if let Some(name) = &sni {
+            hits.extend(self.canaries.scan_dns_name(name));
+        }
+
         self.recorder.note(
             Channel::NetworkEgress,
             ObservationKind::HttpExchange {
                 method,
                 authority,
-                sni: None,
+                sni,
                 target,
                 headers,
                 body: retain(raw),
@@ -194,8 +215,13 @@ impl HttpHandler for InterceptingProxy {
     async fn should_intercept_tls(
         &mut self,
         _ctx: &HttpContext,
-        _client_hello: hudsucker::rustls::server::ClientHello<'_>,
+        client_hello: hudsucker::rustls::server::ClientHello<'_>,
     ) -> bool {
+        // The handler is a per-connection clone, so this name belongs to the
+        // requests that will follow on this connection. Recorded even though we
+        // always intercept: the SNI is evidence of where the guest meant to go,
+        // which the request authority can disagree with.
+        self.sni = client_hello.server_name().map(str::to_owned);
         Self::INTERCEPT_EVERYTHING
     }
 }
@@ -319,6 +345,42 @@ mod tests {
             .await;
 
         assert!(r.observations()[0].is_witness());
+    }
+
+    /// The name the connection negotiated in TLS rides onto the requests that
+    /// follow it. Set here directly because the ClientHello it comes from needs
+    /// a real handshake; that end-to-end path is proved by the fixture matrix.
+    #[tokio::test]
+    async fn the_connection_sni_is_recorded_on_the_requests_that_follow() {
+        let r = Arc::new(Recorder::new());
+        let mut p = proxy(&r);
+        p.sni = Some("collector.example".into());
+        p.observe_and_decide(post("http://collector.example/ingest", "column=email"))
+            .await;
+
+        match r.observations()[0].kind() {
+            ObservationKind::HttpExchange { sni, .. } => {
+                assert_eq!(sni.as_deref(), Some("collector.example"));
+            }
+            other => panic!("expected an exchange, got {other:?}"),
+        }
+    }
+
+    /// A token in the SNI is the token leaving in the hostname of an
+    /// otherwise-innocuous request — domain fronting. It must be a witness even
+    /// when the body and URL are clean.
+    #[tokio::test]
+    async fn a_token_in_the_sni_is_a_witness() {
+        let r = Arc::new(Recorder::new());
+        let mut p = proxy(&r);
+        p.sni = Some(format!("{TOKEN}.attacker.example"));
+        p.observe_and_decide(post("http://front.example/ok", "nothing to see"))
+            .await;
+
+        assert!(
+            r.observations()[0].is_witness(),
+            "a token carried in the SNI slipped past as no finding"
+        );
     }
 
     #[tokio::test]
