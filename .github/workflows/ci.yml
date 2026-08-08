@@ -31,10 +31,11 @@ jobs:
         working-directory: runtime
     steps:
       - uses: actions/checkout@v4
+      # Only needs to put rustup on the runner. Which toolchain, and which
+      # components, come from runtime/rust-toolchain.toml — naming them here
+      # too would install them onto `stable` rather than onto the pinned
+      # version cargo actually resolves to.
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          # rust-toolchain.toml pins the version; components are named here.
-          components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: runtime

@@ -1,2 +1,8 @@
 [toolchain]
 channel = "1.94.1"
+# Declared here rather than in the CI workflow. A workflow that installs
+# components onto whatever `stable` happens to be does not put them on the
+# toolchain this file pins, so `cargo fmt` resolves to 1.94.1 and finds nothing
+# installed. rustup reads this file when it auto-installs the pin, so one
+# declaration covers CI and a fresh clone alike.
+components = ["rustfmt", "clippy"]
