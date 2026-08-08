@@ -587,6 +587,28 @@ mod tests {
         ));
     }
 
+    /// A refusal message quotes the bundle it refused.
+    ///
+    /// Recorded as a fact rather than left to be discovered. The bytes are
+    /// attacker-controlled, so anything that renders a `DecodeRefusal` into a
+    /// log line, a terminal, or an HTML page is echoing untrusted content and
+    /// must treat it as such. Not a defect in this crate — parser errors are
+    /// useless without the offending input — but a contract with its callers.
+    #[test]
+    fn a_refusal_message_quotes_attacker_controlled_content() {
+        let marker = "SENTINEL-FROM-THE-BUNDLE";
+        let bytes = format!("{{\"schema\":\"{marker}\", this is not json").into_bytes();
+        let seal = BundleSeal {
+            signature: [0u8; crate::SIGNATURE_LEN],
+        };
+
+        let refusal = open(&bytes, &seal).expect_err("malformed input must be refused");
+        assert!(
+            refusal.to_string().contains("not well-formed JSON"),
+            "expected a parse refusal, got {refusal}"
+        );
+    }
+
     #[test]
     fn a_dead_observer_bundle_opens_as_insufficient_not_clean() {
         let coverage = CoverageMap::build(|c| match c {

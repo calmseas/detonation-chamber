@@ -13,6 +13,7 @@
 
 pub mod bundle;
 pub mod coverage;
+pub mod gaps;
 pub mod ledger;
 pub mod seal;
 pub mod verdict;

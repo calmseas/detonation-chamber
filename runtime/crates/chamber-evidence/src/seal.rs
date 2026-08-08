@@ -573,14 +573,46 @@ mod tests {
     fn error_types_carry_no_key_material() {
         let secret = RunSecret::mint().expect("entropy available under test");
         let seed_hex = hex::encode(secret.seed_for_leak_tests());
+        let seed_debug = format!("{:?}", secret.seed_for_leak_tests());
         let key_id = secret.key_id().clone();
         let seal = secret.seal(b"payload");
 
-        let err =
-            verify_sealed_bundle(b"different payload", &key_id, &seal).expect_err("must reject");
+        // Every public error type in the crate, both renderings.
+        //
+        // An earlier version of this test checked only the error from
+        // `verify_sealed_bundle`, whose failing arm is a unit variant with
+        // nowhere to put a seed — so it could not have failed however badly
+        // the rest of the crate leaked.
+        let mut rendered = Vec::new();
 
-        assert!(!format!("{err:?}").contains(&seed_hex));
-        assert!(!format!("{err}").contains(&seed_hex));
+        let seal_error =
+            verify_sealed_bundle(b"different payload", &key_id, &seal).expect_err("must reject");
+        rendered.push(format!("{seal_error:?}"));
+        rendered.push(format!("{seal_error}"));
+
+        for e in [
+            KeyIdError::MissingMethodPrefix,
+            KeyIdError::UnsupportedMultibase,
+            KeyIdError::UnsupportedMulticodec,
+            KeyIdError::WrongKeyLength { found: 31 },
+            KeyIdError::NonCanonicalPublicKey,
+        ] {
+            rendered.push(format!("{e:?}"));
+            rendered.push(format!("{e}"));
+            rendered.push(format!("{:?}", SealError::KeyId(e.clone())));
+            rendered.push(format!("{}", SealError::KeyId(e)));
+        }
+
+        rendered.push(format!("{EntropyUnavailable:?}"));
+        rendered.push(format!("{EntropyUnavailable}"));
+
+        for text in rendered {
+            assert!(!text.contains(&seed_hex), "hex seed leaked into: {text}");
+            assert!(
+                !text.contains(&seed_debug),
+                "byte-array seed leaked into: {text}"
+            );
+        }
     }
 
     #[test]
