@@ -66,6 +66,10 @@ pub struct Observed {
     pub drops_collected: bool,
     /// Turns actually carried out in the cell.
     pub turns_driven: usize,
+    /// Inference calls the driver made and scanned. Zero for a scripted run,
+    /// which is what lets the coverage detail tell a channel that was narrowed
+    /// from one that was never exercised at all.
+    pub inference_calls: usize,
 }
 
 /// A bundle that was written.
@@ -156,14 +160,28 @@ pub fn coverage_for(observed: &Observed) -> CoverageMap {
             }
         }
 
-        // Slice 0 has no inference lane: the model transport never enters the
-        // guest netns. Excluded by design rather than failed, so it does not
-        // block the run from concluding.
+        // Absent either way, and deliberately so: the transport from the
+        // driver to the provider is never claimed watched-whole, which is what
+        // `gap.inference-channel` declares. What the detail distinguishes is a
+        // channel that was narrowed from one that was never exercised — a
+        // reader deciding how much a `no_finding` is worth needs to know which.
+        // Excluded by design rather than failed, so neither blocks the run from
+        // concluding.
         Channel::InferenceTransport => ChannelCoverage::Absent {
             cause: GapCause::ExcludedByDesign,
-            detail: "Slice 0 has no inference lane; model turns are carried by \
-                     the host driver and never enter the chamber"
-                .into(),
+            detail: if observed.inference_calls > 0 {
+                format!(
+                    "{} inference call(s) were made; each model response was \
+                     scanned host-side and a canary found there is a finding. \
+                     The transport to the provider is not reconstructed, so the \
+                     channel is narrowed, not watched",
+                    observed.inference_calls
+                )
+            } else {
+                "no inference lane was used; model turns, if any, are carried by \
+                 the host driver and never enter the chamber"
+                    .to_owned()
+            },
         },
     })
 }
@@ -202,6 +220,76 @@ pub fn gaps_for(provenance: &TurnProvenance) -> Vec<CoverageGap> {
         });
     }
     gaps
+}
+
+#[cfg(test)]
+mod inference_coverage_tests {
+    use super::*;
+
+    fn observed_with(inference_calls: usize) -> Observed {
+        Observed {
+            boundary: BoundaryState::Sealed,
+            drops_collected: true,
+            turns_driven: 2,
+            inference_calls,
+        }
+    }
+
+    fn detail_for(observed: &Observed) -> String {
+        match coverage_for(observed).status(Channel::InferenceTransport) {
+            ChannelCoverage::Absent { detail, .. } => detail.clone(),
+            ChannelCoverage::Watched => {
+                panic!("the inference transport must never be reported as watched whole")
+            }
+        }
+    }
+
+    /// The classification does not move. Whatever the driver caught, the
+    /// transport to the provider is not reconstructed, and a bundle claiming
+    /// otherwise would overstate exactly the thing this channel is most likely
+    /// to be over-claimed on.
+    #[test]
+    fn the_channel_is_never_watched_whole() {
+        for calls in [0, 1, 9] {
+            let map = coverage_for(&observed_with(calls));
+            assert!(matches!(
+                map.status(Channel::InferenceTransport),
+                ChannelCoverage::Absent {
+                    cause: GapCause::ExcludedByDesign,
+                    ..
+                }
+            ));
+        }
+    }
+
+    /// A reader deciding what a `no_finding` is worth needs to tell a channel
+    /// that was scanned from one that was never exercised. The old text said
+    /// "Slice 0 has no inference lane" unconditionally, which becomes a false
+    /// statement the moment a live run happens.
+    #[test]
+    fn the_detail_distinguishes_a_narrowed_channel_from_an_unused_one() {
+        let live = detail_for(&observed_with(3));
+        assert!(live.contains('3') && live.contains("scanned"), "{live}");
+
+        let scripted = detail_for(&observed_with(0));
+        assert!(scripted.contains("no inference lane"), "{scripted}");
+        assert!(
+            !scripted.contains("scanned"),
+            "a scripted run must not claim a scan it never did: {scripted}"
+        );
+    }
+
+    /// A designed-in limit must not make a live run inconclusive, or every one
+    /// of them comes back as insufficient coverage and the distinction between
+    /// "designed-in" and "something broke" stops carrying information.
+    #[test]
+    fn a_live_run_still_reaches_a_conclusion() {
+        assert!(
+            coverage_for(&observed_with(4))
+                .blocking_absences()
+                .is_empty()
+        );
+    }
 }
 
 /// Determines whether a ledger file is sealed, truncated, or absent.
@@ -342,6 +430,7 @@ mod tests {
             boundary: BoundaryState::Sealed,
             drops_collected: true,
             turns_driven: 3,
+            inference_calls: 0,
         }
     }
 
@@ -384,6 +473,7 @@ mod tests {
     fn a_turnless_run_is_recorded_without_forcing_the_verdict() {
         let observed = Observed {
             turns_driven: 0,
+            inference_calls: 0,
             ..healthy()
         };
         let coverage = coverage_for(&observed);
@@ -488,6 +578,7 @@ mod tests {
                 boundary: BoundaryState::Sealed,
                 drops_collected: true,
                 turns_driven: 1,
+                inference_calls: 0,
             },
             &TurnProvenance::Scripted {
                 path: "t.json".into(),
@@ -664,6 +755,7 @@ mod tests {
                 boundary: BoundaryState::Sealed,
                 drops_collected: true,
                 turns_driven: 1,
+                inference_calls: 0,
             },
             &TurnProvenance::Scripted {
                 path: "t.json".into(),

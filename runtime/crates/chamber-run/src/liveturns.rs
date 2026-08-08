@@ -25,7 +25,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use chamber_capture::CanarySet;
-use chamber_evidence::{CanaryHit, Digest32, HitField};
+use chamber_evidence::{CanaryHit, Channel, Digest32, HitField, ObservationKind, RunLog};
 use sha2::{Digest as _, Sha256};
 use tokio::time::Instant;
 
@@ -274,6 +274,34 @@ fn digest_of(bytes: &[u8]) -> Digest32 {
     Digest32(hasher.finalize().into())
 }
 
+/// Folds the run's inference calls into the ledger the bundle seals.
+///
+/// The counterpart to [`crate::bundle::record_guest_commands`], and it obeys
+/// the same two rules. Appended after the observer's entries, continuing the
+/// same ordinal counter, so the ledger stays contiguous from zero and
+/// [`chamber_evidence::open`] accepts it. And it carries identities, not
+/// contents: the model's name, a digest of what it was asked, a digest of what
+/// it answered, and any canary the scan found in that answer — never the prompt
+/// or response text, which under raw output carry the planted token and would
+/// put it into the very artefact the run exists to hand someone.
+///
+/// Unlike guest commands, a hit recorded here *can* move the verdict. See
+/// [`Channel::bears_verdict`] for why that is narrower than it sounds.
+pub fn record_inference_calls(log: &mut RunLog, calls: &[InferenceRecord]) {
+    for (call_index, call) in calls.iter().enumerate() {
+        log.note(
+            call_index as u64,
+            Channel::InferenceTransport,
+            ObservationKind::InferenceCall {
+                model: call.model.clone(),
+                request_digest: call.request_digest,
+                response_digest: call.response_digest,
+            },
+            call.response_hits.clone(),
+        );
+    }
+}
+
 /// A live turn source: a host-side model driven as a credulous agent through
 /// the artefact under test, choosing each next action.
 pub struct LiveTurns {
@@ -418,6 +446,10 @@ impl TurnSource for LiveTurns {
         TurnProvenance::Live {
             model: self.model.name(),
         }
+    }
+
+    fn inference_calls(&self) -> &[InferenceRecord] {
+        &self.calls
     }
 
     fn observe(&mut self, outcome: &CellOutput<'_>) {
@@ -861,6 +893,142 @@ mod tests {
             first.calls()[0].response_digest,
             second.calls()[0].response_digest
         );
+    }
+
+    /// The seam the run's record stage actually reads.
+    ///
+    /// `run_detonation` collects the calls through `TurnSource`, not through
+    /// the concrete type, so a driver whose inherent accessor works while the
+    /// trait method returns nothing would seal a live bundle with no inference
+    /// evidence in it at all — and it would look exactly like a scripted run.
+    #[tokio::test]
+    async fn the_calls_reach_the_run_through_the_trait() {
+        let mut turns: Box<dyn TurnSource> = Box::new(driver_watching(
+            FakeModel::answering(vec![Ok(reply(
+                ModelChoice::Conclude,
+                &format!("here it is: {CANARY}"),
+                1,
+            ))]),
+            Budget::new(8, secs(60), 1_000_000).unwrap(),
+        ));
+
+        turns.next_turn(&Transcript::new()).await.unwrap();
+
+        let calls = turns.inference_calls();
+        assert_eq!(
+            calls.len(),
+            1,
+            "the run would seal with no inference record"
+        );
+        assert_eq!(
+            calls[0].response_hits.len(),
+            1,
+            "the hit was lost in transit"
+        );
+    }
+
+    /// A scripted source makes none, and says so.
+    #[test]
+    fn a_scripted_source_reports_no_inference_calls() {
+        let scripted =
+            crate::turns::ScriptedTurns::from_bytes("t.json", b"[{\"do\": \"conclude\"}]").unwrap();
+        assert!(scripted.inference_calls().is_empty());
+    }
+
+    fn a_record(hits: Vec<CanaryHit>) -> InferenceRecord {
+        InferenceRecord {
+            model: "fake/model-1".to_owned(),
+            request_digest: digest_of(b"asked"),
+            response_digest: digest_of(b"answered"),
+            response_hits: hits,
+        }
+    }
+
+    fn a_hit() -> CanaryHit {
+        CanaryHit {
+            label: "aws-key".to_owned(),
+            field: HitField::Body,
+            encoding: chamber_evidence::HitEncoding::Raw,
+            offset: 4,
+        }
+    }
+
+    /// Each call is accounted for on its own channel. A live run that made
+    /// calls and recorded none would read as a scripted one.
+    #[test]
+    fn every_call_lands_on_the_inference_channel() {
+        let mut log = RunLog::open();
+        record_inference_calls(&mut log, &[a_record(vec![]), a_record(vec![])]);
+
+        assert_eq!(log.len(), 2);
+        for entry in log.entries() {
+            assert_eq!(entry.channel(), Channel::InferenceTransport);
+            assert!(matches!(
+                entry.kind(),
+                ObservationKind::InferenceCall { .. }
+            ));
+        }
+    }
+
+    /// D9, end to end through the ledger: a canary the model emitted reaches
+    /// the verdict as a witness.
+    #[test]
+    fn a_response_hit_becomes_a_witness() {
+        let mut log = RunLog::open();
+        record_inference_calls(&mut log, &[a_record(vec![a_hit()])]);
+
+        let witnesses = log.entries().iter().filter(|o| o.is_witness()).count();
+        assert_eq!(witnesses, 1);
+    }
+
+    /// A run that called a model and got nothing incriminating is recorded and
+    /// concludes nothing — the ordinary outcome, and the one that must never
+    /// drift into detonating.
+    #[test]
+    fn calls_without_hits_witness_nothing() {
+        let mut log = RunLog::open();
+        record_inference_calls(&mut log, &[a_record(vec![]), a_record(vec![])]);
+
+        assert!(log.entries().iter().all(|o| !o.is_witness()));
+    }
+
+    /// The obligation, asserted on the bytes rather than the struct: whatever
+    /// the model said, the artefact someone is handed does not repeat it.
+    #[test]
+    fn the_ledger_carries_no_model_text() {
+        let mut log = RunLog::open();
+        record_inference_calls(&mut log, &[a_record(vec![a_hit()])]);
+
+        let serialised = serde_json::to_string(log.entries()).expect("entries serialise");
+        assert!(!serialised.contains("answered"), "{serialised}");
+        assert!(!serialised.contains("asked"), "{serialised}");
+        assert!(
+            serialised.contains("aws-key"),
+            "the hit's label must survive: {serialised}"
+        );
+    }
+
+    /// Appended after the observer's entries and the guest's, continuing the
+    /// same counter. A ledger with a gap is refused at decode, so getting this
+    /// wrong loses the whole bundle rather than one row.
+    #[test]
+    fn the_ledger_stays_contiguous() {
+        let mut log = RunLog::open();
+        log.note(
+            0,
+            Channel::NetworkEgress,
+            ObservationKind::NameQuery {
+                qname: "collector.example".to_owned(),
+                qtype: "A".to_owned(),
+                answered_with: "10.0.0.2".to_owned(),
+            },
+            vec![],
+        );
+        record_inference_calls(&mut log, &[a_record(vec![]), a_record(vec![])]);
+
+        assert_eq!(log.len(), 3);
+        let ids: Vec<u64> = log.entries().iter().map(|o| o.id().0).collect();
+        assert_eq!(ids, vec![0, 1, 2], "the ledger is not contiguous from zero");
     }
 
     /// A turn that never ran must not read to the model as one that succeeded.

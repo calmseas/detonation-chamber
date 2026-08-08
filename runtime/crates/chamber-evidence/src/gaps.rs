@@ -35,14 +35,18 @@ pub fn slice0() -> Vec<CoverageGap> {
         CoverageGap {
             id: "gap.inference-channel".into(),
             cause: GapCause::ExcludedByDesign,
-            scope: "Model turns are carried by the host-side driver and are observed, but are \
-                    excluded from the verdict rule."
+            scope: "Model turns are carried by the host-side driver. The model's own RESPONSE is \
+                    scanned host-side and a canary found there is a finding; the transport \
+                    between the driver and the provider is not reconstructed."
                 .into(),
-            justification: "An agent reading a credential into its own context is how an agent \
-                            works, not evidence of exfiltration; treating it as a finding would \
-                            detonate every run. The consequence is that a payload which \
-                            exfiltrates THROUGH the model transport itself is unobserved as a \
-                            finding."
+            justification: "What the agent reads INTO its context is how an agent works, not \
+                            evidence of exfiltration, so the prompt is deliberately not scanned \
+                            — under raw command output it carries the planted token already, and \
+                            scanning it would detonate every run. What the model EMITS is \
+                            different, and is caught. The residue is the transport itself: a \
+                            payload that routes a token to the provider through a channel the \
+                            driver does not reconstruct is unobserved. This channel is narrowed, \
+                            not closed, and a scripted run makes no inference calls at all."
                 .into(),
         },
         CoverageGap {

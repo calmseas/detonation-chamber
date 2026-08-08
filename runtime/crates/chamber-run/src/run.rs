@@ -291,6 +291,9 @@ pub async fn run_detonation(
     let mut trace = StageTrace::new();
     let emitted = RefCell::new(None);
     let provenance = turns.provenance();
+    // Taken before the wind-down borrows the closure: the source is done being
+    // driven, and what it did is now evidence.
+    let inference_calls = turns.inference_calls().to_vec();
 
     wind_down(
         Window::standard(),
@@ -363,10 +366,14 @@ pub async fn run_detonation(
             // could never ride into the artefact.
             let secrets: Vec<String> = plan.canaries.iter().map(|c| c.value.clone()).collect();
             bundle::record_guest_commands(&mut log, &transcript, &secrets);
+            // The model's side of the run, beside the agent's. Digests only —
+            // see `record_inference_calls`.
+            crate::liveturns::record_inference_calls(&mut log, &inference_calls);
             let observed = Observed {
                 boundary: state,
                 drops_collected: true,
                 turns_driven: turns_taken,
+                inference_calls: inference_calls.len(),
             };
             let written = bundle::emit(&plan.evidence_dir, log, &observed, &provenance)
                 .map_err(|e| e.to_string())?;

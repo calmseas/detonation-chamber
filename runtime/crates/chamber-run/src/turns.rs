@@ -21,6 +21,8 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
+use crate::liveturns::InferenceRecord;
+
 /// One thing the artefact does.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "do", rename_all = "snake_case")]
@@ -220,6 +222,16 @@ pub trait TurnSource: Send {
     /// requiring it to say so would be ceremony. A live source overrides this;
     /// it is the only way the raw output reaches one.
     fn observe(&mut self, _outcome: &CellOutput<'_>) {}
+
+    /// The inference calls this source made, for the ledger.
+    ///
+    /// Empty by default. A scripted source makes none, and a bundle recording
+    /// none is making a true statement about the run rather than omitting one —
+    /// which is the same reason `gap.scripted-turns` is emitted only when it
+    /// applies.
+    fn inference_calls(&self) -> &[InferenceRecord] {
+        &[]
+    }
 }
 
 /// Replays a checked-in JSON sequence.
