@@ -23,3 +23,7 @@ rustls = "0.23.43"
 http-body-util = "0.1.4"
 hyper = "1.11.0"
 sha2 = "0.11.0"
+
+[dev-dependencies]
+reqwest = "0.13"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
