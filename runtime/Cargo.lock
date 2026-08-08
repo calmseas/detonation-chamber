@@ -307,7 +307,10 @@ dependencies = [
 name = "chamber-e2e"
 version = "0.1.0"
 dependencies = [
+ "chamber-evidence",
  "chamber-isolation",
+ "chamber-run",
+ "tokio",
 ]
 
 [[package]]

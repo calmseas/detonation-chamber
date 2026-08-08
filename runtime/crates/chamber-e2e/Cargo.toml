@@ -19,5 +19,12 @@ path = "tests/containment.rs"
 name = "no_flush_ruleset"
 path = "tests/no_flush_ruleset.rs"
 
+[[test]]
+name = "detonation"
+path = "tests/detonation.rs"
+
 [dev-dependencies]
 chamber-isolation = { path = "../chamber-isolation" }
+chamber-run = { path = "../chamber-run" }
+chamber-evidence = { path = "../chamber-evidence" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

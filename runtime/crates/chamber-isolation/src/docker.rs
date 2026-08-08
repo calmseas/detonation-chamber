@@ -621,6 +621,25 @@ impl Container {
         Ok(())
     }
 
+    /// Stops the container, giving its process `grace` to exit on its own.
+    ///
+    /// SIGTERM first, SIGKILL after the grace period. That window is the only
+    /// chance a process has to finish what it was doing — for the observer it
+    /// is the difference between a sealed ledger and a truncated one, so the
+    /// grace here and the observer's own wind-down budget are two halves of the
+    /// same agreement.
+    ///
+    /// # Errors
+    /// [`EngineError`] if the engine refuses.
+    pub fn stop(&self, grace: Duration) -> Result<(), EngineError> {
+        let seconds = grace.as_secs().to_string();
+        must_run(
+            &["stop", "-t", &seconds, &self.id],
+            grace + Duration::from_secs(30),
+        )?;
+        Ok(())
+    }
+
     /// Waits for the container's own process to exit, returning its code.
     ///
     /// # Errors

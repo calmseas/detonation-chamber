@@ -15,7 +15,7 @@
 //! - [`bridge`] — carrying a turn out inside the cell.
 //! - [`bundle`] — coverage, gaps and the sealed artefact.
 //!
-//! `run_detonation` and the `chamber-detonate` binary are not built yet.
+//! - [`run`] — one detonation, start to finish.
 //!
 //! # What this crate must never do
 //!
@@ -38,11 +38,15 @@
 
 pub mod bridge;
 pub mod bundle;
+pub mod run;
 pub mod turns;
 pub mod winddown;
 
 pub use bridge::{ToolBridge, TurnTarget};
 pub use bundle::{BoundaryState, Emitted, Observed, emit};
+pub use run::{
+    ArmingRefusal, DetonationPlan, ImageTags, PlantedCanary, RunEpilogue, run_detonation,
+};
 pub use turns::{
     ScriptedTurns, Transcript, TurnDirective, TurnError, TurnProvenance, TurnRecord, TurnSource,
 };

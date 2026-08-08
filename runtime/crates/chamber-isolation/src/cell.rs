@@ -172,6 +172,19 @@ impl AgentCell {
         Ok(out.stdout.trim().to_owned())
     }
 
+    /// Stops the artefact, giving it `grace` to exit on its own.
+    ///
+    /// The first stage of the wind-down: the artefact must stop acting before
+    /// its evidence is collected, or the collection races whatever it does
+    /// next.
+    ///
+    /// # Errors
+    /// [`CellError`] if the engine refuses.
+    pub fn halt(&self, grace: Duration) -> Result<(), CellError> {
+        self.container.stop(grace)?;
+        Ok(())
+    }
+
     /// Removes the cell by its captured id.
     ///
     /// See the module note: this does **not** yet require proof that the

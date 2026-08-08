@@ -31,14 +31,18 @@ use chamber_deadline::{
 ///
 /// Each closure reports its own failure as a string; the sequence carries on
 /// either way. Returns nothing — see the module note.
-pub async fn wind_down<FH, FS, FT, FR>(
+pub async fn wind_down<H, S, T, R, FH, FS, FT, FR>(
     window: Window,
     trace: &mut StageTrace,
-    halt: FH,
-    seal: FS,
-    teardown: FT,
-    record: FR,
+    halt: H,
+    seal: S,
+    teardown: T,
+    record: R,
 ) where
+    H: FnOnce() -> FH,
+    S: FnOnce() -> FS,
+    T: FnOnce() -> FT,
+    R: FnOnce() -> FR,
     FH: Future<Output = Result<(), String>>,
     FS: Future<Output = Result<(), String>>,
     FT: Future<Output = Result<(), String>>,
@@ -50,11 +54,16 @@ pub async fn wind_down<FH, FS, FT, FR>(
     // is what stops the artefact acting while its evidence is being collected;
     // sealing before teardown is what stops the teardown taking the ledger with
     // it.
-    wd.step(Stage::AgentHalt, AGENT_HALT_CAP, halt).await;
-    wd.step(Stage::BoundarySeal, BOUNDARY_SEAL_CAP, seal).await;
-    wd.step(Stage::SandboxTeardown, SANDBOX_TEARDOWN_CAP, teardown)
+    // Closures, not futures: the teardown stage consumes the containers the
+    // earlier stages are still using, so the work cannot all be constructed up
+    // front. Building it lazily also means a stage whose window has already
+    // closed is never even started.
+    wd.step(Stage::AgentHalt, AGENT_HALT_CAP, halt()).await;
+    wd.step(Stage::BoundarySeal, BOUNDARY_SEAL_CAP, seal())
         .await;
-    wd.step(Stage::RunRecord, RUN_RECORD_CAP, record).await;
+    wd.step(Stage::SandboxTeardown, SANDBOX_TEARDOWN_CAP, teardown())
+        .await;
+    wd.step(Stage::RunRecord, RUN_RECORD_CAP, record()).await;
 }
 
 #[cfg(test)]
@@ -73,15 +82,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_clean_wind_down_visits_every_stage_in_order() {
         let mut trace = StageTrace::new();
-        wind_down(
-            Window::standard(),
-            &mut trace,
-            fine(),
-            fine(),
-            fine(),
-            fine(),
-        )
-        .await;
+        wind_down(Window::standard(), &mut trace, fine, fine, fine, fine).await;
 
         assert_eq!(trace.visited(), Stage::SEQUENCE.to_vec());
         assert!(trace.evidence_was_sealed());
@@ -95,10 +96,10 @@ mod tests {
         wind_down(
             Window::standard(),
             &mut trace,
-            broken("the guest would not stop"),
-            fine(),
-            fine(),
-            fine(),
+            || broken("the guest would not stop"),
+            fine,
+            fine,
+            fine,
         )
         .await;
 
@@ -119,10 +120,10 @@ mod tests {
         wind_down(
             Window::standard(),
             &mut trace,
-            fine(),
-            fine(),
-            broken("the cell is still up"),
-            fine(),
+            fine,
+            fine,
+            || broken("the cell is still up"),
+            fine,
         )
         .await;
 
@@ -145,10 +146,10 @@ mod tests {
         wind_down(
             Window::standard(),
             &mut trace,
-            counted(),
-            counted(),
-            counted(),
-            counted(),
+            counted,
+            counted,
+            counted,
+            counted,
         )
         .await;
 
@@ -166,10 +167,10 @@ mod tests {
         wind_down(
             Window::opening_now(std::time::Duration::ZERO),
             &mut trace,
-            fine(),
-            fine(),
-            fine(),
-            fine(),
+            fine,
+            fine,
+            fine,
+            fine,
         )
         .await;
 
