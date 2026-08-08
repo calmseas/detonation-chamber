@@ -581,6 +581,97 @@ impl Container {
         run_within(&["logs", &self.id], Duration::from_secs(30))
     }
 
+    /// Runs a command inside the container, feeding `input` to its stdin.
+    ///
+    /// This is how a file gets *into* a container. The alternatives are worse:
+    /// a bind mount gives the cell a handle on host state, and passing content
+    /// as an argument puts it in the process table — which is fatal the moment
+    /// the content is a planted canary rather than a ruleset.
+    ///
+    /// # Errors
+    /// [`EngineError`] if the exec could not be performed, outlived `within`,
+    /// or exited non-zero.
+    pub fn exec_with_stdin(
+        &self,
+        argv: &[&str],
+        input: &[u8],
+        within: Duration,
+    ) -> Result<ExecOutcome, EngineError> {
+        use std::io::Write as _;
+
+        let (out_path, err_path) = (scratch_path("out"), scratch_path("err"));
+        let mut full: Vec<&str> = vec!["exec", "-i", &self.id];
+        full.extend_from_slice(argv);
+
+        let mut child = Command::new("docker")
+            .args(&full)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::from(File::create(&out_path)?))
+            .stderr(Stdio::from(File::create(&err_path)?))
+            .spawn()?;
+
+        // Written and dropped before the wait: holding the pipe open leaves the
+        // child blocked on a read that never ends, which presents as a timeout
+        // rather than as the deadlock it is.
+        {
+            let mut stdin = child
+                .stdin
+                .take()
+                .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "stdin was not piped"))?;
+            stdin.write_all(input)?;
+        }
+
+        let started = Instant::now();
+        let status = loop {
+            match child.try_wait()? {
+                Some(status) => break Some(status),
+                None if started.elapsed() >= within => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break None;
+                }
+                None => std::thread::sleep(POLL_INTERVAL),
+            }
+        };
+
+        let stdout = read_and_remove(&out_path);
+        let stderr = read_and_remove(&err_path);
+        let argv_owned = || full.iter().map(|a| (*a).to_owned()).collect::<Vec<_>>();
+
+        match status {
+            Some(status) if status.code() == Some(0) => Ok(ExecOutcome {
+                status: status.code(),
+                stdout,
+                stderr,
+            }),
+            Some(status) => Err(EngineError::Failed {
+                argv: argv_owned(),
+                status: status.code(),
+                stderr,
+            }),
+            None => Err(EngineError::TimedOut {
+                argv: argv_owned(),
+                after: within,
+            }),
+        }
+    }
+
+    /// Starts a command inside the container and returns without waiting.
+    ///
+    /// For long-lived processes — the NFLOG collector, which must outlive the
+    /// call that starts it. Because nothing waits on it, *starting* it proves
+    /// nothing about whether it is running: the caller must confirm that
+    /// separately.
+    ///
+    /// # Errors
+    /// [`EngineError`] if the engine refuses to start it.
+    pub fn exec_detached(&self, argv: &[&str], within: Duration) -> Result<(), EngineError> {
+        let mut full: Vec<&str> = vec!["exec", "-d", &self.id];
+        full.extend_from_slice(argv);
+        must_run(&full, within)?;
+        Ok(())
+    }
+
     /// Runs a command inside the container.
     ///
     /// A non-zero exit is returned, not raised: for a probe, failing is the

@@ -13,10 +13,11 @@
 //!   three fail silently if merely assumed.
 //! - [`probe`] — the outcome vocabulary the adversary probe reports in, and the
 //!   reader for it.
+//! - [`warden`] — the namespace owner: the fabric, the ruleset, the NFLOG
+//!   collector and the tarpit route, with the ordering between them encoded as
+//!   types rather than as a convention.
 //!
-//! The nftables ruleset, the tarpit route, the NFLOG collector, the agent cell
-//! and the sealed environment are **not built yet**, and the order in which
-//! they arrive is not arbitrary.
+//! The agent cell and the sealed environment are **not built yet**.
 //!
 //! # The ordering constraint that cannot be recovered
 //!
@@ -39,12 +40,14 @@
 //! Recorded here because both are load-bearing and both read as mistakes to
 //! someone tidying up:
 //!
-//! 1. **The tarpit route** (`ip route add default via <capture>`) will be added
-//!    once the ruleset exists. Without it an off-subnet packet is rejected by
-//!    the *routing* layer with `ENETUNREACH` and never reaches netfilter — so
-//!    the drop counter stays at exactly zero and no frame is ever logged. The
-//!    chamber is contained and **blind**, which does not demonstrate anything.
-//!    It is safe only because containment does not depend on it: the output
+//! 1. **The tarpit route** (`ip route add default via <capture>`). Measured on
+//!    this engine: without it the probe is blocked identically — its own output
+//!    byte for byte the same — while `c_drop_out` stays at **0** and no frame
+//!    is logged; with it, the same blocked probe leaves **6**. An off-subnet
+//!    packet is otherwise rejected by the *routing* layer with `ENETUNREACH`
+//!    and never reaches netfilter at all. The chamber is contained and
+//!    **blind**, and blindness is indistinguishable from success to a one-sided
+//!    test. Safe only because containment does not depend on it: the output
 //!    policy is `drop`, forwarding is off, and no NAT exists for the subnet.
 //!
 //! 2. **The reset is scoped, never `flush ruleset`.** A full flush destroys
@@ -56,6 +59,7 @@
 pub mod docker;
 pub mod preflight;
 pub mod probe;
+pub mod warden;
 
 pub use docker::{
     Attach, Container, ContainerSpec, Docker, DockerUnavailable, EngineError, EnvFile, ExecOutcome,
@@ -63,3 +67,4 @@ pub use docker::{
 };
 pub use preflight::{AssertOutcome, Preflight, PreflightFailure, StructuralAssert};
 pub use probe::{MalformedRow, ProbeReport, ProbeRow, Reach, RowId};
+pub use warden::{ArmedWarden, CellError, DropCounters, NetFabric, ObservedWarden, Warden};

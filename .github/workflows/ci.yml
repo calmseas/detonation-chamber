@@ -72,9 +72,10 @@ jobs:
       # has to be able to reach them. If this job ever fails on those rows
       # alone, suspect the runner's network before suspecting the chamber.
       #
-      # Serialised: both tests raise fixed subnets, and in parallel they
-      # contend for engine-wide state.
-      - run: cargo test -p chamber-e2e --test containment -- --test-threads=1
+      # No --test-threads=1: the tests that need the chamber's fixed subnet
+      # serialise themselves in-process. Doing it with a CLI flag here would
+      # leave a plain `cargo test` broken for anyone running it locally.
+      - run: cargo test -p chamber-e2e --test containment
 
   # The tool must survive being pointed at itself. A legibility checker that
   # cannot pass its own check has no business gating anyone else's artefacts.

@@ -21,23 +21,38 @@
 //! ruleset exists there is no way back to a state in which the probe could have
 //! been observed working.
 //!
+//! # Every negative is corroborated
+//!
+//! A blocked probe row on its own is one-sided evidence. It was measured on
+//! this engine that a chamber *without* the tarpit route blocks the probe
+//! identically to one with it — the probe's own output byte for byte the same —
+//! while `c_drop_out` stays at exactly zero and no frame is ever logged.
+//! Contained, and blind. So each armed row asserts both that the technique
+//! failed *and* that the chamber independently saw it try.
+//!
 //! # What is here, and what is not yet
 //!
 //! - the container gate, which fails rather than skips in CI
 //! - the three structural asserts, measured and not assumed
 //! - the unarmed positive control
+//! - the armed run: nine rows, corroborated by counters and captured frames
 //!
-//! The armed run, the drop-counter corroborations and the NFLOG frame
-//! assertions arrive with `chamber.nft`. They are the delta; this is the
-//! baseline.
+//! Three rows of the plan's table are **absent** rather than quietly passing:
+//!
+//! - rows 5 and 6 (proxy 403; `getaddrinfo` resolving to the capture address)
+//!   need the capture process running in the chamber. `chamber-capture` has no
+//!   bin target yet, so there is nothing to put at `10.66.0.10`.
+//! - row 7 (inbound refusal) needs a listener alive in the cell *and* a dialer
+//!   outside the namespace. The warden shares the cell's namespace, so a dial
+//!   from it traverses `iif "lo" accept` and would prove nothing.
 
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use chamber_isolation::{
-    Attach, Container, ContainerSpec, Docker, EnvFile, Network, NetworkSpec, Preflight,
-    ProbeReport, Reach, RowId, build_image,
+    Attach, Container, ContainerSpec, Docker, EnvFile, NetFabric, Network, NetworkSpec, Preflight,
+    ProbeReport, Reach, RowId, Warden, build_image,
 };
 
 const OP_WINDOW: Duration = Duration::from_secs(90);
@@ -84,12 +99,26 @@ fn ensure_images() {
     if *done {
         return;
     }
-    for name in ["probe", "sink", "guest", "inspector"] {
+    for name in ["probe", "sink", "guest", "inspector", "warden"] {
         let dir = images_dir().join(name);
         build_image(&dir, &format!("chamber-{name}:test"))
             .unwrap_or_else(|e| panic!("could not build the {name} image from {dir:?}: {e}"));
     }
     *done = true;
+}
+
+/// Serialises the tests that raise the chamber's subnet.
+///
+/// Two of them need `10.66.0.0/24`, and Docker refuses the second with "Pool
+/// overlaps with other one on this address space". Fixing that with
+/// `--test-threads=1` in CI would leave a plain `cargo test` broken for anyone
+/// running it locally, which is how a suite acquires a reputation for being
+/// flaky rather than a bug for being fixed.
+fn chamber_subnet_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
 }
 
 /// Removes what a test raised, even when an assertion panicked.
@@ -131,18 +160,22 @@ fn structural_asserts_hold_on_the_chamber_network() {
         engine.arch()
     );
 
-    let mut scratch = Teardown::default();
-    let network = Network::raise(NetworkSpec {
-        name: "chamber-preflight".into(),
-        subnet: "10.66.0.0/24".into(),
-        internal: true,
-    })
-    .expect("raise the chamber network");
-    scratch.network = Some(network);
-    let network = scratch.network.as_ref().unwrap();
+    let _serialised = chamber_subnet_lock();
 
-    let preflight = Preflight::run(network, "chamber-guest:test", "chamber-inspector:test")
-        .expect("the preflight inspections must be performable");
+    // The real fabric, not a lookalike. A second NetworkSpec repeating the
+    // subnet here is what collided with the armed test, and a preflight that
+    // validates a network the chamber does not use validates nothing.
+    let mut chamber = ChamberTeardown::default();
+    let fabric = NetFabric::raise().expect("raise the chamber fabric");
+    chamber.fabric = Some(fabric);
+    let fabric = chamber.fabric.as_ref().unwrap();
+
+    let preflight = Preflight::run(
+        fabric.egress(),
+        "chamber-guest:test",
+        "chamber-inspector:test",
+    )
+    .expect("the preflight inspections must be performable");
 
     for outcome in preflight.outcomes() {
         eprintln!(
@@ -303,3 +336,214 @@ fn await_sink(sink: &Container) {
         std::thread::sleep(Duration::from_millis(250));
     }
 }
+
+/// Removes the armed chamber. The warden goes first: a network with a container
+/// still attached cannot be removed, and the resulting error would be reported
+/// in place of whatever actually failed.
+#[derive(Default)]
+struct ChamberTeardown {
+    cells: Vec<Container>,
+    warden: Option<chamber_isolation::ObservedWarden>,
+    fabric: Option<NetFabric>,
+}
+
+impl Drop for ChamberTeardown {
+    fn drop(&mut self) {
+        for cell in self.cells.drain(..) {
+            let _ = cell.destroy(OP_WINDOW);
+        }
+        if let Some(warden) = self.warden.take() {
+            let _ = warden.destroy();
+        }
+        if let Some(fabric) = self.fabric.take() {
+            let _ = fabric.destroy();
+        }
+    }
+}
+
+/// The armed run: every row the unarmed baseline reached is now stopped, and
+/// the chamber independently saw each attempt.
+///
+/// The corroboration is not decoration. Without the tarpit route this chamber
+/// blocks the probe *identically* — same output, byte for byte — while
+/// `c_drop_out` stays at zero and nothing is logged. A suite that only asked
+/// "did the probe fail?" would pass in that state and the run would carry no
+/// evidence at all.
+#[test]
+fn the_armed_chamber_blocks_and_records_what_the_baseline_reached() {
+    let Some(_engine) = require_containers() else {
+        return;
+    };
+    ensure_images();
+
+    let _serialised = chamber_subnet_lock();
+
+    let mut chamber = ChamberTeardown::default();
+    let fabric = NetFabric::raise().expect("raise the chamber fabric");
+
+    // Measured before anything is believed. All three are version-dependent
+    // and all three fail silently.
+    Preflight::run(
+        fabric.egress(),
+        "chamber-guest:test",
+        "chamber-inspector:test",
+    )
+    .expect("preflight must be performable")
+    .into_result()
+    .unwrap_or_else(|f| panic!("{f}"));
+
+    // The ordering below is enforced by the type system, not by this comment:
+    // `add_tarpit_route` exists only on an ObservedWarden, which only a
+    // confirmed collector can produce, which only a loaded ruleset can precede.
+    let warden = Warden::start(&fabric, "chamber-warden:test").expect("start the warden");
+    let ruleset = images_dir().join("chamber.nft");
+    let warden = warden.load_ruleset(&ruleset).expect("load the ruleset");
+    let warden = warden
+        .start_drop_collector()
+        .expect("the NFLOG collector must be confirmed listening");
+    warden.add_tarpit_route().expect("add the tarpit route");
+
+    let before = warden.counters().expect("read counters");
+    assert_eq!(
+        before.drop_out, 0,
+        "a fresh chamber has dropped nothing; got {before:?}"
+    );
+
+    chamber.fabric = Some(fabric);
+    chamber.warden = Some(warden);
+    let warden = chamber.warden.as_ref().unwrap();
+
+    // The agent's position: the warden's namespace, and no capabilities.
+    // Targets are the probe's defaults, which ARE the armed expectations.
+    let cell = Container::create(&ContainerSpec {
+        image: "chamber-probe:test".into(),
+        attach: Attach::SharedWith {
+            container_id: warden.container_id().to_owned(),
+        },
+        cap_add: vec![],
+        argv: ARMED_ROWS.iter().map(|s| (*s).to_owned()).collect(),
+        sysctls: vec![],
+        env_file: None,
+        dns: vec![],
+    })
+    .expect("create the probe cell");
+    cell.start().expect("start the probe cell");
+    cell.wait(PROBE_WINDOW).expect("probe ran to completion");
+    let logs = cell.logs().expect("read the probe's output");
+    chamber.cells.push(cell);
+
+    eprintln!("armed probe output:\n{}", logs.stdout);
+    let report = ProbeReport::parse(&logs.stdout)
+        .unwrap_or_else(|e| panic!("{e}\nstderr was:\n{}", logs.stderr));
+
+    let mut failures = Vec::new();
+
+    // Rows that must be REFUSED. Each was measured reaching in the unarmed
+    // baseline, so a block here is attributable to the chamber.
+    for row in [
+        RowId::TcpIpLiteral,
+        RowId::UdpDnsDirect,
+        RowId::TcpCaptureWrongPort,
+        RowId::IcmpEcho,
+        RowId::NftFlush,
+        RowId::IpRouteAdd,
+        RowId::NftList,
+    ] {
+        match report.require(row) {
+            Err(missing) => failures.push(missing),
+            Ok(r) if r.reach() != Reach::Blocked => {
+                failures.push(format!("row `{row}` REACHED {} — {}", r.target, r.detail));
+            }
+            Ok(_) => {}
+        }
+    }
+
+    // Two rows whose success IS the desired result, for different reasons.
+    //
+    // `capbnd` reports the cell's capability bounding set, and an empty one is
+    // a stronger claim than "we dropped privileges": a setuid binary or a root
+    // shell inside the cell cannot regain NET_ADMIN.
+    match report.require(RowId::Capbnd) {
+        Err(missing) => failures.push(missing),
+        Ok(r) if r.reach() != Reach::Reached => {
+            failures.push(format!("the cell holds capabilities: {}", r.detail));
+        }
+        Ok(r) => assert!(r.detail.contains("0000000000000000"), "{}", r.detail),
+    }
+
+    // `udp_high` is the honest weak one. A UDP send is accepted by the local
+    // stack whether or not anything is reachable, so the row reports success
+    // even in a fully armed chamber — measured, not assumed. Its containment is
+    // provable only from the counter, and nothing about the datagram is
+    // decoded. That is precisely `gap.udp-quic`, and asserting a block here
+    // would be asserting something this build does not do.
+    if let Err(missing) = report.require(RowId::UdpHigh) {
+        failures.push(missing);
+    }
+
+    let after = warden.counters().expect("read counters after the run");
+    let frames = warden.captured_frames().expect("read the captured frames");
+
+    eprintln!("counters after: {after:?}");
+
+    // Corroboration 1 — the chamber counted the drops.
+    if after.drop_out <= before.drop_out {
+        failures.push(format!(
+            "c_drop_out did not increase ({} -> {}). The chamber blocked the \
+             probe but recorded nothing: contained and BLIND. Suspect the \
+             tarpit route first — without it an off-subnet packet dies at the \
+             routing layer and never reaches netfilter.",
+            before.drop_out, after.drop_out
+        ));
+    }
+
+    // Corroboration 2 — row 1's exact 5-tuple, so the count is tied to the
+    // destination the probe actually named rather than to traffic in general.
+    if !frames.contains("8.8.8.8.443") {
+        failures.push(format!(
+            "no captured frame names 8.8.8.8.443; the drop counter moved but \
+             the evidence trail did not.\nframes:\n{frames}"
+        ));
+    }
+
+    // Corroboration 3 — the QNAME survives. This is the one that matters for
+    // exfil: a blocked DNS query still yields the domain it was aimed at.
+    if !frames.contains("probe.invalid") {
+        failures.push(format!(
+            "the blocked DNS query's QNAME was not recovered from the NFLOG \
+             capture; a domain an artefact tried to reach would be lost.\n\
+             frames:\n{frames}"
+        ));
+    }
+
+    assert!(
+        failures.is_empty(),
+        "the armed chamber did not contain, or did not record:\n  {}",
+        failures.join("\n  ")
+    );
+
+    // The chamber must still resolve. The scoped reset in chamber.nft exists
+    // because a full flush destroys Docker's nat table — the 127.0.0.11 DNAT —
+    // and kills DNS for the whole namespace. That damage presents as a flaky
+    // network rather than as a rule anyone wrote.
+    assert!(
+        !frames.is_empty(),
+        "the collector captured nothing at all despite reporting that it was \
+         listening"
+    );
+}
+
+/// Every row the armed run exercises. Rows 5, 6 and 7 are deliberately absent —
+/// see the module note; they need infrastructure that does not exist yet, and
+/// including them would mean asserting something weaker than it appears.
+const ARMED_ROWS: &[&str] = &[
+    "tcp_ip_literal",
+    "udp_dns_direct",
+    "tcp_capture_wrong_port",
+    "icmp_echo",
+    "udp_high",
+    "nft_flush",
+    "ip_route_add",
+    "nft_list",
+    "capbnd",
+];

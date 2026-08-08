@@ -1,0 +1,92 @@
+# The chamber's egress ruleset.
+#
+# Loaded by the warden into the network namespace the agent cell shares. The
+# agent has no capability to change it: the netns belongs to the warden, and
+# the cell joins it with an empty capability bounding set.
+#
+# ---------------------------------------------------------------------------
+# The reset is SCOPED. Never `flush` the whole ruleset.
+# ---------------------------------------------------------------------------
+# A full reset destroys Docker's own `ip nat` table -- the one that DNATs
+# 127.0.0.11 to the embedded resolver -- and kills DNS for everything in this
+# namespace. The live ruleset carries Docker's own warning that its nat table
+# is managed by iptables-nft and must not be touched. The two lines below
+# delete only this table, and are a no-op on the first load.
+#
+# `runtime/crates/chamber-e2e/tests/no_flush_ruleset.rs` fails the build if the
+# unscoped form appears anywhere outside the adversary probe image.
+table inet chamber
+delete table inet chamber
+
+table inet chamber {
+  # Counters sit BEFORE the rate limit on every path, so the tallies stay exact
+  # even when a flood washes out the logged detail of the one packet that
+  # mattered. That divergence -- counter total vs. captured frames -- is
+  # reconciled at seal and disclosed rather than smoothed over.
+  counter c_dns_ok    { }
+  counter c_proxy_ok  { }
+  counter c_drop_out  { }
+  counter c_drop_in   { }
+  counter c_drop_fwd  { }
+
+  # One destination, because there is one observer. DNS and the proxy are the
+  # same process at the same address: a single monotonic ordinal across both is
+  # what makes an interleaving -- a name looked up, then immediately POSTed to
+  # -- recoverable from the bundle alone. Two daemons at two addresses cannot
+  # produce that ordering, and reconstructing it by timestamp-merging two log
+  # formats is exactly the unfalsifiable seam this design refuses.
+  #
+  # There is deliberately no uplink and no inference lane. With an empty
+  # allowlist the observer never forwards upstream, so no route to the internet
+  # exists anywhere in the chamber.
+  set capture_v4 { type ipv4_addr; elements = { 10.66.0.10 } }
+
+  chain output {
+    type filter hook output priority filter; policy drop;
+
+    ct state established,related accept
+    oif "lo" accept
+
+    ip daddr @capture_v4 udp dport 53   counter name c_dns_ok   accept
+    ip daddr @capture_v4 tcp dport 53   counter name c_dns_ok   accept
+    ip daddr @capture_v4 tcp dport 3128 counter name c_proxy_ok accept
+
+    # Docker's embedded resolver. Reaching it is not egress; it is how the
+    # container's own /etc/resolv.conf works at all.
+    ip daddr 127.0.0.11 accept
+    ip daddr 127.0.0.1 accept
+
+    # `policy drop` above and the explicit `drop` below are BOTH backstops, and
+    # each was measured holding the boundary on its own: flipping the policy to
+    # accept changes nothing while the final rule stands, and deleting the final
+    # rule changes nothing while the policy stands. That is deliberate defence
+    # in depth, and it is why neither shows up as load-bearing in a test --
+    # removing either one is invisible. Removing BOTH is the failure.
+    #
+    # Everything else. Counted first so the tally is exact, then logged to an
+    # NFLOG GROUP -- never `level warn`, which emits zero dmesg lines inside a
+    # container netns. That failure is completely silent: the rule looks
+    # correct, the ruleset loads, and no evidence is ever produced. The
+    # collector is `tcpdump -i nflog:1`.
+    counter name c_drop_out
+    limit rate 20/second burst 40 packets log prefix "CHAMBER-EGRESS-DROP " group 1
+    drop
+  }
+
+  chain input {
+    type filter hook input priority filter; policy drop;
+
+    ct state established,related accept
+    iif "lo" accept
+
+    counter name c_drop_in
+    limit rate 20/second burst 40 packets log prefix "CHAMBER-INGRESS-DROP " group 2
+    drop
+  }
+
+  chain forward {
+    type filter hook forward priority filter; policy drop;
+    counter name c_drop_fwd
+    drop
+  }
+}
