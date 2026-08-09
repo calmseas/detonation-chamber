@@ -1077,6 +1077,7 @@ pub async fn run_differential(
             evidence_dir,
             canaries,
             max_turns: plan.max_turns,
+            skill_dir: None,
         };
 
         let epilogue = crate::run::run_detonation(&arm_plan, driver.as_mut())

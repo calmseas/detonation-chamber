@@ -76,6 +76,7 @@ async fn main() -> ExitCode {
             var: "CHAMBER_TOKEN".into(),
         }],
         max_turns: env_or("CHAMBER_MAX_TURNS", "12").parse().unwrap_or(12),
+        skill_dir: None,
     };
 
     match run_detonation(&plan, &mut turns).await {

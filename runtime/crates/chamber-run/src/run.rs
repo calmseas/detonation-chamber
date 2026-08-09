@@ -95,6 +95,10 @@ pub struct DetonationPlan {
     pub canaries: Vec<PlantedCanary>,
     /// Ceiling on turns. A script that concludes earlier ends the run earlier.
     pub max_turns: u32,
+    /// The skill directory to stage into the guest `/work` before the first
+    /// turn. `None` reproduces Slice-0 behaviour exactly — nothing is staged,
+    /// and the driver's brief is the only place the skill appears.
+    pub skill_dir: Option<PathBuf>,
 }
 
 /// Why no run happened.
@@ -266,6 +270,14 @@ pub async fn run_detonation(
         .expect("just set")
         .write_file(&sealed_env.anchor_path, sealed_env.ca_pem.as_bytes())
         .map_err(|e| ArmingRefusal::Chamber(format!("placing the trust anchor: {e}")))?;
+
+    // The skill's own files, if any, staged into the cell before the first turn.
+    // A refusal here is still a refusal to arm: a half-staged skill would
+    // detonate as something other than what was handed in.
+    if let Some(skill_dir) = &plan.skill_dir {
+        crate::staging::stage_skill_dir(arming.cell.as_ref().expect("just set"), skill_dir)
+            .map_err(|e| ArmingRefusal::Chamber(format!("staging the skill: {e}")))?;
+    }
 
     // ---- armed. From here nothing aborts the run. The guard stays armed
     //      through the turn loop, so an unexpected early exit still tears the

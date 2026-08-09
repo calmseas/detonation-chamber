@@ -118,6 +118,7 @@ fn plan_with(evidence: std::path::PathBuf, canaries: Vec<PlantedCanary>) -> Deto
         evidence_dir: evidence,
         canaries,
         max_turns: 8,
+        skill_dir: None,
     }
 }
 

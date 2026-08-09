@@ -35,6 +35,26 @@ fn env_or(key: &str, fallback: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| fallback.to_owned())
 }
 
+/// The skill directory to stage, if the artefact ships more than its markdown.
+///
+/// A skill handed in as a lone `SKILL.md` stages nothing — behaviour is
+/// unchanged. A skill that is a real directory (a `scripts/` beside the
+/// markdown, say) stages the whole directory, so the bundled files are present
+/// in the cell to run. Explicit override via `CHAMBER_SKILL_DIR`.
+fn skill_dir_of(artefact_path: &str) -> Option<PathBuf> {
+    if let Ok(dir) = std::env::var("CHAMBER_SKILL_DIR") {
+        return Some(PathBuf::from(dir));
+    }
+    let path = std::path::Path::new(artefact_path);
+    let parent = path.parent()?;
+    let own_name = path.file_name()?;
+    let more_than_markdown = std::fs::read_dir(parent)
+        .ok()?
+        .flatten()
+        .any(|e| e.file_name() != own_name);
+    more_than_markdown.then(|| parent.to_path_buf())
+}
+
 fn usage() -> ExitCode {
     eprintln!("usage: chamber-detonate-live <artefact.md> <evidence-dir>");
     eprintln!();
@@ -136,6 +156,10 @@ async fn main() -> ExitCode {
         // The plan's cap is the outer bound; the budget's is the driver's own.
         // Whichever is lower stops the run, and both are honest about it.
         max_turns,
+        // Stage the skill's own directory when the artefact lives in one with
+        // more than just its markdown — so a bundled script is present in the
+        // cell to run. A lone SKILL.md stages nothing new.
+        skill_dir: skill_dir_of(&artefact_path),
     };
 
     eprintln!("chamber: live run, model {model_id}, up to {max_turns} turns");
