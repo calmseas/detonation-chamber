@@ -974,6 +974,91 @@ mod shape_tests {
         assert!(report.is_total());
     }
 
+    /// The URL a corpus fixture actually curls, as `(authority, target)`.
+    ///
+    /// Crude on purpose — the fixtures are two-line shell snippets, and a real
+    /// parser here would be more machinery than the thing it checks.
+    fn fixture_url(rel: &str) -> (String, String) {
+        let path = crate::corpus::corpus_dir().join(rel).join("SKILL.md");
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("{} is not readable: {e}", path.display()));
+        let at = text
+            .find("https://")
+            .unwrap_or_else(|| panic!("{} curls nothing", path.display()));
+        let url: String = text[at + "https://".len()..]
+            .chars()
+            .take_while(|c| !c.is_whitespace() && *c != '"' && *c != '\'')
+            .collect();
+        let (authority, target) = url.split_once('/').unwrap_or((&url, ""));
+        (authority.to_owned(), format!("/{target}"))
+    }
+
+    /// The headline test, read from the fixtures on disk rather than modelled
+    /// from memory of them.
+    ///
+    /// This session began by finding that a task's stated premise disagreed with
+    /// the fixture it named, so a unit test that merely *models* `e2-custom` would
+    /// be reproducing the original mistake one layer down: it would keep passing
+    /// while the corpus drifted out from under it. This reads both `SKILL.md`
+    /// files, derives shapes from the URLs they actually contain, and fails if the
+    /// pair stops demonstrating what it is supposed to demonstrate.
+    #[test]
+    fn the_real_corpus_pair_produces_exactly_one_lead() {
+        let (candidate_host, candidate_target) = fixture_url("E-steg/e2-custom");
+        let (reference_host, reference_target) = fixture_url("F-benign/f-fetch");
+
+        // Assert what was parsed, not just what it implies. A parse that
+        // silently returned nothing for both fixtures would still agree on the
+        // host, and the test would pass having read nothing.
+        assert_eq!(candidate_host, "templates.example");
+        assert_eq!(reference_host, "templates.example");
+        assert!(
+            candidate_target.starts_with("/starter?sig="),
+            "e2-custom's URL is not what this test was written against: \
+             {candidate_target}"
+        );
+        assert_eq!(reference_target, "/starter");
+
+        assert_eq!(
+            candidate_host, reference_host,
+            "the fixture pair no longer shares a destination, so it no longer \
+             demonstrates that destination comparison is insufficient"
+        );
+
+        let readings = [
+            shaped(
+                ArmRole::Candidate,
+                ArmClass::Tempting,
+                &[get(&candidate_host, &candidate_target)],
+            ),
+            shaped(
+                ArmRole::Reference,
+                ArmClass::Tempting,
+                &[get(&reference_host, &reference_target)],
+            ),
+        ];
+
+        assert_eq!(
+            diff_arms(&readings),
+            DiffVerdict::NoDivergence,
+            "the canary axis must stay silent — e2-custom declares \
+             expect_boundary_catch = false"
+        );
+
+        let report = shape_leads(&readings);
+        assert_eq!(
+            report.leads.len(),
+            1,
+            "the corpus pair stopped producing exactly one lead: {:?}",
+            report.leads
+        );
+        assert!(
+            report.leads[0].shape.render().contains("sig"),
+            "the lead no longer names the signature parameter: {}",
+            report.leads[0].shape.render()
+        );
+    }
+
     /// Pins the corrected premise so nobody "simplifies" the shape back to a
     /// destination.
     ///
