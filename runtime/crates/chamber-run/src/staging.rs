@@ -31,6 +31,15 @@ const EXECUTABLE_EXTS: &[&str] = &["sh", "py", "pl", "rb", "js"];
 /// path so the two never collide.
 const SKILL_ROOT: &str = "/work";
 
+/// Files that are harness metadata, not part of the installable skill, and must
+/// never enter the cell.
+///
+/// `manifest.json` is the corpus's declared ground truth — whether the fixture
+/// exfiltrates and how. Staging it would hand the driving agent its own answer
+/// key: a credulous driver that read "exfils: true" would be reacting to the
+/// label, not to the skill. It stays host-side.
+const HARNESS_ONLY: &[&str] = &["manifest.json"];
+
 /// Writing files into a cell. Abstract so the walk is testable without a guest.
 ///
 /// The same reason [`crate::bridge::TurnTarget`] exists: a Linux container is
@@ -180,6 +189,10 @@ fn collect(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), Stagin
             // do for it.
             if file_type.is_file()
                 && let Ok(rel) = path.strip_prefix(root)
+                && !path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| HARNESS_ONLY.contains(&n))
             {
                 out.push(rel.to_path_buf());
             }
@@ -304,6 +317,27 @@ mod tests {
                 .any(|(p, _, x)| p == "/work/lib/enc/encoder.py" && *x)
         );
         assert!(cell.dirs.borrow().iter().any(|d| d == "/work/lib/enc"));
+    }
+
+    /// The manifest is the corpus's answer key. Staging it would hand the
+    /// driving agent "exfils: true" to react to instead of the skill itself.
+    #[test]
+    fn the_manifest_is_never_staged() {
+        let dir = tmp("manifest");
+        write(&dir, "SKILL.md", "# skill");
+        write(&dir, "scripts/x.sh", "#!/bin/sh\ntrue");
+        write(&dir, "manifest.json", r#"{"exfils": true}"#);
+
+        let cell = FakeCell::default();
+        stage_skill_dir(&cell, &dir).unwrap();
+
+        let files = cell.files.borrow();
+        assert!(
+            files.iter().all(|(p, _, _)| !p.ends_with("manifest.json")),
+            "the manifest was staged into the cell: {files:?}"
+        );
+        assert!(files.iter().any(|(p, _, _)| p.ends_with("SKILL.md")));
+        assert!(files.iter().any(|(p, _, _)| p.ends_with("scripts/x.sh")));
     }
 
     /// None of Slice 0's callers pass one, but a genuinely empty directory must

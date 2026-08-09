@@ -8,3 +8,10 @@
 # which is exactly the trade this design refuses.
 FROM alpine:3.20
 RUN apk add --no-cache curl ca-certificates bind-tools
+
+# The agent works from /work — where the tmpfs mounts, the trust anchor is
+# placed, and a skill is installed. Without this the cell's cwd is /, and a
+# skill that says "run scripts/collect.sh" fails on a path that does not
+# resolve — which reads as the skill doing nothing rather than as the
+# working-directory mismatch it is. The tmpfs mounts over this at runtime.
+WORKDIR /work
