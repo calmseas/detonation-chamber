@@ -52,8 +52,8 @@ pub use corpus::{CorpusCell, CorpusManifest, corpus_dir, load_manifests};
 pub use differential::{
     ArmClass, ArmDriverFactory, ArmOutcome, ArmReading, ArmRole, ArmSpec, ArmWitness, ArtefactRef,
     BatteryTask, CanaryTemplate, Crossing, DiffVerdict, Differential, DifferentialBundle,
-    DifferentialPlan, DifferentialRefusal, RecheckRefusal, diff_arms, recheck_differential,
-    run_differential,
+    DifferentialPlan, DifferentialRefusal, RecheckRefusal, RequestShape, ShapeLead, ShapeReport,
+    diff_arms, recheck_differential, run_differential, shape_gaps, shape_leads,
 };
 pub use liveturns::{
     AgentBrief, AgentPrompt, Budget, BudgetRefusal, Exchange, InferenceRecord, LiveTurns, Model,

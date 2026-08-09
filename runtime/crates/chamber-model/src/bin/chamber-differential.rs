@@ -29,7 +29,7 @@ use chamber_capture::{Canary, CanarySet};
 use chamber_model::{DEFAULT_MODEL, HttpsTransport, OpenRouterModel};
 use chamber_run::{
     AgentBrief, ArmClass, ArmDriverFactory, ArmSpec, ArtefactRef, BatteryTask, Budget,
-    CanaryTemplate, DiffVerdict, DifferentialPlan, ImageTags, LiveTurns, TurnSource,
+    CanaryTemplate, DiffVerdict, DifferentialPlan, ImageTags, LiveTurns, ShapeReport, TurnSource,
     run_differential,
 };
 
@@ -91,6 +91,48 @@ fn arm_skill_dir(override_var: &str, artefact_path: &str) -> Option<PathBuf> {
         return Some(PathBuf::from(dir));
     }
     chamber_run::skill_dir_beside(std::path::Path::new(artefact_path))
+}
+
+/// The second axis, printed beside the verdict and never as one.
+///
+/// Deliberately worded so a reader cannot mistake a lead for a finding: the two
+/// arms run different artefacts, so an ordinary structural difference lands here
+/// too. The exit code is unaffected — leads never move it.
+fn print_shape_report(report: &ShapeReport) {
+    if report.leads.is_empty() {
+        println!(
+            "No unmatched request shapes on the classes compared. That is not \
+             safety either — see the residual limits in the differential bundle."
+        );
+    } else {
+        println!("UNMATCHED REQUEST SHAPES ({} — a lead, not a finding)", {
+            let n = report.leads.len();
+            if n == 1 {
+                "1".to_owned()
+            } else {
+                n.to_string()
+            }
+        });
+        println!("  the candidate contacted the boundary this way; the reference never did:");
+        for lead in &report.leads {
+            println!("    {:<12} {}", lead.class.wire_tag(), lead.shape.render());
+        }
+        println!();
+        println!(
+            "A shape the reference never produced is NOT proof a secret left — only \
+             that the two artefacts behaved differently. Read the arm bundles."
+        );
+    }
+
+    if !report.is_total() {
+        println!(
+            "  {} ledger entr{} could not be reduced to a shape, so this \
+             comparison is not total.",
+            report.uncompared,
+            if report.uncompared == 1 { "y" } else { "ies" }
+        );
+    }
+    println!();
 }
 
 fn battery() -> Vec<BatteryTask> {
@@ -229,6 +271,7 @@ async fn main() -> ExitCode {
                 );
             }
             println!();
+            print_shape_report(&differential.shapes);
             match &differential.verdict {
                 DiffVerdict::Divergent { witnesses } => {
                     for w in witnesses {

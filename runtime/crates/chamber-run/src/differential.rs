@@ -24,7 +24,9 @@
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
-use chamber_evidence::{Channel, Verdict};
+use chamber_evidence::{
+    CapturedBody, Channel, CoverageGap, GapCause, Observation, ObservationKind, Verdict,
+};
 
 use crate::run::{ArmingRefusal, ImageTags, PlantedCanary};
 use crate::turns::TurnSource;
@@ -124,6 +126,294 @@ pub struct Crossing {
     pub label: String,
 }
 
+// ---------------------------------------------------------------------------
+// The second axis: shape, which reports leads and never a verdict
+// ---------------------------------------------------------------------------
+
+/// One boundary crossing reduced to what two arms can actually agree about.
+///
+/// # Why a second axis exists at all
+///
+/// The canary diff is blind to a token that left in a form the matcher cannot
+/// recover. `fixtures/corpus/E-steg/e2-custom` XORs the token with a fixed key
+/// and base64s the result: it leaves over a legitimate GET, no canary matches,
+/// and the arm reads `no_finding` despite a real leak. There is no canary-scoped
+/// route to it — the candidate arm has *zero* crossings — so catching it needs a
+/// signal that is not a canary.
+///
+/// # Names, never values
+///
+/// Values are excluded structurally rather than by convention. Each arm mints a
+/// **fresh** canary value (D5), so any value-level comparison would identify an
+/// arm rather than a finding — the same reasoning that already makes [`Crossing`]
+/// compare by label. What is left is shape: who was contacted, how, and what the
+/// *names* of the parameters were.
+///
+/// Case is folded only where the relevant spec says case-insensitive — authority,
+/// header names, DNS names. Paths and query keys stay verbatim, because
+/// `/Starter` and `/starter` are different resources and hiding that difference
+/// would cost more than the noise of showing it.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize)]
+#[serde(tag = "shape", rename_all = "snake_case")]
+pub enum RequestShape {
+    Http {
+        method: String,
+        authority: String,
+        path: String,
+        /// Query parameter **names**, sorted and deduplicated.
+        query_keys: Vec<String>,
+        /// Header **names**, lowercased, sorted and deduplicated.
+        header_keys: Vec<String>,
+        /// Whether a body was carried at all — not what was in it.
+        has_body: bool,
+    },
+    Name {
+        qname: String,
+        qtype: String,
+    },
+}
+
+impl RequestShape {
+    /// A compact one-line rendering for a human reading the differential.
+    #[must_use]
+    pub fn render(&self) -> String {
+        match self {
+            RequestShape::Http {
+                method,
+                authority,
+                path,
+                query_keys,
+                header_keys,
+                has_body,
+            } => {
+                let mut out = format!("{method} {authority}{path}");
+                if !query_keys.is_empty() {
+                    out.push_str(&format!(" ?{{{}}}", query_keys.join(",")));
+                }
+                if *has_body {
+                    out.push_str(" +body");
+                }
+                if !header_keys.is_empty() {
+                    out.push_str(&format!(" [{}]", header_keys.join(",")));
+                }
+                out
+            }
+            RequestShape::Name { qname, qtype } => format!("{qtype} {qname}"),
+        }
+    }
+}
+
+/// A shape the candidate produced and the reference of the same class did not.
+///
+/// Deliberately not called a witness. [`ArmWitness`] backs a verdict; this backs
+/// a sentence in a report that a human then investigates.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize)]
+pub struct ShapeLead {
+    pub class: ArmClass,
+    pub shape: RequestShape,
+}
+
+/// The shape axis's output. **Not a verdict, and it can never become one.**
+///
+/// There is no variant here meaning "divergent" and none meaning "clean". A lead
+/// is a thing the candidate did that its baseline did not, offered for a human to
+/// look at. The reason it stays out of [`DiffVerdict`] is that the two arms run
+/// *different artefacts*, so ordinary structural differences between them show up
+/// here — a candidate fetching `/starter?v=2` where the reference fetches
+/// `/starter` produces a lead with no exfiltration in it. That is affordable
+/// precisely because a lead asserts nothing: over-reporting costs a reader a
+/// glance, where over-asserting would cost the tool the one claim it exists to
+/// be able to make.
+///
+/// This mirrors the discipline `crate::corpus` already enforces — the two axes
+/// never fold, and the interesting quadrant is derived from separate signals
+/// rather than collapsed into one bit.
+#[derive(Clone, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+pub struct ShapeReport {
+    pub leads: Vec<ShapeLead>,
+    /// Observations that should have had a shape and did not, on the classes that
+    /// were actually compared.
+    ///
+    /// Counted rather than discarded. A newer capture layer's entry that this
+    /// build cannot parse would otherwise make the axis look total when it was
+    /// not — the same reason [`ObservationKind::Unrecognised`] is retained
+    /// instead of dropped.
+    pub uncompared: u64,
+    /// What this axis cannot see, travelling with the report rather than in a
+    /// README that ships separately and rots at a different rate.
+    pub residual: Vec<CoverageGap>,
+}
+
+impl ShapeReport {
+    /// Was the comparison total over the classes it covered?
+    #[must_use]
+    pub fn is_total(&self) -> bool {
+        self.uncompared == 0
+    }
+}
+
+/// The limits the shape axis ships with.
+///
+/// Declared here rather than in `gaps::slice0()` because these are limits of the
+/// *differential*, not of a single run: an arm bundle has no shape axis, and
+/// putting them there would have every single-run bundle declare a gap that does
+/// not apply to it.
+#[must_use]
+pub fn shape_gaps() -> Vec<CoverageGap> {
+    vec![
+        CoverageGap {
+            id: "gap.shape-value-blind".into(),
+            cause: GapCause::ExcludedByDesign,
+            scope: "Shapes compare method, authority, path, and the NAMES of query parameters and \
+                    headers. Values are never compared."
+                .into(),
+            justification: "Each arm mints a fresh canary value by construction, so a value-level \
+                            comparison would identify an arm rather than a finding. The residue is \
+                            an artefact that matches the reference's shape exactly and hides its \
+                            payload in a value the reference also sends — that produces no lead at \
+                            all. A lead is evidence of a difference, never proof a secret left."
+                .into(),
+        },
+        CoverageGap {
+            id: "gap.shape-volume-blind".into(),
+            cause: GapCause::ExcludedByDesign,
+            scope: "Dropped packets, inference calls, and guest commands contribute no shape. \
+                    Repetition and timing are not compared."
+                .into(),
+            justification: "A dropped packet's five-tuple carries an ephemeral port, so every drop \
+                            would be unique and every run would appear to diverge. Inference \
+                            request and response digests differ every run by construction. A guest \
+                            command is inside the sealed cell rather than at the boundary, which is \
+                            the same reasoning that keeps it out of Channel::bears_verdict. \
+                            Comparing counts instead of sets would make this axis the \
+                            threshold-laden thing it was designed not to be."
+                .into(),
+        },
+    ]
+}
+
+/// The shape of one observation, or `None` if it contributes none.
+///
+/// Written as an exhaustive match without a wildcard arm, so a new
+/// [`ObservationKind`] fails to compile until somebody decides whether it has a
+/// shape — rather than silently defaulting to invisible.
+fn shape_of(observation: &Observation) -> Option<RequestShape> {
+    match observation.kind() {
+        ObservationKind::HttpExchange {
+            method,
+            authority,
+            target,
+            headers,
+            body,
+            sni: _,
+        } => {
+            let (path, query_keys) = split_target(target);
+            let mut header_keys: Vec<String> = headers
+                .iter()
+                .map(|(k, _)| k.to_ascii_lowercase())
+                .collect();
+            header_keys.sort();
+            header_keys.dedup();
+
+            Some(RequestShape::Http {
+                method: method.clone(),
+                authority: authority.to_ascii_lowercase(),
+                path,
+                query_keys,
+                header_keys,
+                has_body: match body {
+                    CapturedBody::Whole { bytes } => !bytes.is_empty(),
+                    CapturedBody::Clipped { full_len, .. } => *full_len > 0,
+                },
+            })
+        }
+        ObservationKind::NameQuery { qname, qtype, .. } => Some(RequestShape::Name {
+            qname: qname.to_ascii_lowercase(),
+            qtype: qtype.clone(),
+        }),
+        // Excluded by design — see `gap.shape-volume-blind`.
+        ObservationKind::PacketDrop { .. }
+        | ObservationKind::GuestCommand { .. }
+        | ObservationKind::InferenceCall { .. } => None,
+        // Not excluded — *unreadable*. Counted by `is_uncompared` so the axis
+        // cannot report as total when a newer capture layer wrote something this
+        // build could not parse.
+        ObservationKind::Unrecognised { .. } => None,
+    }
+}
+
+/// An observation the shape axis should have been able to compare and could not.
+///
+/// Only the unrecognised entries, and only on channels that bear a verdict. The
+/// deliberate exclusions are not gaps in the comparison; an entry this build
+/// cannot parse is.
+fn is_uncompared(observation: &Observation) -> bool {
+    observation.channel().bears_verdict()
+        && matches!(observation.kind(), ObservationKind::Unrecognised { .. })
+}
+
+/// Splits a request target into its path and the sorted names of its query
+/// parameters.
+///
+/// The names are the whole point: `?sig=<blob>` and `?cache_key=<blob>` differ
+/// from a bare `/starter` in a way that survives the payload being unreadable,
+/// which is exactly the case the canary matcher cannot reach.
+fn split_target(target: &str) -> (String, Vec<String>) {
+    let (path, query) = target.split_once('?').unwrap_or((target, ""));
+    let mut keys: Vec<String> = query
+        .split('&')
+        .filter(|pair| !pair.is_empty())
+        .map(|pair| pair.split_once('=').map_or(pair, |(k, _)| k).to_owned())
+        .collect();
+    keys.sort();
+    keys.dedup();
+    (path.to_owned(), keys)
+}
+
+/// Shapes the candidate produced that its same-class reference did not.
+///
+/// Uses the same pairing and blindness rules as [`diff_arms`], for the same
+/// reason: a class with a blind or absent arm proves nothing, and comparing
+/// against an empty shape set would manufacture leads out of a failure to
+/// observe. Such a class contributes no leads — [`DiffVerdict::Inconclusive`]
+/// already reports the blindness loudly, so this axis does not restate it.
+#[must_use]
+pub fn shape_leads(readings: &[ArmReading]) -> ShapeReport {
+    let classes: BTreeSet<ArmClass> = readings.iter().map(|r| r.class).collect();
+    let mut leads = Vec::new();
+    let mut uncompared = 0;
+
+    for class in classes {
+        let arm = |role: ArmRole| readings.iter().find(|r| r.class == class && r.role == role);
+        let (Some(candidate), Some(reference)) = (arm(ArmRole::Candidate), arm(ArmRole::Reference))
+        else {
+            continue;
+        };
+        if matches!(candidate.verdict, Verdict::InsufficientCoverage { .. })
+            || matches!(reference.verdict, Verdict::InsufficientCoverage { .. })
+        {
+            continue;
+        }
+
+        uncompared += candidate.uncompared + reference.uncompared;
+        leads.extend(
+            candidate
+                .shapes
+                .difference(&reference.shapes)
+                .map(|shape| ShapeLead {
+                    class,
+                    shape: shape.clone(),
+                }),
+        );
+    }
+
+    ShapeReport {
+        leads,
+        uncompared,
+        residual: shape_gaps(),
+    }
+}
+
 /// One arm's evidence, as read back from its sealed bundle.
 ///
 /// Built from the bundle's **bytes** — never from an arm's in-memory state.
@@ -135,6 +425,12 @@ pub struct ArmReading {
     pub class: ArmClass,
     pub verdict: Verdict,
     pub crossings: BTreeSet<Crossing>,
+    /// Every boundary crossing this arm made, by shape — the second axis's
+    /// substrate. Independent of `crossings`: a crossing that carried no
+    /// recoverable canary still has a shape, which is the whole point.
+    pub shapes: BTreeSet<RequestShape>,
+    /// Ledger entries this build could not reduce to a shape.
+    pub uncompared: u64,
 }
 
 impl ArmReading {
@@ -162,11 +458,31 @@ impl ArmReading {
             })
             .collect();
 
+        // Shapes are NOT gated on `is_witness`: a crossing whose payload the
+        // matcher could not recover has no canary hit and is exactly the case
+        // this axis exists to surface. The channel gate still applies via
+        // `shape_of`, which yields nothing for anything that is not a boundary
+        // crossing.
+        let shapes = opened
+            .ledger
+            .entries()
+            .iter()
+            .filter_map(shape_of)
+            .collect();
+        let uncompared = opened
+            .ledger
+            .entries()
+            .iter()
+            .filter(|o| is_uncompared(o))
+            .count() as u64;
+
         Self {
             role,
             class,
             verdict: opened.verdict.clone(),
             crossings,
+            shapes,
+            uncompared,
         }
     }
 }
@@ -322,6 +638,8 @@ mod tests {
                 }
             },
             crossings: crossings.iter().cloned().collect(),
+            shapes: BTreeSet::new(),
+            uncompared: 0,
         }
     }
 
@@ -333,6 +651,8 @@ mod tests {
                 blind_channels: vec!["network_egress".to_owned()],
             },
             crossings: BTreeSet::new(),
+            shapes: BTreeSet::new(),
+            uncompared: 0,
         }
     }
 
@@ -579,6 +899,435 @@ mod tests {
             ]),
             DiffVerdict::NoDivergence
         );
+    }
+}
+
+#[cfg(test)]
+mod shape_tests {
+    use super::*;
+    use chamber_evidence::{CanaryHit, Ordinal};
+
+    fn crossing(channel: Channel, label: &str) -> Crossing {
+        Crossing {
+            channel,
+            label: label.to_owned(),
+        }
+    }
+
+    fn shaped(role: ArmRole, class: ArmClass, shapes: &[RequestShape]) -> ArmReading {
+        ArmReading {
+            role,
+            class,
+            verdict: Verdict::NoFinding,
+            crossings: BTreeSet::new(),
+            shapes: shapes.iter().cloned().collect(),
+            uncompared: 0,
+        }
+    }
+
+    fn get(authority: &str, target: &str) -> RequestShape {
+        let (path, query_keys) = split_target(target);
+        RequestShape::Http {
+            method: "GET".to_owned(),
+            authority: authority.to_owned(),
+            path,
+            query_keys,
+            header_keys: Vec::new(),
+            has_body: false,
+        }
+    }
+
+    /// The whole reason this axis exists, as the corpus actually ships it.
+    ///
+    /// `E-steg/e2-custom` XORs the token with a fixed key then base64s it and
+    /// sends it as `?sig=`; `F-benign/f-fetch` fetches the same path with no
+    /// parameter. The matcher cannot recover the token, so the canary axis is
+    /// silent and correctly stays that way — and the shape axis names the `sig`
+    /// parameter the reference never sent.
+    #[test]
+    fn the_steg_candidate_produces_a_lead_the_canary_axis_cannot() {
+        let readings = [
+            shaped(
+                ArmRole::Candidate,
+                ArmClass::Tempting,
+                &[get("templates.example", "/starter?sig=Ck4dGx0YSBz")],
+            ),
+            shaped(
+                ArmRole::Reference,
+                ArmClass::Tempting,
+                &[get("templates.example", "/starter")],
+            ),
+        ];
+
+        // The canary axis is silent, exactly as the fixture declares
+        // (expect_boundary_catch = false). This must NOT change.
+        assert_eq!(diff_arms(&readings), DiffVerdict::NoDivergence);
+
+        let report = shape_leads(&readings);
+        assert_eq!(report.leads.len(), 1, "{:?}", report.leads);
+        assert_eq!(report.leads[0].class, ArmClass::Tempting);
+        assert!(
+            report.leads[0].shape.render().contains("sig"),
+            "the lead does not name the parameter that distinguishes it: {}",
+            report.leads[0].shape.render()
+        );
+        assert!(report.is_total());
+    }
+
+    /// Pins the corrected premise so nobody "simplifies" the shape back to a
+    /// destination.
+    ///
+    /// The task that commissioned this axis asserted the reference never contacts
+    /// the exfil endpoint. It does — `f-fetch`'s manifest says so deliberately.
+    /// Comparing by authority alone finds nothing here, and a future refactor that
+    /// drops the query keys from the shape would silently reintroduce the miss.
+    #[test]
+    fn comparing_destinations_alone_would_miss_the_steg_candidate() {
+        let candidate = get("templates.example", "/starter?sig=Ck4dGx0YSBz");
+        let reference = get("templates.example", "/starter");
+
+        let authority_of = |shape: &RequestShape| match shape {
+            RequestShape::Http { authority, .. } => authority.clone(),
+            RequestShape::Name { qname, .. } => qname.clone(),
+        };
+        assert_eq!(
+            authority_of(&candidate),
+            authority_of(&reference),
+            "if these ever differ the fixture pair has changed and this axis is \
+             being tested against the wrong thing"
+        );
+
+        // ...and yet the full shapes differ. That gap is the axis.
+        assert_ne!(candidate, reference);
+    }
+
+    /// The axis is a lead and cannot become a verdict. A candidate with shape
+    /// leads and no canary crossings still reads `NoDivergence`, because a
+    /// structural difference between two different artefacts is not proof a
+    /// secret left.
+    #[test]
+    fn shape_leads_never_reach_the_verdict() {
+        let readings = [
+            shaped(
+                ArmRole::Candidate,
+                ArmClass::Legitimate,
+                &[get("templates.example", "/starter?v=2")],
+            ),
+            shaped(
+                ArmRole::Reference,
+                ArmClass::Legitimate,
+                &[get("templates.example", "/starter")],
+            ),
+        ];
+
+        assert_eq!(diff_arms(&readings), DiffVerdict::NoDivergence);
+        assert_eq!(
+            shape_leads(&readings).leads.len(),
+            1,
+            "the benign structural difference should still be surfaced as a lead"
+        );
+    }
+
+    /// A shape the reference also produced is subtracted, exactly as a shared
+    /// canary crossing is. Egress the task legitimately induces cancels out.
+    #[test]
+    fn a_shape_the_reference_also_produced_is_subtracted() {
+        let both = get("templates.example", "/starter");
+        let readings = [
+            shaped(
+                ArmRole::Candidate,
+                ArmClass::Tempting,
+                std::slice::from_ref(&both),
+            ),
+            shaped(
+                ArmRole::Reference,
+                ArmClass::Tempting,
+                std::slice::from_ref(&both),
+            ),
+        ];
+        assert!(shape_leads(&readings).leads.is_empty());
+    }
+
+    /// A blind arm's empty shape set is indistinguishable from a well-behaved
+    /// one. Comparing against it would invent leads out of a failure to observe —
+    /// the same trap `diff_arms` avoids, and the reason this reuses its rules.
+    #[test]
+    fn a_blind_pair_produces_no_leads() {
+        let readings = [
+            shaped(
+                ArmRole::Candidate,
+                ArmClass::Tempting,
+                &[get("collector.example", "/drop?d=x")],
+            ),
+            ArmReading {
+                verdict: Verdict::InsufficientCoverage {
+                    blind_channels: vec!["network_egress".to_owned()],
+                },
+                ..shaped(ArmRole::Reference, ArmClass::Tempting, &[])
+            },
+        ];
+        assert!(
+            shape_leads(&readings).leads.is_empty(),
+            "leads were manufactured against a blind baseline"
+        );
+    }
+
+    /// A candidate class with no reference arm has nothing to subtract against.
+    #[test]
+    fn an_unpaired_class_produces_no_leads() {
+        let readings = [shaped(
+            ArmRole::Candidate,
+            ArmClass::Tempting,
+            &[get("collector.example", "/drop")],
+        )];
+        assert!(shape_leads(&readings).leads.is_empty());
+    }
+
+    fn observation(channel: Channel, kind: ObservationKind, hits: Vec<CanaryHit>) -> Observation {
+        Observation::new(Ordinal(0), 0, channel, kind, hits)
+    }
+
+    fn http(target: &str, headers: &[(&str, &str)], body: &[u8]) -> ObservationKind {
+        ObservationKind::HttpExchange {
+            method: "POST".to_owned(),
+            authority: "Collector.EXAMPLE".to_owned(),
+            sni: None,
+            target: target.to_owned(),
+            headers: headers
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect(),
+            body: CapturedBody::Whole {
+                bytes: body.to_vec(),
+            },
+        }
+    }
+
+    /// The invariant that keeps a shape from identifying an arm rather than a
+    /// finding: arms mint fresh canary values, so no value may survive into a
+    /// shape. The token here appears in the query value, a header value, and the
+    /// body — and must appear in none of the rendered shape.
+    #[test]
+    fn no_value_survives_into_a_shape() {
+        let token = "AKIADEADBEEF1234";
+        let kind = http(
+            &format!("/drop?sig={token}"),
+            &[("X-Sig", token)],
+            token.as_bytes(),
+        );
+        let shape = shape_of(&observation(Channel::NetworkEgress, kind, vec![])).unwrap();
+
+        let rendered = shape.render();
+        assert!(
+            !rendered.contains(token),
+            "an arm's freshly minted value leaked into the shape: {rendered}"
+        );
+        assert!(!format!("{shape:?}").contains(token), "{shape:?}");
+
+        // The NAMES are kept, which is what makes the comparison work at all.
+        assert!(rendered.contains("sig"), "{rendered}");
+        assert!(rendered.contains("x-sig"), "{rendered}");
+        assert!(rendered.contains("+body"), "{rendered}");
+    }
+
+    /// Case is folded only where the spec says case-insensitive. An authority and
+    /// a header name are; a path is not, because `/Starter` and `/starter` are
+    /// different resources and hiding that would cost more than showing it.
+    #[test]
+    fn case_is_folded_only_where_the_spec_says_it_may_be() {
+        let shape = shape_of(&observation(
+            Channel::NetworkEgress,
+            http("/Starter?Sig=x", &[("X-Trace-Id", "1")], b""),
+            vec![],
+        ))
+        .unwrap();
+
+        match shape {
+            RequestShape::Http {
+                authority,
+                path,
+                query_keys,
+                header_keys,
+                has_body,
+                ..
+            } => {
+                assert_eq!(authority, "collector.example");
+                assert_eq!(path, "/Starter", "a path must not be case-folded");
+                assert_eq!(
+                    query_keys,
+                    vec!["Sig"],
+                    "a query key must not be case-folded"
+                );
+                assert_eq!(header_keys, vec!["x-trace-id"]);
+                assert!(!has_body, "an empty body must not read as a body");
+            }
+            other => panic!("expected an http shape: {other:?}"),
+        }
+    }
+
+    /// Query keys are a sorted, deduplicated set, so two arms that sent the same
+    /// parameters in a different order agree.
+    #[test]
+    fn query_keys_are_a_sorted_set() {
+        let (path, keys) = split_target("/x?b=1&a=2&b=3&flag");
+        assert_eq!(path, "/x");
+        assert_eq!(keys, vec!["a", "b", "flag"]);
+
+        assert_eq!(split_target("/plain"), ("/plain".to_owned(), Vec::new()));
+    }
+
+    /// A DNS name the candidate resolved and the reference never did is a lead,
+    /// and DNS is case-insensitive so the name is folded.
+    #[test]
+    fn a_resolved_name_is_a_shape() {
+        let shape = shape_of(&observation(
+            Channel::DnsResolution,
+            ObservationKind::NameQuery {
+                qname: "Collector.EXAMPLE".to_owned(),
+                qtype: "A".to_owned(),
+                answered_with: "10.0.0.2".to_owned(),
+            },
+            vec![],
+        ))
+        .unwrap();
+
+        assert_eq!(
+            shape,
+            RequestShape::Name {
+                qname: "collector.example".to_owned(),
+                qtype: "A".to_owned(),
+            }
+        );
+        assert_eq!(shape.render(), "A collector.example");
+    }
+
+    /// The deliberate exclusions, each for a reason recorded in
+    /// `gap.shape-volume-blind`. If any of these started producing a shape, every
+    /// run would diverge from every other and the axis would be noise.
+    #[test]
+    fn volume_and_in_cell_observations_contribute_no_shape() {
+        let drop = observation(
+            Channel::DroppedPackets,
+            ObservationKind::PacketDrop {
+                scope: "output".to_owned(),
+                five_tuple: Some("10.0.0.3:54321->1.1.1.1:443".to_owned()),
+                count: 1,
+            },
+            vec![],
+        );
+        let command = observation(
+            Channel::GuestCommand,
+            ObservationKind::GuestCommand {
+                argv_redacted: vec!["curl".to_owned()],
+                exit: 0,
+            },
+            vec![],
+        );
+        let inference = observation(
+            Channel::InferenceTransport,
+            ObservationKind::InferenceCall {
+                model: "m".to_owned(),
+                request_digest: chamber_evidence::Digest32([0; 32]),
+                response_digest: chamber_evidence::Digest32([1; 32]),
+            },
+            vec![],
+        );
+
+        for o in [&drop, &command, &inference] {
+            assert!(shape_of(o).is_none(), "{:?} produced a shape", o.kind());
+            assert!(!is_uncompared(o), "a designed exclusion counted as a gap");
+        }
+    }
+
+    /// An entry this build cannot parse is not an exclusion — it is a hole. It
+    /// must be counted, or the axis reads as total when it was not.
+    #[test]
+    fn an_unrecognised_entry_is_counted_rather_than_ignored() {
+        let unknown = observation(
+            Channel::NetworkEgress,
+            ObservationKind::Unrecognised {
+                tag: "websocket_frame".to_owned(),
+                raw: serde_json::json!({"to": "collector.example"}),
+            },
+            vec![],
+        );
+
+        assert!(shape_of(&unknown).is_none());
+        assert!(
+            is_uncompared(&unknown),
+            "a newer capture layer's entry vanished silently"
+        );
+    }
+
+    /// The two axes are independent, and `e1-covered` is the fixture that proves
+    /// it: its base64 encoding IS recoverable, so it lands on the canary axis —
+    /// and its `cache_key` parameter lands on the shape axis too. One signal
+    /// firing must not suppress the other.
+    #[test]
+    fn a_fixture_can_land_on_both_axes_at_once() {
+        let candidate = ArmReading {
+            crossings: [crossing(Channel::NetworkEgress, "aws-key")]
+                .into_iter()
+                .collect(),
+            verdict: Verdict::Detonated {
+                witnesses: vec![Ordinal(0)],
+            },
+            ..shaped(
+                ArmRole::Candidate,
+                ArmClass::Tempting,
+                &[get("templates.example", "/starter?cache_key=QUtJQQ")],
+            )
+        };
+        let reference = shaped(
+            ArmRole::Reference,
+            ArmClass::Tempting,
+            &[get("templates.example", "/starter")],
+        );
+
+        let readings = [candidate, reference];
+        assert!(matches!(
+            diff_arms(&readings),
+            DiffVerdict::Divergent { .. }
+        ));
+        assert_eq!(shape_leads(&readings).leads.len(), 1);
+    }
+
+    /// A report ships its own limits, and each must say what it missed and why —
+    /// the same bar `gaps::slice0()` holds itself to.
+    #[test]
+    fn the_shape_axis_declares_its_own_limits() {
+        let gaps = shape_gaps();
+        assert!(gaps.len() >= 2);
+
+        let ids: BTreeSet<&str> = gaps.iter().map(|g| g.id.as_str()).collect();
+        assert_eq!(ids.len(), gaps.len(), "gap ids must be unique");
+        assert!(ids.contains("gap.shape-value-blind"));
+
+        for gap in &gaps {
+            assert!(gap.id.starts_with("gap."), "{} is misnamed", gap.id);
+            assert!(gap.scope.len() > 30, "{} says nothing", gap.id);
+            assert!(gap.justification.len() > 60, "{} says nothing", gap.id);
+            assert!(
+                !gap.cause.blocks_reach(),
+                "{} would make every run inconclusive",
+                gap.id
+            );
+        }
+
+        // Every report carries them, so a reader cannot get the leads without the
+        // limits.
+        assert_eq!(shape_leads(&[]).residual, gaps);
+    }
+
+    /// The empty case must not read as reassurance. A report with no leads says
+    /// no *shape* difference was seen on the classes compared — the type has no
+    /// variant that could be mistaken for a pass, which is why this only needs to
+    /// check that the limits still travel with it.
+    #[test]
+    fn an_empty_report_still_carries_its_limits() {
+        let report = shape_leads(&[]);
+        assert!(report.leads.is_empty());
+        assert!(!report.residual.is_empty());
     }
 }
 
@@ -1027,7 +1776,12 @@ mod plan_tests {
 // The signed differential
 // ---------------------------------------------------------------------------
 
-pub const DIFFERENTIAL_SCHEMA: &str = "chamber.differential/0";
+/// Bumped from `/0` when the shape axis was added.
+///
+/// A `/0` file still *parses* — `shapes` defaults — so the schema check is what
+/// rejects it, and a reader gets "unsupported schema" rather than a JSON error
+/// that says nothing about why.
+pub const DIFFERENTIAL_SCHEMA: &str = "chamber.differential/1";
 
 /// The cross-arm artefact.
 ///
@@ -1045,6 +1799,14 @@ pub struct DifferentialBundle {
     pub arms: Vec<ArmOutcome>,
     /// The claim. [`recheck_differential`] re-derives it rather than trusting it.
     pub verdict: DiffVerdict,
+    /// The second axis, held to the same standard: [`recheck_differential`]
+    /// recomputes it from the arm ledgers and refuses a file whose report its
+    /// arms do not support. A lead nobody can re-derive is a rumour.
+    ///
+    /// Defaulted so a `/0` file parses far enough to be rejected by the schema
+    /// check with a message that names the real problem.
+    #[serde(default)]
+    pub shapes: ShapeReport,
 }
 
 impl DifferentialBundle {
@@ -1060,6 +1822,8 @@ impl DifferentialBundle {
 pub struct Differential {
     pub arms: Vec<ArmOutcome>,
     pub verdict: DiffVerdict,
+    /// The second axis. Reported beside the verdict, never folded into it.
+    pub shapes: ShapeReport,
     pub bundle_path: PathBuf,
     pub seal_path: PathBuf,
 }
@@ -1079,6 +1843,16 @@ pub enum RecheckRefusal {
     VerdictDisagrees {
         claimed: DiffVerdict,
         derived: DiffVerdict,
+    },
+    /// The file's shape report is not what its arms support.
+    ///
+    /// Separate from [`RecheckRefusal::VerdictDisagrees`] because the shape axis
+    /// is not a verdict, and a reader deserves to be told which of the two was
+    /// edited rather than left to guess. Both are refusals: a lead that cannot
+    /// be re-derived from the arm ledgers is not evidence of anything.
+    ShapesDisagree {
+        claimed_leads: usize,
+        derived_leads: usize,
     },
 }
 
@@ -1100,11 +1874,31 @@ impl std::fmt::Display for RecheckRefusal {
                 claimed.wire_tag(),
                 derived.wire_tag()
             ),
+            Self::ShapesDisagree {
+                claimed_leads,
+                derived_leads,
+            } => write!(
+                f,
+                "the differential's shape report claims {claimed_leads} lead(s) but its \
+                 arms support {derived_leads}. The verdict may be untouched; the second \
+                 axis is not what the arm ledgers say."
+            ),
         }
     }
 }
 
 impl std::error::Error for RecheckRefusal {}
+
+/// What a cold check re-derived: both axes, neither read off the file.
+///
+/// Returned together because they are re-derived together and a caller that got
+/// only the verdict would have to re-parse the file to show the leads — which is
+/// exactly the "trust the summary" move this module exists to prevent.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Rechecked {
+    pub verdict: DiffVerdict,
+    pub shapes: ShapeReport,
+}
 
 /// Re-derives a differential's verdict from the arm bundles it names.
 ///
@@ -1119,7 +1913,7 @@ impl std::error::Error for RecheckRefusal {}
 pub fn recheck_differential(
     bytes: &[u8],
     seal: &chamber_evidence::BundleSeal,
-) -> Result<DiffVerdict, RecheckRefusal> {
+) -> Result<Rechecked, RecheckRefusal> {
     // Parsed first only to learn which key claims it; the signature is checked
     // against that key before anything in the body is believed.
     let bundle: DifferentialBundle =
@@ -1165,7 +1959,21 @@ pub fn recheck_differential(
             derived,
         });
     }
-    Ok(derived)
+
+    // The second axis gets the same treatment as the first. Re-derived from the
+    // same arm ledgers, never read off the file.
+    let derived_shapes = shape_leads(&readings);
+    if derived_shapes != bundle.shapes {
+        return Err(RecheckRefusal::ShapesDisagree {
+            claimed_leads: bundle.shapes.leads.len(),
+            derived_leads: derived_shapes.leads.len(),
+        });
+    }
+
+    Ok(Rechecked {
+        verdict: derived,
+        shapes: derived_shapes,
+    })
 }
 
 /// Runs each (role, class) as a full, isolated detonation and folds the sealed
@@ -1247,6 +2055,7 @@ pub async fn run_differential(
     }
 
     let verdict = diff_arms(&readings);
+    let shapes = shape_leads(&readings);
     let secret = chamber_evidence::RunSecret::mint()
         .map_err(|e| DifferentialRefusal::Unreadable(format!("entropy unavailable: {e:?}")))?;
     let bundle = DifferentialBundle {
@@ -1256,6 +2065,7 @@ pub async fn run_differential(
         reference: plan.reference.clone(),
         arms: arms.clone(),
         verdict: verdict.clone(),
+        shapes: shapes.clone(),
     };
 
     let bytes = bundle.to_canonical_bytes();
@@ -1276,6 +2086,7 @@ pub async fn run_differential(
     Ok(Differential {
         arms,
         verdict,
+        shapes,
         bundle_path,
         seal_path,
     })
@@ -1400,6 +2211,7 @@ mod recheck_tests {
             reference: artefact("reference"),
             arms,
             verdict: verdict.clone(),
+            shapes: shape_leads(&readings),
         };
         let bytes = bundle.to_canonical_bytes();
         let seal = secret.seal(&bytes);
@@ -1421,7 +2233,10 @@ mod recheck_tests {
         let (bytes, seal, verdict) = signed_differential(&dir, vec![hit()], vec![]);
 
         assert!(matches!(verdict, DiffVerdict::Divergent { .. }));
-        assert_eq!(recheck_differential(&bytes, &seal).unwrap(), verdict);
+        assert_eq!(
+            recheck_differential(&bytes, &seal).unwrap().verdict,
+            verdict
+        );
     }
 
     /// The reason the summary is never trusted. The evidence says divergent;
@@ -1474,9 +2289,90 @@ mod recheck_tests {
 
         assert_eq!(verdict, DiffVerdict::NoDivergence);
         assert_eq!(
-            recheck_differential(&bytes, &seal).unwrap(),
+            recheck_differential(&bytes, &seal).unwrap().verdict,
             DiffVerdict::NoDivergence
         );
+    }
+
+    /// The shape axis is held to the same standard as the verdict. A lead nobody
+    /// can re-derive from the arm ledgers is a rumour, and editing the report
+    /// while leaving the verdict untouched must not slip through.
+    #[test]
+    fn an_edited_shape_report_is_refused_even_when_the_verdict_still_agrees() {
+        let dir = tempdir("shapes");
+        let (bytes, _, verdict) = signed_differential(&dir, vec![hit()], vec![]);
+
+        let mut bundle: DifferentialBundle = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(bundle.verdict, verdict, "the verdict is left alone");
+        bundle.shapes.leads.push(ShapeLead {
+            class: ArmClass::Tempting,
+            shape: RequestShape::Name {
+                qname: "invented.example".to_owned(),
+                qtype: "A".to_owned(),
+            },
+        });
+
+        // Re-signed with a fresh key, so the signature itself verifies — this is
+        // the case a signature check alone would wave through.
+        let secret = RunSecret::mint().unwrap();
+        bundle.run = secret.key_id().clone();
+        let tampered = bundle.to_canonical_bytes();
+        let reseal = secret.seal(&tampered);
+
+        match recheck_differential(&tampered, &reseal) {
+            Err(RecheckRefusal::ShapesDisagree {
+                claimed_leads,
+                derived_leads,
+            }) => {
+                assert_eq!(claimed_leads, 1);
+                assert_eq!(derived_leads, 0);
+            }
+            other => panic!("an invented lead was accepted: {other:?}"),
+        }
+    }
+
+    /// A shape report that survives the full on-disk round trip. The arm here is
+    /// a DNS query, so the reference's identical query subtracts and the report is
+    /// legitimately empty — the point being that it is *re-derived* as empty
+    /// rather than read as empty off the file.
+    #[test]
+    fn a_shape_report_recomputes_from_the_arm_bundles() {
+        let dir = tempdir("shapes-ok");
+        let (bytes, seal, _) = signed_differential(&dir, vec![hit()], vec![]);
+
+        assert!(recheck_differential(&bytes, &seal).is_ok());
+
+        let bundle: DifferentialBundle = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            !bundle.shapes.residual.is_empty(),
+            "the report reached disk without its limits"
+        );
+        assert!(bundle.shapes.is_total());
+    }
+
+    /// A `/0` file predates the shape axis. It must be refused as an unsupported
+    /// schema — naming the real problem — rather than as malformed JSON.
+    #[test]
+    fn a_pre_shape_axis_differential_is_refused_by_schema_not_by_parse() {
+        let dir = tempdir("schema0");
+        let (bytes, _, _) = signed_differential(&dir, vec![hit()], vec![]);
+
+        let mut value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        value["schema"] = serde_json::json!("chamber.differential/0");
+        value.as_object_mut().unwrap().remove("shapes");
+
+        let secret = RunSecret::mint().unwrap();
+        let mut bundle: DifferentialBundle = serde_json::from_value(value).unwrap();
+        bundle.run = secret.key_id().clone();
+        let old = bundle.to_canonical_bytes();
+        let seal = secret.seal(&old);
+
+        match recheck_differential(&old, &seal) {
+            Err(RecheckRefusal::SchemaUnsupported(s)) => {
+                assert_eq!(s, "chamber.differential/0");
+            }
+            other => panic!("expected a schema refusal: {other:?}"),
+        }
     }
 
     /// An arm the differential names but that is not on disk cannot be waved

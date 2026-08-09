@@ -45,12 +45,35 @@ fn main() -> ExitCode {
     };
 
     match recheck_differential(&bytes, &seal) {
-        Ok(verdict) => {
+        Ok(rechecked) => {
+            let verdict = rechecked.verdict;
             println!("differential  {bundle}");
             println!(
                 "VERDICT       {} (re-derived from the arm bundles)",
                 verdict.wire_tag()
             );
+
+            // The second axis, re-derived from the same ledgers rather than read
+            // off the file — a file whose report its arms did not support was
+            // already refused above. Printed before the verdict's own detail so a
+            // reader sees the leads even when the verdict is `no_divergence`,
+            // which is precisely the case they exist for.
+            if !rechecked.shapes.leads.is_empty() {
+                println!();
+                println!("UNMATCHED REQUEST SHAPES (a lead, not a finding)");
+                for lead in &rechecked.shapes.leads {
+                    println!("  {:<12} {}", lead.class.wire_tag(), lead.shape.render());
+                }
+                println!("  A shape the reference never produced is not proof a secret left.");
+            }
+            if !rechecked.shapes.is_total() {
+                println!(
+                    "  {} ledger entries could not be reduced to a shape; the shape \
+                     comparison is not total.",
+                    rechecked.shapes.uncompared
+                );
+            }
+
             match verdict {
                 DiffVerdict::Divergent { witnesses } => {
                     println!();
