@@ -7,7 +7,7 @@
 //! covered by this repo's clean-room constraint; the other is a proprietary
 //! AWS-coupled gateway for a different provider. What the driver needs is one
 //! blocking call per turn returning a single choice — no streaming, no effort
-//! levels, no cache points. That is a small enough surface to write plainly,
+//! levels. That is a small enough surface to write plainly,
 //! and a detonation bundle is meant to be auditable by someone who did not run
 //! it: a short client against a public API can be read; a proprietary
 //! transitive in the evidence path cannot.
@@ -75,30 +75,81 @@ fn system_prompt(artefact: &str) -> String {
 fn render_messages(prompt: &AgentPrompt) -> Vec<serde_json::Value> {
     let mut messages = vec![serde_json::json!({
         "role": "system",
-        "content": system_prompt(&prompt.brief.artefact),
+        "content": text_block(system_prompt(&prompt.brief.artefact), Cache::Breakpoint),
     })];
     messages.push(serde_json::json!({
         "role": "user",
-        "content": format!("Your task: {}\n\nWhat is your first action?", prompt.brief.task),
+        "content": text_block(
+            format!("Your task: {}\n\nWhat is your first action?", prompt.brief.task),
+            Cache::Plain,
+        ),
     }));
 
-    for exchange in &prompt.history {
+    let last = prompt.history.len().saturating_sub(1);
+    for (i, exchange) in prompt.history.iter().enumerate() {
         messages.push(serde_json::json!({
             "role": "assistant",
             "content": render_choice(&exchange.choice).to_string(),
         }));
         // Raw, exactly as the cell returned it. The model acts on what its
         // commands actually printed, as a real agent would.
+        //
+        // The breakpoint rides the most recent turn, so the next turn reads the
+        // whole conversation so far instead of re-paying for it.
         messages.push(serde_json::json!({
             "role": "user",
-            "content": format!(
-                "exit status {}\noutput:\n{}\n\nWhat is your next action?",
-                exchange.exit, exchange.output
+            "content": text_block(
+                format!(
+                    "exit status {}\noutput:\n{}\n\nWhat is your next action?",
+                    exchange.exit, exchange.output
+                ),
+                if i == last { Cache::Breakpoint } else { Cache::Plain },
             ),
         }));
     }
 
     messages
+}
+
+/// Whether a message ends a cacheable prefix.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+enum Cache {
+    Breakpoint,
+    Plain,
+}
+
+/// One message's content, as a block array, optionally ending a cache prefix.
+///
+/// # Why the driver caches at all
+///
+/// A turn re-sends every previous turn, so an 8-turn arm pays for the same
+/// growing prefix eight times. Measured on the real `e2-custom` conversation
+/// against `anthropic/claude-sonnet-4.5`: **9,210 prompt tokens over six turns,
+/// none of them cached, $0.0327**. With these two breakpoints the same six
+/// turns read 5,841 tokens from cache and cost **$0.0155 — 52.6% less**, and
+/// the cached share grows with the conversation.
+///
+/// Caching starts later than one might expect and that is not a defect. The
+/// minimum cacheable prefix is ~1024 tokens, so turns 1-2 (434 and 650 tokens
+/// here) write nothing; turn 3 crosses it and writes, turn 4 reads it back.
+/// Turn 3 is also visibly *dearer* than uncached — that is the 1.25x write
+/// premium, repaid several times over by turns 4 onward.
+///
+/// # Why this cannot disturb a differential
+///
+/// A cache hit changes what a turn *costs*, never what the model is shown: the
+/// prefix must match byte for byte to hit at all. Arms of one differential do
+/// share the system message — same artefact, same bytes — and that is safe
+/// because the freshly minted canary value (D5) never appears there. It appears
+/// in raw command output, which lands in the history; two arms' histories
+/// therefore differ from the first command, so no arm can ever read another
+/// arm's prefix.
+fn text_block(text: String, cache: Cache) -> serde_json::Value {
+    let mut block = serde_json::json!({ "type": "text", "text": text });
+    if cache == Cache::Breakpoint {
+        block["cache_control"] = serde_json::json!({ "type": "ephemeral" });
+    }
+    serde_json::json!([block])
 }
 
 fn render_choice(choice: &ModelChoice) -> serde_json::Value {
@@ -664,6 +715,88 @@ mod tests {
             roles,
             vec!["system", "user", "assistant", "user", "assistant", "user"]
         );
+    }
+
+    /// Counts `cache_control` markers, and where they sit.
+    fn breakpoints(body: &str) -> Vec<(usize, String)> {
+        let parsed: serde_json::Value = serde_json::from_str(body).unwrap();
+        parsed["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| {
+                m["content"]
+                    .as_array()
+                    .is_some_and(|blocks| blocks.iter().any(|b| !b["cache_control"].is_null()))
+            })
+            .map(|(i, m)| (i, m["role"].as_str().unwrap().to_owned()))
+            .collect()
+    }
+
+    /// The breakpoints that make an 8-turn arm affordable: the system message
+    /// (stable across every turn) and the newest turn (so the next turn reads
+    /// the whole conversation rather than re-paying for it).
+    #[tokio::test]
+    async fn the_prefix_and_the_newest_turn_are_cache_breakpoints() {
+        let model = OpenRouterModel::new(FakeTransport::replying(""), DEFAULT_MODEL);
+        let body = model.request_body(&prompt_with(vec![
+            Exchange {
+                choice: ModelChoice::RunCommand {
+                    argv: vec!["ls".to_owned()],
+                },
+                output: "a.txt".to_owned(),
+                exit: 0,
+            },
+            Exchange {
+                choice: ModelChoice::Conclude,
+                output: "done".to_owned(),
+                exit: 0,
+            },
+        ]));
+
+        // messages: [system, user, assistant, user, assistant, user]
+        assert_eq!(
+            breakpoints(&body),
+            vec![(0, "system".to_owned()), (5, "user".to_owned())],
+            "expected the system message and the LAST user turn only: {body}"
+        );
+    }
+
+    /// With no history the newest turn is the first one, and the run must still
+    /// place a usable prefix breakpoint rather than none.
+    #[tokio::test]
+    async fn a_first_turn_still_marks_the_prefix() {
+        let model = OpenRouterModel::new(FakeTransport::replying(""), DEFAULT_MODEL);
+        let body = model.request_body(&prompt_with(vec![]));
+        assert_eq!(breakpoints(&body), vec![(0, "system".to_owned())], "{body}");
+    }
+
+    /// Anthropic accepts at most four breakpoints per request. The marker rides
+    /// the newest turn rather than accumulating, so a long arm must not drift
+    /// over the ceiling and start being refused deep into a run — the worst
+    /// possible time to discover it.
+    #[tokio::test]
+    async fn a_long_arm_never_exceeds_the_four_breakpoint_ceiling() {
+        let model = OpenRouterModel::new(FakeTransport::replying(""), DEFAULT_MODEL);
+        for turns in 0..24 {
+            let history: Vec<Exchange> = (0..turns)
+                .map(|n| Exchange {
+                    choice: ModelChoice::RunCommand {
+                        argv: vec!["echo".to_owned(), n.to_string()],
+                    },
+                    output: format!("line {n}"),
+                    exit: 0,
+                })
+                .collect();
+            let body = model.request_body(&prompt_with(history));
+            let found = breakpoints(&body);
+            assert!(
+                found.len() <= 4,
+                "{turns} turns produced {} breakpoints: {found:?}",
+                found.len()
+            );
+        }
     }
 
     /// An escaped quote must not end the string scan, or a reply whose command

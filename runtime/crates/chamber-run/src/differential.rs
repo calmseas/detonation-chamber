@@ -358,8 +358,31 @@ fn is_uncompared(observation: &Observation) -> bool {
 /// The names are the whole point: `?sig=<blob>` and `?cache_key=<blob>` differ
 /// from a bare `/starter` in a way that survives the payload being unreadable,
 /// which is exactly the case the canary matcher cannot reach.
+///
+/// # Three target forms, because a proxy sees all of them
+///
+/// The first live run caught this, and no unit test could have: a target written
+/// as `/starter?sig=…` in a skill arrives at the observer in **absolute-form**,
+/// `https://templates.example:443/starter?sig=…`, because that is what a client
+/// sends to a proxy. Tunnel setup arrives in **authority-form** — `CONNECT
+/// templates.example:443`, no path at all.
+///
+/// Left unnormalised, the authority ends up inside `path`. That is not merely
+/// ugly: `path` is compared verbatim and case-sensitively, while an authority is
+/// case-*insensitive*, so a candidate that spelled the host differently from the
+/// reference would produce a lead with no behavioural difference behind it.
 fn split_target(target: &str) -> (String, Vec<String>) {
-    let (path, query) = target.split_once('?').unwrap_or((target, ""));
+    let path_part = match target.split_once("://") {
+        // Absolute-form: the path begins at the first `/` after the authority,
+        // and a bare `https://host` has none.
+        Some((_, after_scheme)) => after_scheme.find('/').map_or("", |at| &after_scheme[at..]),
+        // Origin-form, as a client sends direct.
+        None if target.starts_with('/') => target,
+        // Authority-form: CONNECT carries `host:port` and no path.
+        None => "",
+    };
+
+    let (path, query) = path_part.split_once('?').unwrap_or((path_part, ""));
     let mut keys: Vec<String> = query
         .split('&')
         .filter(|pair| !pair.is_empty())
@@ -1259,6 +1282,72 @@ mod shape_tests {
         assert_eq!(keys, vec!["a", "b", "flag"]);
 
         assert_eq!(split_target("/plain"), ("/plain".to_owned(), Vec::new()));
+    }
+
+    /// The regression guard for a bug the first live run found and no unit test
+    /// had: a proxy records absolute-form targets, not the origin-form a skill
+    /// author writes. The literal below is copied from a real arm bundle.
+    ///
+    /// Unnormalised, the authority lands inside `path` — which is compared
+    /// verbatim and case-sensitively while an authority is not, so a host spelled
+    /// differently between arms would raise a lead with nothing behind it.
+    #[test]
+    fn a_proxied_absolute_form_target_normalises_to_its_path() {
+        let (path, keys) =
+            split_target("https://templates.example:443/starter?sig=GxETGxxrbBsbG2Nqb2MYaRwbGWM=");
+        assert_eq!(path, "/starter", "the authority leaked into the path");
+        assert_eq!(keys, vec!["sig"]);
+
+        // CONNECT carries no path at all.
+        assert_eq!(
+            split_target("templates.example:443"),
+            (String::new(), Vec::new())
+        );
+        // An absolute-form URL with no path is still no path.
+        assert_eq!(
+            split_target("https://templates.example"),
+            (String::new(), Vec::new())
+        );
+    }
+
+    /// What a reader actually sees for the two shapes the live run produced. The
+    /// first release rendered the GET as
+    /// `templates.example:443https://templates.example:443/starter`.
+    #[test]
+    fn the_live_run_shapes_render_legibly() {
+        let tunnel = shape_of(&observation(
+            Channel::NetworkEgress,
+            ObservationKind::HttpExchange {
+                method: "CONNECT".to_owned(),
+                authority: "templates.example:443".to_owned(),
+                sni: None,
+                target: "templates.example:443".to_owned(),
+                headers: vec![("host".to_owned(), "x".to_owned())],
+                body: CapturedBody::Whole { bytes: Vec::new() },
+            },
+            vec![],
+        ))
+        .unwrap();
+        assert_eq!(tunnel.render(), "CONNECT templates.example:443 [host]");
+
+        let fetch = shape_of(&observation(
+            Channel::NetworkEgress,
+            ObservationKind::HttpExchange {
+                method: "GET".to_owned(),
+                authority: "templates.example:443".to_owned(),
+                sni: None,
+                target: "https://templates.example:443/starter?sig=GxETGxxrbBsbG2Nqb2MYaRwbGWM="
+                    .to_owned(),
+                headers: vec![("accept".to_owned(), "*/*".to_owned())],
+                body: CapturedBody::Whole { bytes: Vec::new() },
+            },
+            vec![],
+        ))
+        .unwrap();
+        assert_eq!(
+            fetch.render(),
+            "GET templates.example:443/starter ?{sig} [accept]"
+        );
     }
 
     /// A DNS name the candidate resolved and the reference never did is a lead,
