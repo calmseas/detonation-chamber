@@ -1,0 +1,36 @@
+[package]
+name = "chamber-model"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The reference live model provider: an OpenRouter chat-completions client behind chamber-run's Model seam."
+
+# WHY THIS IS ITS OWN CRATE.
+#
+# `chamber-run` is the host orchestrator, and `chamber-run/tests/no_proxy_stack.rs`
+# forbids hyper, rustls and friends from its dependency closure — not for build
+# hygiene, but because a TLS terminator inside the orchestrator is an egress path
+# in the one process that sits OUTSIDE the chamber. An HTTP client is exactly
+# that stack, so the provider cannot live there.
+#
+# The dependency runs one way: chamber-model -> chamber-run. chamber-run stays
+# clean, and `tests/closure.rs` here asserts BOTH halves of that arrangement so
+# the split cannot quietly collapse.
+[dependencies]
+chamber-run = { path = "../chamber-run" }
+chamber-evidence = { path = "../chamber-evidence" }
+# TYPES ONLY, same as chamber-run: the canary matcher, not the observer.
+chamber-capture = { path = "../chamber-capture", default-features = false }
+
+async-trait = "0.1.92"
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+tokio = { version = "1", features = ["rt", "macros", "time"] }
+
+# rustls, not the platform TLS: one certificate story on every host the chamber
+# runs on, and no OpenSSL to find at build time.
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "http2", "charset"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

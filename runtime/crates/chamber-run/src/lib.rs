@@ -45,6 +45,10 @@ pub mod winddown;
 
 pub use bridge::{CarriedTurn, ToolBridge, TurnTarget};
 pub use bundle::{BoundaryState, Emitted, Observed, emit};
+pub use liveturns::{
+    AgentBrief, AgentPrompt, Budget, BudgetRefusal, Exchange, InferenceRecord, LiveTurns, Model,
+    ModelChoice, ModelError, ModelReply, record_inference_calls,
+};
 pub use run::{
     ArmingRefusal, DetonationPlan, ImageTags, PlantedCanary, RunEpilogue, run_detonation,
 };
