@@ -245,12 +245,20 @@ struct ChatResponse {
 #[derive(Debug, Deserialize)]
 struct Choice {
     message: ChoiceMessage,
+    /// `content_filter` when the provider's classifiers declined. Arrives as a
+    /// normal 200 with empty content, so without this a refusal is
+    /// indistinguishable from a malformed answer.
+    #[serde(default)]
+    finish_reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct ChoiceMessage {
     #[serde(default)]
     content: Option<String>,
+    /// Some providers explain the refusal here instead of in `content`.
+    #[serde(default)]
+    refusal: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -303,11 +311,30 @@ impl<T: Transport> Model for OpenRouterModel<T> {
             return Err(ModelError::Transport(error.message));
         }
 
-        let response_text = parsed
+        let choice = parsed
             .choices
             .first()
-            .and_then(|c| c.message.content.clone())
-            .ok_or_else(|| ModelError::Unusable("the response carried no message".to_owned()))?;
+            .ok_or_else(|| ModelError::Unusable("the response carried no choices".to_owned()))?;
+
+        // A declined request is a 200 with empty content, so it has to be
+        // recognised before the content is read or it reads as a malformed
+        // answer — and the operator goes looking for a parsing bug that is not
+        // there.
+        if choice.finish_reason.as_deref() == Some("content_filter")
+            || choice.message.refusal.is_some()
+        {
+            return Err(ModelError::Declined(
+                choice
+                    .message
+                    .refusal
+                    .clone()
+                    .unwrap_or_else(|| "the provider's classifiers refused the request".to_owned()),
+            ));
+        }
+
+        let response_text = choice.message.content.clone().ok_or_else(|| {
+            ModelError::Unusable("the response carried no message content".to_owned())
+        })?;
 
         Ok(ModelReply {
             choice: parse_choice(&response_text)?,
@@ -382,6 +409,45 @@ impl Transport for HttpsTransport {
             )));
         }
         Ok(text)
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests_support {
+    use super::*;
+    use chamber_run::AgentBrief;
+    use std::sync::Mutex;
+
+    pub struct FakeTransport {
+        reply: String,
+        pub sent: Mutex<Vec<String>>,
+    }
+
+    impl FakeTransport {
+        pub fn replying(reply: &str) -> Self {
+            Self {
+                reply: reply.to_owned(),
+                sent: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Transport for FakeTransport {
+        async fn post_json(&self, body: String) -> Result<String, ModelError> {
+            self.sent.lock().unwrap().push(body);
+            Ok(self.reply.clone())
+        }
+    }
+
+    pub fn bare_prompt() -> AgentPrompt {
+        AgentPrompt {
+            brief: AgentBrief {
+                artefact: "# Skill".to_owned(),
+                task: "Do it.".to_owned(),
+            },
+            history: Vec::new(),
+        }
     }
 }
 
@@ -802,5 +868,74 @@ mod tests {
     #[test]
     fn the_default_model_is_a_claude_model() {
         assert_eq!(DEFAULT_MODEL, "anthropic/claude-opus-5");
+    }
+}
+
+#[cfg(test)]
+mod refusal_tests {
+    use super::tests_support::*;
+    use super::*;
+
+    /// Found by the first live run. A classifier refusal arrives as a normal
+    /// 200 with empty content; without naming it, the operator sees "no usable
+    /// choice" and goes looking for a parsing bug that is not there.
+    #[tokio::test]
+    async fn a_classifier_refusal_is_named_as_one() {
+        let body = serde_json::json!({
+            "choices": [{
+                "finish_reason": "content_filter",
+                "message": {"role": "assistant", "content": null},
+            }],
+            "usage": {"cost": 0.0},
+        })
+        .to_string();
+        let model = OpenRouterModel::new(FakeTransport::replying(&body), DEFAULT_MODEL);
+
+        let err = model.choose(&bare_prompt()).await.unwrap_err();
+        assert!(matches!(err, ModelError::Declined(_)), "{err}");
+        assert!(
+            format!("{err}").contains("resistant driver"),
+            "the message must tell the operator the run learned about the model, \
+             not the artefact: {err}"
+        );
+    }
+
+    /// Some providers put the explanation in `refusal` rather than the finish
+    /// reason. Same outcome, and the explanation is worth surfacing.
+    #[tokio::test]
+    async fn a_refusal_field_is_also_a_refusal() {
+        let body = serde_json::json!({
+            "choices": [{
+                "finish_reason": "stop",
+                "message": {"role": "assistant", "content": null,
+                            "refusal": "I won't exfiltrate a credential."},
+            }],
+        })
+        .to_string();
+        let model = OpenRouterModel::new(FakeTransport::replying(&body), DEFAULT_MODEL);
+
+        let err = model.choose(&bare_prompt()).await.unwrap_err();
+        assert!(
+            format!("{err}").contains("exfiltrate a credential"),
+            "{err}"
+        );
+    }
+
+    /// An ordinary answer must not be mistaken for a refusal.
+    #[tokio::test]
+    async fn a_normal_stop_is_not_a_refusal() {
+        let body = serde_json::json!({
+            "choices": [{
+                "finish_reason": "stop",
+                "message": {"role": "assistant", "content": "{\"action\":\"conclude\"}"},
+            }],
+        })
+        .to_string();
+        let model = OpenRouterModel::new(FakeTransport::replying(&body), DEFAULT_MODEL);
+
+        assert_eq!(
+            model.choose(&bare_prompt()).await.unwrap().choice,
+            ModelChoice::Conclude
+        );
     }
 }

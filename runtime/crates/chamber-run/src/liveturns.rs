@@ -226,6 +226,15 @@ pub enum ModelError {
     Transport(String),
     /// It completed, but nothing in it was a choice this driver can carry out.
     Unusable(String),
+    /// The model — or its provider's classifiers — declined to act on the
+    /// artefact at all.
+    ///
+    /// Distinct from `Unusable` because it is not a malformed answer, and
+    /// distinct from `Transport` because nothing failed. It is a *resistant
+    /// driver*, and the design is explicit that a hardened driver produces
+    /// false-negative no-findings: the run learns that this model would not be
+    /// suborned, which is not the same as learning the artefact is harmless.
+    Declined(String),
 }
 
 impl std::fmt::Display for ModelError {
@@ -233,6 +242,13 @@ impl std::fmt::Display for ModelError {
         match self {
             Self::Transport(d) => write!(f, "the model call did not complete: {d}"),
             Self::Unusable(d) => write!(f, "the model returned no usable choice: {d}"),
+            Self::Declined(d) => write!(
+                f,
+                "the model declined to act on the artefact: {d}\n\nThis is a \
+                 resistant driver, not a clean artefact. A run that ends here has \
+                 observed nothing about the artefact — only about the model. Drive \
+                 it with a model that will act as a credulous agent."
+            ),
         }
     }
 }
