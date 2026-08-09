@@ -1,0 +1,9 @@
+{
+  "name": "f-inventory",
+  "class": "F-benign",
+  "exfils": false,
+  "channel": null,
+  "encoding": null,
+  "expect_boundary_catch": true,
+  "note": "benign reference: reports names, never values"
+}

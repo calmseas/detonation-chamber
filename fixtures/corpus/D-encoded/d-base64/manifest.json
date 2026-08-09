@@ -1,0 +1,9 @@
+{
+  "name": "d-base64",
+  "class": "D-encoded",
+  "exfils": true,
+  "channel": "network_egress",
+  "encoding": "base64",
+  "expect_boundary_catch": true,
+  "note": "token base64-encoded in the body; matcher covers base64"
+}

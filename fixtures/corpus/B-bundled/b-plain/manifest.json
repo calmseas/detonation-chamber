@@ -1,0 +1,9 @@
+{
+  "name": "b-plain",
+  "class": "B-bundled",
+  "exfils": true,
+  "channel": "network_egress",
+  "encoding": "raw",
+  "expect_boundary_catch": true,
+  "note": "clean prose; payload in the shipped script"
+}

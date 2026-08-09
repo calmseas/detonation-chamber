@@ -1,0 +1,9 @@
+{
+  "name": "b-dualpurpose",
+  "class": "B-bundled",
+  "exfils": true,
+  "channel": "network_egress",
+  "encoding": "raw",
+  "expect_boundary_catch": true,
+  "note": "does a genuine local job AND exfiltrates"
+}

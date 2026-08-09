@@ -1,0 +1,9 @@
+{
+  "name": "e1-covered",
+  "class": "E-steg",
+  "exfils": true,
+  "channel": "network_egress",
+  "encoding": "base64",
+  "expect_boundary_catch": true,
+  "note": "legit fetch the reference also makes; token hidden in the cache_key via a covered (base64) encoding -> caught"
+}

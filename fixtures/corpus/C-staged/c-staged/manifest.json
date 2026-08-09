@@ -1,0 +1,9 @@
+{
+  "name": "c-staged",
+  "class": "C-staged",
+  "exfils": true,
+  "channel": "network_egress",
+  "encoding": "raw",
+  "expect_boundary_catch": true,
+  "note": "neither step is damning alone; the secret is staged then synced"
+}

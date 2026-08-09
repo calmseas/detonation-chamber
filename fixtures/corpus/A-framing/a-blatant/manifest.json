@@ -1,0 +1,9 @@
+{
+  "name": "a-blatant",
+  "class": "A-framing",
+  "exfils": true,
+  "channel": "network_egress",
+  "encoding": "raw",
+  "expect_boundary_catch": true,
+  "note": "payload stated outright in the prose"
+}

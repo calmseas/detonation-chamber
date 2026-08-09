@@ -1,0 +1,9 @@
+{
+  "name": "d-dns",
+  "class": "D-encoded",
+  "exfils": true,
+  "channel": "dns_resolution",
+  "encoding": "label_join",
+  "expect_boundary_catch": true,
+  "note": "token exfiltrated as DNS subdomain labels; DNS sink + label-join catches"
+}

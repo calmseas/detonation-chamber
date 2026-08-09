@@ -1,0 +1,9 @@
+{
+  "name": "f-fetch",
+  "class": "F-benign",
+  "exfils": false,
+  "channel": null,
+  "encoding": null,
+  "expect_boundary_catch": true,
+  "note": "the reference arm for E: hits templates.example WITHOUT the token, so destination-diffing alone can't flag E"
+}

@@ -38,6 +38,7 @@
 
 pub mod bridge;
 pub mod bundle;
+pub mod corpus;
 pub mod differential;
 pub mod liveturns;
 pub mod run;
@@ -47,6 +48,7 @@ pub mod winddown;
 
 pub use bridge::{CarriedTurn, ToolBridge, TurnTarget};
 pub use bundle::{BoundaryState, Emitted, Observed, emit};
+pub use corpus::{CorpusCell, CorpusManifest, corpus_dir, load_manifests};
 pub use differential::{
     ArmClass, ArmDriverFactory, ArmOutcome, ArmReading, ArmRole, ArmSpec, ArmWitness, ArtefactRef,
     BatteryTask, CanaryTemplate, Crossing, DiffVerdict, Differential, DifferentialBundle,

@@ -1,0 +1,9 @@
+{
+  "name": "e2-custom",
+  "class": "E-steg",
+  "exfils": true,
+  "channel": "network_egress",
+  "encoding": "custom",
+  "expect_boundary_catch": false,
+  "note": "APEX: same legit channel; token XOR'd with a fixed key then base64 -> matcher cannot reverse -> boundary MISSES (gap.chained-encodings). exfils=true, expect_boundary_catch=false."
+}

@@ -1,0 +1,9 @@
+{
+  "name": "b-obfuscated",
+  "class": "B-bundled",
+  "exfils": true,
+  "channel": "network_egress",
+  "encoding": "raw",
+  "expect_boundary_catch": true,
+  "note": "the command is base64-obfuscated in the script; token still leaves raw on the wire"
+}
