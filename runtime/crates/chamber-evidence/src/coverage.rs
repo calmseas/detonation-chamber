@@ -9,7 +9,12 @@
 use serde::{Deserialize, Serialize};
 
 /// A boundary the chamber can observe.
-#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
+///
+/// Ordered by declaration, which matches [`Channel::ALL`]. The ordering is not
+/// a priority ranking — it exists so a set of channels has one canonical
+/// sequence, which a signed artefact needs: two runs that saw the same
+/// crossings must produce the same bytes.
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Channel {
     /// Requests that reached the intercepting proxy.

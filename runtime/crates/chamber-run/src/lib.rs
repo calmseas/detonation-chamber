@@ -38,6 +38,7 @@
 
 pub mod bridge;
 pub mod bundle;
+pub mod differential;
 pub mod liveturns;
 pub mod run;
 pub mod turns;
@@ -45,6 +46,12 @@ pub mod winddown;
 
 pub use bridge::{CarriedTurn, ToolBridge, TurnTarget};
 pub use bundle::{BoundaryState, Emitted, Observed, emit};
+pub use differential::{
+    ArmClass, ArmDriverFactory, ArmOutcome, ArmReading, ArmRole, ArmSpec, ArmWitness, ArtefactRef,
+    BatteryTask, CanaryTemplate, Crossing, DiffVerdict, Differential, DifferentialBundle,
+    DifferentialPlan, DifferentialRefusal, RecheckRefusal, diff_arms, recheck_differential,
+    run_differential,
+};
 pub use liveturns::{
     AgentBrief, AgentPrompt, Budget, BudgetRefusal, Exchange, InferenceRecord, LiveTurns, Model,
     ModelChoice, ModelError, ModelReply, record_inference_calls,
