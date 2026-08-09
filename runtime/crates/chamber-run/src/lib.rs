@@ -62,6 +62,7 @@ pub use liveturns::{
 pub use run::{
     ArmingRefusal, DetonationPlan, ImageTags, PlantedCanary, RunEpilogue, run_detonation,
 };
+pub use staging::{CellFiles, StagingError, skill_dir_beside, stage_skill_dir};
 pub use turns::{
     CellOutput, ScriptedTurns, Transcript, TurnDirective, TurnError, TurnProvenance, TurnRecord,
     TurnSource,

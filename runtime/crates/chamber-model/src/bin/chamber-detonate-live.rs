@@ -37,22 +37,15 @@ fn env_or(key: &str, fallback: &str) -> String {
 
 /// The skill directory to stage, if the artefact ships more than its markdown.
 ///
-/// A skill handed in as a lone `SKILL.md` stages nothing — behaviour is
-/// unchanged. A skill that is a real directory (a `scripts/` beside the
-/// markdown, say) stages the whole directory, so the bundled files are present
-/// in the cell to run. Explicit override via `CHAMBER_SKILL_DIR`.
+/// The rule itself is [`chamber_run::skill_dir_beside`], shared with
+/// `chamber-differential` and unit-tested there. What belongs here is only the
+/// operator's override: `CHAMBER_SKILL_DIR` wins outright, for the case where
+/// the skill's real root is not the directory the markdown happens to sit in.
 fn skill_dir_of(artefact_path: &str) -> Option<PathBuf> {
     if let Ok(dir) = std::env::var("CHAMBER_SKILL_DIR") {
         return Some(PathBuf::from(dir));
     }
-    let path = std::path::Path::new(artefact_path);
-    let parent = path.parent()?;
-    let own_name = path.file_name()?;
-    let more_than_markdown = std::fs::read_dir(parent)
-        .ok()?
-        .flatten()
-        .any(|e| e.file_name() != own_name);
-    more_than_markdown.then(|| parent.to_path_buf())
+    chamber_run::skill_dir_beside(std::path::Path::new(artefact_path))
 }
 
 fn usage() -> ExitCode {

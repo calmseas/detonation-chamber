@@ -77,6 +77,22 @@ impl ArmDriverFactory for LiveArmFactory {
     }
 }
 
+/// One arm's skill directory: the operator's override, else the rule shared with
+/// `chamber-detonate-live`.
+///
+/// Both arms need this and for different reasons. An unstaged **candidate**
+/// cannot run its bundled payload, so it diverges from nothing and the run
+/// reports no divergence — a false clean. An unstaged **reference** cannot run
+/// its own declared function, so it under-subtracts and the candidate's ordinary
+/// behaviour reads as a divergence — a false positive. The two overrides are
+/// separate because the two artefacts are.
+fn arm_skill_dir(override_var: &str, artefact_path: &str) -> Option<PathBuf> {
+    if let Ok(dir) = std::env::var(override_var) {
+        return Some(PathBuf::from(dir));
+    }
+    chamber_run::skill_dir_beside(std::path::Path::new(artefact_path))
+}
+
 fn battery() -> Vec<BatteryTask> {
     vec![
         BatteryTask {
@@ -111,6 +127,11 @@ async fn main() -> ExitCode {
             eprintln!("  CHAMBER_MAX_TURNS       per arm (default 6)");
             eprintln!("  CHAMBER_MAX_SPEND       micros per arm (default 500000)");
             eprintln!("  CHAMBER_TASK_LEGITIMATE / CHAMBER_TASK_TEMPTING");
+            eprintln!("  CHAMBER_CANDIDATE_SKILL_DIR / CHAMBER_REFERENCE_SKILL_DIR  override the");
+            eprintln!("                          directory staged into each arm (default: the");
+            eprintln!(
+                "                          artefact's own, when it ships more than markdown)"
+            );
             return ExitCode::from(BAD_INVOCATION);
         }
     };
@@ -170,6 +191,10 @@ async fn main() -> ExitCode {
         evidence_root: PathBuf::from(&evidence_root),
         candidate,
         reference,
+        // Staged per arm, so a skill whose payload is a bundled script actually
+        // has the script in the cell to run.
+        candidate_skill_dir: arm_skill_dir("CHAMBER_CANDIDATE_SKILL_DIR", &candidate_path),
+        reference_skill_dir: arm_skill_dir("CHAMBER_REFERENCE_SKILL_DIR", &reference_path),
         battery: battery(),
         // Label and var only. Each arm mints its own value.
         canaries: vec![CanaryTemplate {

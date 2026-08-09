@@ -165,6 +165,37 @@ pub fn stage_skill_dir(
     Ok(staged)
 }
 
+/// The skill directory an artefact lives in, if it ships more than its markdown.
+///
+/// A skill handed in as a lone `SKILL.md` stages nothing, so behaviour is
+/// unchanged for the prose-only case. A skill that is a real directory — a
+/// `scripts/` beside the markdown — stages the whole directory, so the bundled
+/// files are present in the cell to run.
+///
+/// Pure on purpose. The env override every binary layers on top of this is a
+/// binary's concern; the *rule* is shared, and lived untested inside one binary
+/// until two callers needed it.
+///
+/// Two edges worth knowing, both deliberate:
+///
+/// - A bare filename with no parent (`SKILL.md`) reads as no directory rather
+///   than as the process's working directory, which is almost never the skill.
+/// - A corpus fixture's `manifest.json` counts toward "more than markdown" even
+///   though [`stage_skill_dir`] never stages it. So a prose-only fixture beside
+///   its manifest does stage — placing just the `SKILL.md` in `/work`. That is
+///   harmless and slightly wider than the name suggests, and it is preserved
+///   rather than tightened because the corpus was measured under it.
+#[must_use]
+pub fn skill_dir_beside(artefact_path: &Path) -> Option<PathBuf> {
+    let parent = artefact_path.parent()?;
+    let own_name = artefact_path.file_name()?;
+    let more_than_markdown = std::fs::read_dir(parent)
+        .ok()?
+        .flatten()
+        .any(|e| e.file_name() != own_name);
+    more_than_markdown.then(|| parent.to_path_buf())
+}
+
 /// Relative paths of every file under `dir`, recursively.
 fn collect(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), StagingError> {
     let entries = std::fs::read_dir(dir).map_err(|e| StagingError::Unreadable {
@@ -403,6 +434,52 @@ mod tests {
             detail: "refused".into(),
         };
         assert!(format!("{cell}").contains("/work/x") && format!("{cell}").contains("refused"));
+    }
+
+    /// The case the heuristic exists for: a skill that ships a script resolves
+    /// to its own directory, so the script is in the cell to run.
+    #[test]
+    fn an_artefact_shipping_a_script_resolves_to_its_directory() {
+        let dir = tmp("beside-script");
+        write(&dir, "SKILL.md", "run scripts/sign.sh");
+        write(&dir, "scripts/sign.sh", "#!/bin/sh\ntrue");
+
+        assert_eq!(skill_dir_beside(&dir.join("SKILL.md")), Some(dir.clone()));
+    }
+
+    /// A lone markdown stages nothing — Slice-0 behaviour, unchanged.
+    #[test]
+    fn a_lone_markdown_resolves_to_no_directory() {
+        let dir = tmp("beside-lone");
+        write(&dir, "SKILL.md", "# just prose");
+
+        assert_eq!(skill_dir_beside(&dir.join("SKILL.md")), None);
+    }
+
+    /// Documents the wider-than-it-sounds edge rather than leaving a reader to
+    /// discover it: the manifest is what makes a prose-only corpus fixture stage,
+    /// even though the manifest itself never enters the cell.
+    #[test]
+    fn a_manifest_beside_the_markdown_counts_as_more_than_markdown() {
+        let dir = tmp("beside-manifest");
+        write(&dir, "SKILL.md", "# just prose");
+        write(&dir, "manifest.json", r#"{"exfils": false}"#);
+
+        assert_eq!(skill_dir_beside(&dir.join("SKILL.md")), Some(dir.clone()));
+
+        // ...and staging it still withholds the answer key.
+        let cell = FakeCell::default();
+        stage_skill_dir(&cell, &dir).unwrap();
+        let files = cell.files.borrow();
+        assert!(files.iter().all(|(p, _, _)| !p.ends_with("manifest.json")));
+        assert!(files.iter().any(|(p, _, _)| p.ends_with("SKILL.md")));
+    }
+
+    /// A bare filename must not resolve to the working directory, which is
+    /// almost never the skill.
+    #[test]
+    fn a_bare_filename_resolves_to_no_directory() {
+        assert_eq!(skill_dir_beside(Path::new("SKILL.md")), None);
     }
 
     #[test]

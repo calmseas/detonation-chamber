@@ -39,6 +39,18 @@ pub enum ArmRole {
     Reference,
 }
 
+impl ArmRole {
+    /// Also the evidence-directory prefix, which makes it a path contract and
+    /// not merely a display string.
+    #[must_use]
+    pub fn wire_tag(self) -> &'static str {
+        match self {
+            ArmRole::Candidate => "candidate",
+            ArmRole::Reference => "reference",
+        }
+    }
+}
+
 /// The task an arm runs.
 ///
 /// Both roles run the same classes, so a candidate arm is diffed against the
@@ -631,6 +643,22 @@ pub struct DifferentialPlan {
     pub evidence_root: PathBuf,
     pub candidate: ArtefactRef,
     pub reference: ArtefactRef,
+    /// The candidate's own directory, staged into its arms' `/work`.
+    ///
+    /// Without this a candidate whose payload is a bundled script runs with the
+    /// script absent: `sh scripts/sign.sh` fails on the harness, the artefact
+    /// cannot act, and the diff reports `NoDivergence`. That is a false clean
+    /// manufactured by under-staging rather than earned by the artefact
+    /// behaving — the one outcome this whole design exists to avoid.
+    pub candidate_skill_dir: Option<PathBuf>,
+    /// The reference's own directory, staged into its arms' `/work`.
+    ///
+    /// Separate from the candidate's and equally necessary, for the mirror-image
+    /// reason. A reference that cannot run its own declared function under-acts,
+    /// and the candidate then appears to do something the reference did not —
+    /// **manufacturing** a divergence out of a staging asymmetry. The baseline
+    /// only subtracts what it was actually able to do.
+    pub reference_skill_dir: Option<PathBuf>,
     pub battery: Vec<BatteryTask>,
     pub canaries: Vec<CanaryTemplate>,
     pub max_turns: u32,
@@ -722,6 +750,37 @@ fn arm_order(plan: &DifferentialPlan) -> Vec<(ArmRole, &BatteryTask)> {
     arms
 }
 
+/// One arm's detonation plan: its own chamber, evidence directory, freshly
+/// minted canaries, and **its own artefact's files**.
+///
+/// Split out of [`run_differential`] so the routing that decides which directory
+/// each role stages can be checked without raising a chamber. Getting that
+/// routing wrong fails silently in the worst possible direction: an arm that
+/// could not act still produces a well-formed bundle and a plausible verdict, so
+/// there is nothing in the output to suggest the answer came from a crippled arm
+/// rather than a well-behaved artefact.
+fn arm_detonation_plan(
+    plan: &DifferentialPlan,
+    role: ArmRole,
+    class: ArmClass,
+    canaries: Vec<PlantedCanary>,
+) -> crate::run::DetonationPlan {
+    crate::run::DetonationPlan {
+        images: plan.images.clone(),
+        ruleset: plan.ruleset.clone(),
+        evidence_dir: plan
+            .evidence_root
+            .join(format!("{}-{}", role.wire_tag(), class.wire_tag())),
+        canaries,
+        max_turns: plan.max_turns,
+        // Each role stages its own artefact's directory, never the other's.
+        skill_dir: match role {
+            ArmRole::Candidate => plan.candidate_skill_dir.clone(),
+            ArmRole::Reference => plan.reference_skill_dir.clone(),
+        },
+    }
+}
+
 fn check_battery(plan: &DifferentialPlan) -> Result<(), DifferentialRefusal> {
     if plan.battery.is_empty() {
         return Err(DifferentialRefusal::Battery(
@@ -768,6 +827,8 @@ mod plan_tests {
                 path: "b.md".into(),
                 digest: "bb".into(),
             },
+            candidate_skill_dir: None,
+            reference_skill_dir: None,
             battery,
             canaries,
             max_turns: 4,
@@ -850,6 +911,105 @@ mod plan_tests {
                 (ArmRole::Candidate, ArmClass::Tempting),
             ]
         );
+    }
+
+    fn planted() -> Vec<PlantedCanary> {
+        vec![PlantedCanary {
+            label: "aws-key".into(),
+            value: "AKIADEADBEEF0000".into(),
+            var: "CHAMBER_TOKEN".into(),
+        }]
+    }
+
+    /// The regression guard for a false clean the harness would manufacture.
+    ///
+    /// A candidate whose payload is a bundled script — `E-steg/e2-custom` runs
+    /// `sh scripts/sign.sh` — cannot act at all if the script is not in the cell.
+    /// It then diverges from nothing and the differential reports
+    /// `NoDivergence`: a clean answer produced by under-staging rather than by
+    /// the artefact behaving. Until this routing existed, `run_differential`
+    /// passed `skill_dir: None` unconditionally and every bundled-script fixture
+    /// in the corpus read that way.
+    #[test]
+    fn a_bundled_script_candidate_is_never_run_scriptless() {
+        let mut plan = plan_with(vec![task(ArmClass::Tempting)], vec![canary()]);
+        plan.candidate_skill_dir = Some(PathBuf::from("/fixtures/E-steg/e2-custom"));
+
+        let arm = arm_detonation_plan(&plan, ArmRole::Candidate, ArmClass::Tempting, planted());
+        assert_eq!(
+            arm.skill_dir,
+            Some(PathBuf::from("/fixtures/E-steg/e2-custom")),
+            "the candidate arm would have run with no scripts in the cell"
+        );
+    }
+
+    /// The mirror-image failure, and why the reference needs its own directory
+    /// rather than sharing the candidate's or going without.
+    ///
+    /// A reference that cannot run its own declared function under-acts, so the
+    /// candidate appears to do something the reference did not — a divergence
+    /// manufactured out of a staging asymmetry. Each role stages its own.
+    #[test]
+    fn each_role_stages_its_own_directory_and_never_the_others() {
+        let mut plan = plan_with(vec![task(ArmClass::Tempting)], vec![canary()]);
+        plan.candidate_skill_dir = Some(PathBuf::from("/fixtures/E-steg/e2-custom"));
+        plan.reference_skill_dir = Some(PathBuf::from("/fixtures/F-benign/f-fetch"));
+
+        let candidate =
+            arm_detonation_plan(&plan, ArmRole::Candidate, ArmClass::Tempting, planted());
+        let reference =
+            arm_detonation_plan(&plan, ArmRole::Reference, ArmClass::Tempting, planted());
+
+        assert_eq!(
+            candidate.skill_dir,
+            Some(PathBuf::from("/fixtures/E-steg/e2-custom"))
+        );
+        assert_eq!(
+            reference.skill_dir,
+            Some(PathBuf::from("/fixtures/F-benign/f-fetch"))
+        );
+        assert_ne!(
+            candidate.skill_dir, reference.skill_dir,
+            "one arm was handed the other's artefact"
+        );
+    }
+
+    /// A prose-only differential stages nothing, exactly as before this routing
+    /// existed. The fix must not change the case that was already correct.
+    #[test]
+    fn a_plan_with_no_skill_dirs_stages_nothing() {
+        let plan = plan_with(vec![task(ArmClass::Tempting)], vec![canary()]);
+        for role in [ArmRole::Candidate, ArmRole::Reference] {
+            assert_eq!(
+                arm_detonation_plan(&plan, role, ArmClass::Tempting, planted()).skill_dir,
+                None
+            );
+        }
+    }
+
+    /// Each arm gets its own evidence directory, keyed by both role and class —
+    /// four arms of a two-class battery must not write over each other.
+    #[test]
+    fn every_arm_gets_its_own_evidence_directory() {
+        let plan = plan_with(
+            vec![task(ArmClass::Legitimate), task(ArmClass::Tempting)],
+            vec![canary()],
+        );
+
+        let mut dirs: BTreeSet<PathBuf> = BTreeSet::new();
+        for role in [ArmRole::Candidate, ArmRole::Reference] {
+            for class in [ArmClass::Legitimate, ArmClass::Tempting] {
+                dirs.insert(arm_detonation_plan(&plan, role, class, planted()).evidence_dir);
+            }
+        }
+
+        assert_eq!(
+            dirs.len(),
+            4,
+            "two arms shared an evidence directory: {dirs:?}"
+        );
+        assert!(dirs.contains(&PathBuf::from("/tmp/ev/candidate-tempting")));
+        assert!(dirs.contains(&PathBuf::from("/tmp/ev/reference-legitimate")));
     }
 
     /// D5, as a property of the minting rather than of caller discipline. Two
@@ -1062,23 +1222,7 @@ pub async fn run_differential(
             canaries: &canaries,
         });
 
-        let evidence_dir = plan.evidence_root.join(format!(
-            "{}-{}",
-            match role {
-                ArmRole::Candidate => "candidate",
-                ArmRole::Reference => "reference",
-            },
-            task.class.wire_tag()
-        ));
-
-        let arm_plan = crate::run::DetonationPlan {
-            images: plan.images.clone(),
-            ruleset: plan.ruleset.clone(),
-            evidence_dir,
-            canaries,
-            max_turns: plan.max_turns,
-            skill_dir: None,
-        };
+        let arm_plan = arm_detonation_plan(plan, role, task.class, canaries);
 
         let epilogue = crate::run::run_detonation(&arm_plan, driver.as_mut())
             .await
