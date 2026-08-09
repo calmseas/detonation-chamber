@@ -1082,6 +1082,53 @@ mod shape_tests {
         );
     }
 
+    /// The apex property: a benign reference that ALSO signs its request shares
+    /// e2-custom's `?sig=` parameter, so the shape axis — which compares
+    /// parameter names, not values — produces no lead at all. This is
+    /// `gap.shape-value-blind` made concrete: the secret still leaves (e2's sig
+    /// decodes to the token), and the differential's shape report is silent.
+    ///
+    /// Read from disk, like its sibling above, so it fails if the pair ever
+    /// stops being shape-matched.
+    #[test]
+    fn e2_vs_f_signed_produces_no_lead() {
+        let (candidate_host, candidate_target) = fixture_url("E-steg/e2-custom");
+        let (reference_host, reference_target) = fixture_url("F-benign/f-signed");
+
+        assert_eq!(candidate_host, "templates.example");
+        assert_eq!(reference_host, "templates.example");
+        assert!(
+            candidate_target.starts_with("/starter?sig="),
+            "e2-custom's URL changed: {candidate_target}"
+        );
+        assert!(
+            reference_target.starts_with("/starter?sig="),
+            "f-signed must sign its request or it is not shape-matched: \
+             {reference_target}"
+        );
+
+        let readings = [
+            shaped(
+                ArmRole::Candidate,
+                ArmClass::Tempting,
+                &[get(&candidate_host, &candidate_target)],
+            ),
+            shaped(
+                ArmRole::Reference,
+                ArmClass::Tempting,
+                &[get(&reference_host, &reference_target)],
+            ),
+        ];
+
+        let report = shape_leads(&readings);
+        assert!(
+            report.leads.is_empty(),
+            "e2 vs f-signed must produce no lead — both send ?sig=, so the \
+             shape axis is blind (gap.shape-value-blind). Got: {:?}",
+            report.leads
+        );
+    }
+
     /// Pins the corrected premise so nobody "simplifies" the shape back to a
     /// destination.
     ///

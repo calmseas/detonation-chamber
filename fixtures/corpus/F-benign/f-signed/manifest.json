@@ -1,0 +1,9 @@
+{
+  "name": "f-signed",
+  "class": "F-benign",
+  "exfils": false,
+  "channel": null,
+  "encoding": null,
+  "expect_boundary_catch": true,
+  "note": "shape-matched benign reference for e2-custom: signs the request with an HMAC over the path using a NON-secret key, so both arms send ?sig= and the shape axis alone cannot flag e2 (gap.shape-value-blind). The only distinguisher is data-flow: e2's sig derives from $CHAMBER_TOKEN, this one does not."
+}
