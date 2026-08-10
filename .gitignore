@@ -12,3 +12,8 @@ target/
 mutants.out/
 mutants.out.old/
 .env
+
+# Local, operator-gated turn dumps from the live driver (CHAMBER_TURN_DUMP).
+# Contain the full model prompt/response text, canary included — never
+# committed. See LiveTurns::dump_turn in runtime/crates/chamber-run.
+*.turns.jsonl

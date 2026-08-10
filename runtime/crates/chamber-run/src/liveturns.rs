@@ -334,6 +334,15 @@ pub struct LiveTurns {
     /// before the chamber was even up.
     started: Option<Instant>,
     last_prompt: Option<AgentPrompt>,
+    /// Where to append the local, operator-gated turn dump — `None` unless
+    /// [`LiveTurns::with_turn_dump`] set it.
+    ///
+    /// This is a debugging side-channel, not evidence: the file it names
+    /// carries the full prompt and response text, canary included, which is
+    /// exactly what the sealed bundle deliberately omits. See `dump_turn` for
+    /// the write itself and its best-effort contract. Name it with a
+    /// `*.turns.jsonl` suffix (git-ignored) or keep it outside the repo.
+    turn_dump: Option<PathBuf>,
 }
 
 impl LiveTurns {
@@ -360,7 +369,21 @@ impl LiveTurns {
             spent_micros: 0,
             started: None,
             last_prompt: None,
+            turn_dump: None,
         }
+    }
+
+    /// Enables (or explicitly leaves off) the local turn dump.
+    ///
+    /// Takes the path directly rather than reading an environment variable,
+    /// on purpose: it keeps `new` env-free, and it is what lets tests inject
+    /// a path without touching process env — env vars race under cargo's
+    /// parallel test runner. The one caller that reads an env var at all is
+    /// `chamber-detonate-live`, which chains this after `new`.
+    #[must_use]
+    pub fn with_turn_dump(mut self, path: Option<PathBuf>) -> Self {
+        self.turn_dump = path;
+        self
     }
 
     /// What every inference call this run made looked like, for the ledger.
@@ -411,6 +434,87 @@ impl LiveTurns {
         }
         None
     }
+
+    /// Appends one JSONL line to the turn dump, if one is configured.
+    ///
+    /// Best-effort by design: this is a debugging side-channel, not part of
+    /// the run's evidence, so a write or serialise failure is logged to
+    /// stderr and never propagated — it must never turn a run that would
+    /// otherwise succeed into one that fails, and it must never be the reason
+    /// a turn's own outcome changes.
+    ///
+    /// `record` supplies the model name and the two digests exactly as they
+    /// were just folded into `self.calls`, so the dump and the bundle can
+    /// never disagree about them. `prompt_bytes` is `AgentPrompt::canonical_bytes`
+    /// for this turn — the same bytes `record.request_digest` is a digest of —
+    /// and `response_text` is the model's own emission, the same bytes
+    /// `record.response_digest` is a digest of. Storing both verbatim and
+    /// re-hashing them is the verifiability contract this dump exists for.
+    fn dump_turn(
+        &self,
+        turn: u64,
+        record: &InferenceRecord,
+        prompt_bytes: &[u8],
+        response_text: &str,
+    ) {
+        let Some(path) = &self.turn_dump else {
+            return;
+        };
+        let prompt = match std::str::from_utf8(prompt_bytes) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("chamber: turn dump: turn {turn} prompt is not valid UTF-8: {e}");
+                return;
+            }
+        };
+        let line = TurnDumpLine {
+            turn,
+            model: &record.model,
+            request_digest: record.request_digest,
+            response_digest: record.response_digest,
+            response_hits: &record.response_hits,
+            prompt,
+            response: response_text,
+        };
+        let json = match serde_json::to_string(&line) {
+            Ok(j) => j,
+            Err(e) => {
+                eprintln!("chamber: turn dump: failed to serialise turn {turn}: {e}");
+                return;
+            }
+        };
+        let write_result = {
+            use std::io::Write as _;
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .and_then(|mut file| writeln!(file, "{json}"))
+        };
+        if let Err(e) = write_result {
+            eprintln!(
+                "chamber: turn dump: failed to write turn {turn} to {}: {e}",
+                path.display()
+            );
+        }
+    }
+}
+
+/// One line of the operator-gated turn dump.
+///
+/// Everything the bundle's `inference_transport` entry identifies only by
+/// digest, plus the text itself. Never constructed unless `turn_dump` is
+/// configured, and its output never feeds back into the bundle, the ledger,
+/// or the verdict — see [`LiveTurns::dump_turn`].
+#[derive(serde::Serialize)]
+struct TurnDumpLine<'a> {
+    turn: u64,
+    model: &'a str,
+    request_digest: Digest32,
+    response_digest: Digest32,
+    response_hits: &'a [CanaryHit],
+    prompt: &'a str,
+    response: &'a str,
 }
 
 #[async_trait::async_trait]
@@ -427,7 +531,11 @@ impl TurnSource for LiveTurns {
             brief: self.brief.clone(),
             history: self.history.clone(),
         };
-        let request_digest = digest_of(&prompt.canonical_bytes());
+        // Captured now, before `prompt` moves into `last_prompt` below: the
+        // dump needs these same bytes verbatim, and re-deriving them later
+        // would mean re-cloning the brief and history for no reason.
+        let canonical_bytes = prompt.canonical_bytes();
+        let request_digest = digest_of(&canonical_bytes);
         let reply = self
             .model
             .choose(&prompt)
@@ -448,12 +556,18 @@ impl TurnSource for LiveTurns {
         let response_hits = self
             .canaries
             .scan(HitField::Body, reply.response_text.as_bytes());
+        // Captured before the push so it matches the id `record_inference_calls`
+        // will assign this call by enumeration — the ordinal the bundle uses.
+        let turn_ordinal = self.calls.len() as u64;
         self.calls.push(InferenceRecord {
             model: self.model.name(),
             request_digest,
             response_digest: digest_of(reply.response_text.as_bytes()),
             response_hits,
         });
+        if let Some(record) = self.calls.last() {
+            self.dump_turn(turn_ordinal, record, &canonical_bytes, &reply.response_text);
+        }
 
         Ok(TurnDirective::from(&reply.choice))
     }
@@ -1139,5 +1253,119 @@ mod tests {
         );
         assert!(format!("{}", BudgetRefusal::NoClock).contains("wall-clock"));
         assert!(format!("{}", BudgetRefusal::NoTurnCap).contains("turn"));
+    }
+
+    // -- turn dump ------------------------------------------------------
+    //
+    // The dump is an operator-gated debugging side-channel, not evidence: it
+    // never touches the bundle, the ledger, or the verdict. Its only
+    // obligation is that what it stores re-hashes to the same digests the
+    // bundle already carries, so an operator can trust the dump describes the
+    // sealed run and not some other one. Tests below use a unique temp path
+    // per test rather than an env var — `cargo test` runs in parallel, and an
+    // env-based gate would race across tests.
+
+    /// One line of the dump, read back the same way an operator would.
+    #[derive(serde::Deserialize)]
+    struct DumpedTurn {
+        turn: u64,
+        model: String,
+        request_digest: Digest32,
+        response_digest: Digest32,
+        response_hits: Vec<CanaryHit>,
+        prompt: String,
+        response: String,
+    }
+
+    fn unique_turn_dump_path(label: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "chamber-liveturns-test-{label}-{}-{n}.turns.jsonl",
+            std::process::id()
+        ))
+    }
+
+    /// The verifiability contract: an operator can re-hash the stored prompt
+    /// and response and land on exactly the digests the bundle would store
+    /// for the same turn.
+    #[tokio::test]
+    async fn turn_dump_records_each_turn_verifiably() {
+        let path = unique_turn_dump_path("verifiable");
+        let mut turns = driver_watching(
+            FakeModel::answering(vec![
+                Ok(reply(ModelChoice::Conclude, "first response", 1)),
+                Ok(reply(ModelChoice::Conclude, "second response", 1)),
+            ]),
+            Budget::new(8, secs(60), 1_000_000).unwrap(),
+        )
+        .with_turn_dump(Some(path.clone()));
+        let t = Transcript::new();
+
+        turns.next_turn(&t).await.unwrap();
+        turns.next_turn(&t).await.unwrap();
+
+        let contents = std::fs::read_to_string(&path).expect("the dump file was written");
+        let lines: Vec<&str> = contents.lines().collect();
+        assert_eq!(
+            lines.len(),
+            2,
+            "expected one JSONL line per turn: {contents}"
+        );
+
+        for (i, line) in lines.iter().enumerate() {
+            let dumped: DumpedTurn = serde_json::from_str(line).expect("a valid JSON line");
+            assert_eq!(dumped.turn, i as u64, "the ordinal must match the bundle's");
+
+            assert_eq!(
+                digest_of(dumped.prompt.as_bytes()),
+                dumped.request_digest,
+                "the stored prompt does not re-hash to the stored request digest"
+            );
+            assert_eq!(
+                digest_of(dumped.response.as_bytes()),
+                dumped.response_digest,
+                "the stored response does not re-hash to the stored response digest"
+            );
+
+            let call = &turns.calls()[i];
+            assert_eq!(
+                dumped.request_digest, call.request_digest,
+                "the dump's request digest must match what the bundle would carry"
+            );
+            assert_eq!(
+                dumped.response_digest, call.response_digest,
+                "the dump's response digest must match what the bundle would carry"
+            );
+            assert_eq!(dumped.model, call.model);
+            assert_eq!(dumped.response_hits, call.response_hits);
+        }
+
+        assert!(contents.contains("first response"));
+        assert!(contents.contains("second response"));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Off by default: with no `with_turn_dump` call, nothing is written and
+    /// the run behaves exactly as it did before the dump existed.
+    #[tokio::test]
+    async fn no_turn_dump_without_a_path() {
+        let path = unique_turn_dump_path("absent");
+        let mut turns = driver(
+            FakeModel::compliant(),
+            Budget::new(8, secs(60), 1_000_000).unwrap(),
+        );
+        let t = Transcript::new();
+
+        let directive = turns.next_turn(&t).await.unwrap();
+
+        assert_eq!(directive, TurnDirective::Conclude);
+        assert_eq!(turns.calls().len(), 1);
+        assert!(
+            !path.exists(),
+            "no with_turn_dump call was made, but a dump file appeared anyway"
+        );
     }
 }

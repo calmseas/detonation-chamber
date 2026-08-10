@@ -58,6 +58,10 @@ impl ArmDriverFactory for LiveArmFactory {
         let transport = HttpsTransport::new(self.api_key.clone(), self.wall_clock)
             .expect("the transport built once at startup builds again");
 
+        // Not wired to `with_turn_dump` here: both arms would share one
+        // factory, and one file, and their turns would interleave into it.
+        // Natural follow-up is a per-arm path (e.g. derived from `spec`);
+        // out of scope for this task.
         Box::new(LiveTurns::new(
             Box::new(OpenRouterModel::new(transport, self.model_id.clone())),
             AgentBrief {
