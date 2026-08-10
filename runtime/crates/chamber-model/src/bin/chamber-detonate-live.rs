@@ -60,6 +60,9 @@ fn usage() -> ExitCode {
     eprintln!("  CHAMBER_RULESET      path to chamber.nft");
     eprintln!("  CHAMBER_IMAGE_*      capture / warden / guest / inspector tags");
     eprintln!("  CHAMBER_CANARY_VALUE the token to plant");
+    eprintln!("  CHAMBER_TURN_DUMP    path to append a local, git-ignored JSONL record of");
+    eprintln!("                        every turn's full prompt and response text (debug");
+    eprintln!("                        only — contains the canary in cleartext; off unless set)");
     ExitCode::from(BAD_INVOCATION)
 }
 
@@ -130,7 +133,11 @@ async fn main() -> ExitCode {
         // The driver scans the model's own responses for this. The observer
         // scans the boundary for it independently — same token, two channels.
         CanarySet::new(vec![Canary::new("aws-key", canary_value.clone())]),
-    );
+    )
+    // Off unless the operator names a path. The dump carries the canary in
+    // cleartext by design — see `LiveTurns::dump_turn` — so it is never
+    // wired to anything the sealed bundle touches.
+    .with_turn_dump(std::env::var("CHAMBER_TURN_DUMP").ok().map(PathBuf::from));
 
     let plan = DetonationPlan {
         images: ImageTags {
