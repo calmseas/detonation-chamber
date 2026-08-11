@@ -28,6 +28,11 @@
 //!    a working egress path.
 
 pub mod canary;
+// Deliberately NOT behind `observer`: the host orchestrator configures
+// consequence mode and must name the same type the observer reads it back into,
+// while linking none of the proxy stack. See the note on the feature split in
+// Cargo.toml.
+pub mod consequence;
 #[cfg(feature = "observer")]
 pub mod dns;
 #[cfg(feature = "observer")]
@@ -36,6 +41,7 @@ pub mod recorder;
 pub mod writer;
 
 pub use canary::{Canary, CanarySet};
+pub use consequence::{ConsequenceConfigError, ConsequenceResponse};
 #[cfg(feature = "observer")]
 pub use dns::DnsSink;
 #[cfg(feature = "observer")]

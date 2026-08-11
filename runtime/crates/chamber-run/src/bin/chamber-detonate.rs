@@ -77,6 +77,9 @@ async fn main() -> ExitCode {
         }],
         max_turns: env_or("CHAMBER_MAX_TURNS", "12").parse().unwrap_or(12),
         skill_dir: None,
+        // The scripted detonator refuses, as it always has. Consequence mode is
+        // an instrument for live runs, and belongs to chamber-detonate-live.
+        consequence: None,
     };
 
     match run_detonation(&plan, &mut turns).await {

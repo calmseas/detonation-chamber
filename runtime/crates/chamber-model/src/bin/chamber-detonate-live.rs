@@ -23,7 +23,9 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use chamber_capture::{Canary, CanarySet};
-use chamber_model::{DEFAULT_MODEL, HttpsTransport, OpenRouterModel};
+use chamber_model::{
+    CONSEQUENCE_BODY_FILE_VAR, DEFAULT_MODEL, HttpsTransport, OpenRouterModel, consequence_from_env,
+};
 use chamber_run::{
     AgentBrief, Budget, DetonationPlan, ImageTags, LiveTurns, PlantedCanary, run_detonation,
 };
@@ -63,6 +65,11 @@ fn usage() -> ExitCode {
     eprintln!("  CHAMBER_TURN_DUMP    path to append a local, git-ignored JSONL record of");
     eprintln!("                        every turn's full prompt and response text (debug");
     eprintln!("                        only — contains the canary in cleartext; off unless set)");
+    eprintln!("  CHAMBER_CONSEQUENCE_STATUS     with _BODY_FILE, answer intercepted requests");
+    eprintln!("  CHAMBER_CONSEQUENCE_BODY_FILE  with this fabricated response instead of the");
+    eprintln!("                        403 that tells the artefact it is being watched. Both or");
+    eprintln!("                        neither; one alone refuses to start. Grants NO egress —");
+    eprintln!("                        the boundary builds the answer, it never fetches it.");
     ExitCode::from(BAD_INVOCATION)
 }
 
@@ -139,6 +146,16 @@ async fn main() -> ExitCode {
     // wired to anything the sealed bundle touches.
     .with_turn_dump(std::env::var("CHAMBER_TURN_DUMP").ok().map(PathBuf::from));
 
+    // Resolved before the run so a bad path or a half-set pair is a bad
+    // invocation, not a chamber that comes up telling the wrong story.
+    let consequence = match consequence_from_env() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("chamber: {e}");
+            return ExitCode::from(BAD_INVOCATION);
+        }
+    };
+
     let plan = DetonationPlan {
         images: ImageTags {
             capture: env_or("CHAMBER_IMAGE_CAPTURE", "chamber-capture:test"),
@@ -160,9 +177,22 @@ async fn main() -> ExitCode {
         // more than just its markdown — so a bundled script is present in the
         // cell to run. A lone SKILL.md stages nothing new.
         skill_dir: skill_dir_of(&artefact_path),
+        consequence: consequence.clone(),
     };
 
     eprintln!("chamber: live run, model {model_id}, up to {max_turns} turns");
+    // Said on the host too, not only inside the observer: whoever reads this
+    // terminal is the person who will interpret the run, and the two modes
+    // produce identical-looking evidence.
+    if let Some(c) = &consequence {
+        eprintln!(
+            "chamber: consequence mode — the boundary answers {} with {} byte(s) from \
+             {}, instead of refusing. Still no egress: the answer is fabricated.",
+            c.status(),
+            c.body().len(),
+            std::env::var(CONSEQUENCE_BODY_FILE_VAR).unwrap_or_default()
+        );
+    }
 
     match run_detonation(&plan, &mut turns).await {
         Ok(epilogue) => {

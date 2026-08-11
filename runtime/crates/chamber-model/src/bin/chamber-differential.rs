@@ -26,7 +26,7 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use chamber_capture::{Canary, CanarySet};
-use chamber_model::{DEFAULT_MODEL, HttpsTransport, OpenRouterModel};
+use chamber_model::{DEFAULT_MODEL, HttpsTransport, OpenRouterModel, consequence_from_env};
 use chamber_run::{
     AgentBrief, ArmClass, ArmDriverFactory, ArmRole, ArmSpec, ArtefactRef, BatteryTask, Budget,
     CanaryTemplate, DiffVerdict, Differential, DifferentialPlan, EntropyLead, ImageTags, LiveTurns,
@@ -269,6 +269,19 @@ async fn main() -> ExitCode {
                 "                          chamber-detonate-live, this names a directory, not a"
             );
             eprintln!("                          file — both arms would otherwise interleave.");
+            eprintln!(
+                "  CHAMBER_CONSEQUENCE_STATUS / CHAMBER_CONSEQUENCE_BODY_FILE  answer intercepted"
+            );
+            eprintln!(
+                "                          requests with this fabricated response instead of the"
+            );
+            eprintln!(
+                "                          403 tell. Applied to BOTH arms — an asymmetry here"
+            );
+            eprintln!("                          would diverge on the boundary, not the artefact.");
+            eprintln!(
+                "                          Grants no egress; the answer is built, not fetched."
+            );
             return ExitCode::from(BAD_INVOCATION);
         }
     };
@@ -333,6 +346,23 @@ async fn main() -> ExitCode {
         turn_dump_base,
     };
 
+    // One configuration for both arms, resolved before either is raised.
+    let consequence = match consequence_from_env() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("chamber: {e}");
+            return ExitCode::from(BAD_INVOCATION);
+        }
+    };
+    if let Some(c) = &consequence {
+        eprintln!(
+            "chamber: consequence mode — BOTH arms meet a boundary answering {} with \
+             {} fabricated byte(s), instead of refusing. Still no egress.",
+            c.status(),
+            c.body().len()
+        );
+    }
+
     let plan = DifferentialPlan {
         images: ImageTags {
             capture: env_or("CHAMBER_IMAGE_CAPTURE", "chamber-capture:test"),
@@ -355,6 +385,7 @@ async fn main() -> ExitCode {
             var: "CHAMBER_TOKEN".to_owned(),
         }],
         max_turns,
+        consequence,
     };
 
     if let Err(e) = std::fs::create_dir_all(&evidence_root) {

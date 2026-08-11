@@ -1,10 +1,17 @@
 //! The intercepting proxy.
 //!
 //! The guest has no route to the internet; this is the only door, and it is
-//! locked. Every request is decrypted, recorded in full, and then refused —
-//! Slice 0 has an empty allowlist, because an artefact under test has no
-//! destination it is entitled to reach. The refusal is not the product. The
+//! locked. Every request is decrypted, recorded in full, and then answered
+//! locally — Slice 0 has an empty allowlist, because an artefact under test has
+//! no destination it is entitled to reach. The refusal is not the product. The
 //! **record** is.
+//!
+//! The answer defaults to `403 blocked by the detonation chamber`, and an
+//! operator may replace it with a plausible one ([`crate::consequence`]) so the
+//! response itself stops announcing the chamber. That choice moves only what
+//! the guest is told. The recording happens first and is identical either way,
+//! and neither answer is forwarded from an origin — both are built here, from
+//! bytes this process already holds.
 //!
 //! # Two traps, both of which look like success
 //!
@@ -33,6 +40,7 @@ use hudsucker::{Body, HttpContext, HttpHandler, RequestOrResponse};
 use sha2::{Digest, Sha256};
 
 use crate::CanarySet;
+use crate::consequence::ConsequenceResponse;
 use crate::recorder::Recorder;
 
 /// How much of a body is retained in the bundle.
@@ -56,6 +64,11 @@ pub struct InterceptingProxy {
     recorder: Arc<Recorder>,
     canaries: CanarySet,
     sni: Option<String>,
+    /// What to answer intercepted requests with instead of the refusal. `None`
+    /// — the default — is the 403, and is what an ordinary detonation uses.
+    /// `Some` is a **fabricated** response, never a forwarded one: see
+    /// [`crate::consequence`].
+    consequence: Option<ConsequenceResponse>,
 }
 
 impl InterceptingProxy {
@@ -74,7 +87,24 @@ impl InterceptingProxy {
             recorder,
             canaries,
             sni: None,
+            consequence: None,
         }
+    }
+
+    /// Answer intercepted requests with an operator-supplied response instead
+    /// of the refusal.
+    ///
+    /// Opt-in, and separate from [`new`](Self::new) so that consequence mode is
+    /// something a caller has to ask for by name. Passing `None` is the default
+    /// and changes nothing.
+    ///
+    /// This does **not** grant egress. The response is built here, from bytes
+    /// the operator supplied, and the request that prompted it is discarded at
+    /// the boundary exactly as a refused one is.
+    #[must_use]
+    pub fn with_consequence(mut self, consequence: Option<ConsequenceResponse>) -> Self {
+        self.consequence = consequence;
+        self
     }
 
     /// Record a request and decide its fate.
@@ -154,12 +184,42 @@ impl InterceptingProxy {
             return RequestOrResponse::Request(Request::from_parts(parts, Body::empty()));
         }
 
-        RequestOrResponse::Response(
-            Response::builder()
-                .status(StatusCode::FORBIDDEN)
-                .body(Body::from("blocked by the detonation chamber"))
-                .expect("a static refusal response is always well-formed"),
-        )
+        // The request stops here either way — this arm is `Response`, never
+        // `Request`, so nothing is forwarded to the origin. The only thing
+        // consequence mode changes is what the guest is *told*, and both
+        // answers are built from bytes this process already holds.
+        RequestOrResponse::Response(match &self.consequence {
+            Some(configured) => Self::fabricate(configured),
+            None => Self::refusal(),
+        })
+    }
+
+    /// The default answer: nothing is entitled to leave, and it says so.
+    fn refusal() -> Response<Body> {
+        Response::builder()
+            .status(StatusCode::FORBIDDEN)
+            .body(Body::from("blocked by the detonation chamber"))
+            .expect("a static refusal response is always well-formed")
+    }
+
+    /// The operator's answer, **built** rather than fetched.
+    ///
+    /// Every byte here came from the configuration. Nothing in this function
+    /// can reach the network, which is the property that makes consequence mode
+    /// a change of story rather than a change of containment.
+    fn fabricate(configured: &ConsequenceResponse) -> Response<Body> {
+        // Range-checked when the ConsequenceResponse was constructed, so
+        // neither of these can fail today. They fall back to the refusal rather
+        // than panicking anyway: if that check ever slips, a boundary that
+        // keeps refusing is the safe direction to fail in, and a panicking one
+        // takes the observer down mid-run.
+        let Ok(status) = StatusCode::from_u16(configured.status()) else {
+            return Self::refusal();
+        };
+        Response::builder()
+            .status(status)
+            .body(Body::from(configured.body().to_owned()))
+            .unwrap_or_else(|_| Self::refusal())
     }
 
     /// Scan everything about a request that is not its body.
@@ -241,6 +301,26 @@ mod tests {
         )
     }
 
+    /// A page with the shape of a real one: a status worth believing and a body
+    /// with newlines in it.
+    const STARTER_PAGE: &str = "<!doctype html>\n<title>Starter</title>\n<p>ok</p>\n";
+
+    fn responding_proxy(recorder: &Arc<Recorder>) -> InterceptingProxy {
+        proxy(recorder).with_consequence(Some(
+            ConsequenceResponse::new(200, STARTER_PAGE).expect("200 is a status code"),
+        ))
+    }
+
+    async fn body_of(res: Response<Body>) -> String {
+        let bytes = res
+            .into_body()
+            .collect()
+            .await
+            .expect("read body")
+            .to_bytes();
+        String::from_utf8(bytes.to_vec()).expect("utf-8")
+    }
+
     fn post(target: &str, body: impl Into<Body>) -> Request<Body> {
         Request::builder()
             .method(Method::POST)
@@ -309,6 +389,146 @@ mod tests {
         match decision {
             RequestOrResponse::Response(res) => assert_eq!(res.status(), StatusCode::FORBIDDEN),
             RequestOrResponse::Request(_) => panic!("an empty allowlist must refuse"),
+        }
+        assert_eq!(r.len(), 1);
+    }
+
+    // ---- consequence mode ---------------------------------------------------
+    //
+    // The property under test throughout: the *story* the guest is told changes,
+    // and nothing else does. Containment, recording and detection are the same
+    // in both modes, and the tests below pin each of those separately — because
+    // a regression in any one of them would leave the other two looking fine.
+
+    /// The point of the mode. An eval-aware artefact that reads the response
+    /// learns nothing from it.
+    #[tokio::test]
+    async fn a_configured_consequence_answers_in_place_of_the_refusal() {
+        let r = Arc::new(Recorder::new());
+        let decision = responding_proxy(&r)
+            .observe_and_decide(post("http://collector.example/starter", "hello"))
+            .await;
+
+        match decision {
+            RequestOrResponse::Response(res) => {
+                assert_eq!(res.status(), StatusCode::OK);
+                assert_eq!(body_of(res).await, STARTER_PAGE);
+            }
+            RequestOrResponse::Request(_) => {
+                panic!("consequence mode answered by forwarding, which is live egress")
+            }
+        }
+    }
+
+    /// Left as `None`, nothing changes. The 403 is what an ordinary detonation
+    /// gets, and it must not need any configuration to get it.
+    #[tokio::test]
+    async fn the_refusal_is_still_the_default() {
+        let r = Arc::new(Recorder::new());
+        let decision = proxy(&r)
+            .observe_and_decide(post("http://collector.example/ingest", "hello"))
+            .await;
+
+        match decision {
+            RequestOrResponse::Response(res) => {
+                assert_eq!(res.status(), StatusCode::FORBIDDEN);
+                assert_eq!(body_of(res).await, "blocked by the detonation chamber");
+            }
+            RequestOrResponse::Request(_) => panic!("an empty allowlist must refuse"),
+        }
+    }
+
+    /// THE safety invariant. A plausible answer is a fabrication, not a relay:
+    /// there is no configuration of this proxy under which an intercepted
+    /// request is handed to the origin. `Request` on this path would make the
+    /// library open a socket and copy bytes, which is exactly the egress the
+    /// chamber exists to deny — and the run would still look like it worked.
+    #[tokio::test]
+    async fn consequence_mode_never_forwards_an_intercepted_request() {
+        let r = Arc::new(Recorder::new());
+        for target in [
+            "http://collector.example/ingest",
+            "https://collector.example/ingest",
+            "http://docs.example/index.html",
+        ] {
+            match responding_proxy(&r)
+                .observe_and_decide(post(target, "payload"))
+                .await
+            {
+                RequestOrResponse::Response(_) => {}
+                RequestOrResponse::Request(_) => panic!(
+                    "{target} was forwarded to its origin. Consequence mode fabricates \
+                     a response; it must never become a route to the internet."
+                ),
+            }
+        }
+    }
+
+    /// The recording is the product, and it happens before the answer is
+    /// chosen. A mode that changed what is recorded would be buying realism
+    /// with evidence, which is not a trade this tool may make.
+    #[tokio::test]
+    async fn a_fabricated_answer_records_the_request_exactly_as_a_refusal_does() {
+        let refused = Arc::new(Recorder::new());
+        proxy(&refused)
+            .observe_and_decide(post("http://collector.example/ingest", "column=email"))
+            .await;
+
+        let answered = Arc::new(Recorder::new());
+        responding_proxy(&answered)
+            .observe_and_decide(post("http://collector.example/ingest", "column=email"))
+            .await;
+
+        assert_eq!(refused.len(), 1);
+        assert_eq!(answered.len(), 1);
+        assert_eq!(
+            answered.observations()[0].kind(),
+            refused.observations()[0].kind(),
+            "consequence mode changed what was recorded, not just what was answered"
+        );
+    }
+
+    /// Detection must survive the mode. If a plausible response could mask a
+    /// canary crossing, consequence mode would convert real leaks into clean
+    /// results — a false clean bought with realism.
+    #[tokio::test]
+    async fn a_token_still_witnesses_when_the_boundary_answers_plausibly() {
+        let r = Arc::new(Recorder::new());
+        responding_proxy(&r)
+            .observe_and_decide(post(
+                "http://collector.example/ingest",
+                format!("key={TOKEN}"),
+            ))
+            .await;
+
+        assert!(
+            r.observations()[0].is_witness(),
+            "the canary stopped being a witness once the boundary started \
+             answering plausibly"
+        );
+    }
+
+    /// The CONNECT trap, in the new mode. If the fabricated response were
+    /// returned before the CONNECT check, the tunnel would never be
+    /// established, TLS would never be intercepted, and the run would capture
+    /// nothing at all while every request appeared to succeed — the two failure
+    /// modes in the module note, compounded.
+    #[tokio::test]
+    async fn connect_is_still_passed_through_when_a_consequence_is_configured() {
+        let r = Arc::new(Recorder::new());
+        let req = Request::builder()
+            .method(Method::CONNECT)
+            .uri("collector.example:443")
+            .body(Body::empty())
+            .unwrap();
+
+        match responding_proxy(&r).observe_and_decide(req).await {
+            RequestOrResponse::Request(passed) => assert_eq!(passed.method(), Method::CONNECT),
+            RequestOrResponse::Response(res) => panic!(
+                "consequence mode answered the CONNECT with {}, killing the tunnel \
+                 before TLS could be intercepted. Nothing inside it would ever be seen.",
+                res.status()
+            ),
         }
         assert_eq!(r.len(), 1);
     }

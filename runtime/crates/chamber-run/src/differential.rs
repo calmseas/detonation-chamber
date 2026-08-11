@@ -28,6 +28,8 @@ use chamber_evidence::{
     CapturedBody, Channel, CoverageGap, GapCause, Observation, ObservationKind, RunEnding, Verdict,
 };
 
+use chamber_capture::ConsequenceResponse;
+
 use crate::run::{ArmingRefusal, ImageTags, PlantedCanary};
 use crate::turns::TurnSource;
 use serde::{Deserialize, Serialize};
@@ -2330,6 +2332,16 @@ pub struct DifferentialPlan {
     pub battery: Vec<BatteryTask>,
     pub canaries: Vec<CanaryTemplate>,
     pub max_turns: u32,
+    /// What the boundary answers both arms with. `None` is the refusal.
+    ///
+    /// **One field, deliberately** — unlike the skill directories above, which
+    /// are per-role because each arm must stage its own artefact. The boundary's
+    /// story is a property of the *environment*, and the differential's entire
+    /// claim is that the arms differ only in the artefact under test. An arm
+    /// that saw plausible 200s against one that saw 403s would diverge because
+    /// of the boundary rather than because of the candidate, and the subtraction
+    /// would report that difference as the artefact's behaviour.
+    pub consequence: Option<ConsequenceResponse>,
 }
 
 /// Why no differential happened.
@@ -2446,6 +2458,9 @@ fn arm_detonation_plan(
             ArmRole::Candidate => plan.candidate_skill_dir.clone(),
             ArmRole::Reference => plan.reference_skill_dir.clone(),
         },
+        // NOT matched on role: both arms meet the same boundary, or the
+        // subtraction attributes the environment's difference to the artefact.
+        consequence: plan.consequence.clone(),
     }
 }
 
@@ -2567,6 +2582,7 @@ mod plan_tests {
             battery,
             canaries,
             max_turns: 4,
+            consequence: None,
         }
     }
 

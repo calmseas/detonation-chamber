@@ -108,6 +108,9 @@ fn a_bundled_script_is_staged_and_detonates() {
         }],
         max_turns: 8,
         skill_dir: Some(skill_dir.clone()),
+        // The containment properties this suite asserts are the ones that must
+        // hold on the DEFAULT boundary, which refuses.
+        consequence: None,
     };
 
     let ep = block_on(run_detonation(&plan, &mut turns)).unwrap_or_else(|e| panic!("{e}"));

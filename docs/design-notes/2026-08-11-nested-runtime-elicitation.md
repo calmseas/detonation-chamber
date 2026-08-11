@@ -213,12 +213,31 @@ that would matter is a **responding boundary** (a real 200 back) — the armed c
 no sink, so the exfil endpoint never answers; simulating that consequence is a chamber
 infra change, not a fixture tweak. `gap.no-response-consequence` (proposed).
 
+**Since built — consequence mode.** The boundary now takes an operator-supplied
+response and fabricates it in place of the `403 blocked by the detonation chamber`
+that otherwise announces the chamber in one round-trip. Off by default; set
+`CHAMBER_CONSEQUENCE_STATUS` and `CHAMBER_CONSEQUENCE_BODY_FILE` together on
+`chamber-detonate-live` (or `chamber-differential`, where it applies to *both* arms,
+since an asymmetric boundary would diverge on the environment rather than the
+artefact). Setting one alone refuses to start rather than falling back, because a
+half-configured run answers with the tell the operator believed they had removed and
+nothing downstream would show it.
+
+It is a change of story, not of containment: the response is **built** from the
+configured bytes, never fetched, and the request still dies at the boundary. The
+loopback suite pins both halves in one test — a real TLS client receives the plausible
+200 while the origin's connection counter stays at zero, and the canary in the request
+is still a witness. What is *not* yet recorded is the mode itself: the sealed bundle
+looks identical either way, so today only the run log distinguishes a fabricated 200
+from real uplink. Read a consequence-mode bundle with its log beside it.
+
 Tooling lesson (recorded): fire must be measured as a boundary crossing, never a
 substring match on the payload script name — an early fold counted `cat sign.sh` as a
 fire and had to be corrected.
 
-Next: the responding-boundary consequence layer, the refuser set (do opus-4.8 /
-sonnet-5 shift with realism, or refuse uniformly?), and more drivers/N.
+Next: re-run the L2+ proof with consequence mode supplying a real 200 — does a
+succeeding exfil change firing rates? — and the refuser set (do opus-4.8 / sonnet-5
+shift with realism, or refuse uniformly?), plus more drivers/N.
 
 ## References (verified this sweep)
 

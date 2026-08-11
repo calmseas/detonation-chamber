@@ -14,7 +14,7 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use chamber_capture::{Canary, CanarySet, InterceptingProxy, Recorder};
+use chamber_capture::{Canary, CanarySet, ConsequenceResponse, InterceptingProxy, Recorder};
 use chamber_evidence::{CapturedBody, Channel, HitField, ObservationKind};
 use hudsucker::Proxy;
 use hudsucker::certificate_authority::RcgenAuthority;
@@ -71,7 +71,10 @@ async fn spawn_origin() -> Origin {
 }
 
 /// Start the chamber's proxy on an ephemeral port.
-async fn spawn_proxy(recorder: Arc<Recorder>) -> SocketAddr {
+async fn spawn_proxy(
+    recorder: Arc<Recorder>,
+    consequence: Option<ConsequenceResponse>,
+) -> SocketAddr {
     let (ca, ca_der) = per_run_ca();
     CA_DER.with(|slot| *slot.borrow_mut() = Some(ca_der));
 
@@ -83,7 +86,8 @@ async fn spawn_proxy(recorder: Arc<Recorder>) -> SocketAddr {
     let handler = InterceptingProxy::new(
         recorder,
         CanarySet::new(vec![Canary::new("aws-key", TOKEN)]),
-    );
+    )
+    .with_consequence(consequence);
 
     let proxy = Proxy::builder()
         .with_listener(listener)
@@ -114,9 +118,14 @@ struct Harness {
 }
 
 async fn harness() -> Harness {
+    harness_with(None).await
+}
+
+/// The same harness, with the boundary answering plausibly instead of refusing.
+async fn harness_with(consequence: Option<ConsequenceResponse>) -> Harness {
     let _ = aws_lc_rs::default_provider().install_default();
     let recorder = Arc::new(Recorder::new());
-    let proxy = spawn_proxy(Arc::clone(&recorder)).await;
+    let proxy = spawn_proxy(Arc::clone(&recorder), consequence).await;
     let ca_der = CA_DER
         .with(|slot| slot.borrow_mut().take())
         .expect("ca der");
@@ -281,6 +290,78 @@ async fn a_token_in_the_query_string_is_caught_through_tls() {
             .any(|hit| hit.field == HitField::Target),
         "a token in the query string must be caught: {get:?}"
     );
+}
+
+/// THE consequence-mode claim, end to end through real TLS: the client is told
+/// its request succeeded, and the origin was still never contacted.
+///
+/// Both halves matter and neither is sufficient alone. A 200 the client
+/// believes is what makes the mode worth having; an origin counter still at
+/// zero is what makes it safe. Asserting them in one test is the point — it is
+/// the only place that can distinguish "fabricated a plausible answer" from
+/// "quietly became a working proxy", and those two look identical from the
+/// client's side.
+#[tokio::test]
+async fn consequence_mode_answers_plausibly_and_still_never_reaches_the_origin() {
+    let page = "<!doctype html>\n<title>Starter</title>\n<p>ok</p>\n";
+    let h = harness_with(Some(
+        ConsequenceResponse::new(200, page).expect("200 is a status code"),
+    ))
+    .await;
+
+    let response = h
+        .client()
+        .post(h.origin_url("/starter"))
+        .body(format!("{{\"key\":\"{TOKEN}\"}}"))
+        .send()
+        .await
+        .expect("the proxy must answer rather than hang");
+
+    assert_eq!(
+        response.status(),
+        reqwest::StatusCode::OK,
+        "the artefact was still told it had been blocked"
+    );
+    assert_eq!(
+        response.text().await.expect("read the body"),
+        page,
+        "the body the guest received is not the one the operator configured"
+    );
+
+    // Give anything in flight a chance to land before counting.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    // Proves TLS interception actually happened, so the zero below means
+    // "declined to forward" and not "the handshake never completed".
+    let exchange = h.inner_request("POST");
+
+    assert_eq!(
+        h.origin.connections.load(Ordering::SeqCst),
+        0,
+        "a plausible answer was bought by actually contacting the origin — the \
+         boundary became a relay, which is the one thing consequence mode must \
+         never do"
+    );
+
+    // Realism must not be bought with evidence: the same crossing is recorded,
+    // and the token in it is still a witness.
+    assert!(
+        exchange.is_witness(),
+        "the canary stopped supporting a finding once the boundary answered \
+         plausibly — consequence mode would be converting real leaks into clean \
+         results"
+    );
+    assert_eq!(exchange.channel(), Channel::NetworkEgress);
+    match exchange.kind() {
+        ObservationKind::HttpExchange { body, .. } => assert_eq!(
+            body,
+            &CapturedBody::Whole {
+                bytes: format!("{{\"key\":\"{TOKEN}\"}}").into_bytes()
+            },
+            "the plaintext body must still be recovered in consequence mode"
+        ),
+        other => panic!("expected an exchange, got {other:?}"),
+    }
 }
 
 /// Ordinary traffic is recorded and does not detonate. Without this the tool

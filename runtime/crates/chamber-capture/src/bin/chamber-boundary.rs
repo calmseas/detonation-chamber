@@ -25,6 +25,16 @@
 //! | `CHAMBER_PROXY_ADDR` | `0.0.0.0:3128` | proxy bind |
 //! | `CHAMBER_DNS_ADDR` | `0.0.0.0:53` | DNS bind, UDP and TCP |
 //! | `CHAMBER_CANARY_<LABEL>` | — | one planted token to watch for |
+//! | `CHAMBER_CONSEQUENCE_STATUS` | — | status to fabricate instead of refusing |
+//! | `CHAMBER_CONSEQUENCE_BODY_B64` | — | the body to fabricate, base64 |
+//!
+//! The last two are the opt-in [consequence
+//! mode](chamber_capture::consequence): both set, and intercepted requests are
+//! answered plausibly instead of with the 403 that tells an artefact it is being
+//! watched. Neither set is the default. Exactly one set is a misconfiguration
+//! and refuses to start — see that module for why silence would be worse.
+//! Fabricating an answer never forwards anything upstream; the request still
+//! dies here.
 //!
 //! # Readiness is announced, not assumed
 //!
@@ -47,7 +57,9 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 
-use chamber_capture::{Canary, CanarySet, DnsSink, InterceptingProxy, LedgerWriter, Recorder};
+use chamber_capture::{
+    Canary, CanarySet, ConsequenceResponse, DnsSink, InterceptingProxy, LedgerWriter, Recorder,
+};
 use chamber_evidence::{CanaryHit, HitField};
 use hickory_server::Server;
 use hudsucker::Proxy;
@@ -194,6 +206,17 @@ async fn main() -> ExitCode {
         }
     };
 
+    // Read before anything binds. A half-configured consequence must refuse to
+    // arm, and discovering that once the artefact is already running is
+    // discovering it too late.
+    let consequence = match ConsequenceResponse::from_env() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("chamber-boundary: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
     let canaries = canaries_from_env();
     if canaries.is_empty() {
         eprintln!(
@@ -278,10 +301,10 @@ async fn main() -> ExitCode {
         .with_listener(listener)
         .with_ca(ca)
         .with_rustls_connector(aws_lc_rs::default_provider())
-        .with_http_handler(InterceptingProxy::new(
-            Arc::clone(&recorder),
-            CanarySet::new(canaries),
-        ))
+        .with_http_handler(
+            InterceptingProxy::new(Arc::clone(&recorder), CanarySet::new(canaries))
+                .with_consequence(consequence.clone()),
+        )
         .build()
     {
         Ok(p) => p,
@@ -313,6 +336,22 @@ async fn main() -> ExitCode {
     say(&format!(
         "chamber-boundary: proxy={proxy_addr} dns={dns_addr} answering {answer_with}"
     ));
+    // Said out loud, because the two modes are indistinguishable downstream:
+    // the observations a run records are identical either way, so this line is
+    // what tells a reader of the log whether the guest was being refused or
+    // told a story. An unannounced consequence mode would let a fabricated 200
+    // be mistaken for real uplink, which is the one misreading this feature
+    // could cause.
+    match &consequence {
+        Some(c) => say(&format!(
+            "chamber-boundary: CONSEQUENCE MODE — intercepted requests are answered \
+             {} with {} fabricated byte(s) instead of refused. Nothing is forwarded \
+             to an origin; the request still dies here.",
+            c.status(),
+            c.body().len()
+        )),
+        None => say("chamber-boundary: intercepted requests are refused (403)"),
+    }
     say("LISTENING");
 
     wait_for_shutdown().await;

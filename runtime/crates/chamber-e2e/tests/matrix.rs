@@ -119,6 +119,9 @@ fn plan_with(evidence: std::path::PathBuf, canaries: Vec<PlantedCanary>) -> Deto
         canaries,
         max_turns: 8,
         skill_dir: None,
+        // The matrix pins the default boundary's behaviour. A fixture row that
+        // wanted a plausible answer would set this and say so.
+        consequence: None,
     }
 }
 

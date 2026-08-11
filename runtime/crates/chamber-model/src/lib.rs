@@ -21,6 +21,7 @@
 
 use std::time::Duration;
 
+use chamber_capture::{ConsequenceResponse, consequence};
 use chamber_run::{AgentPrompt, Model, ModelChoice, ModelError, ModelReply};
 use serde::Deserialize;
 
@@ -463,6 +464,74 @@ impl Transport for HttpsTransport {
     }
 }
 
+// ---- consequence mode, the operator's half -------------------------------
+
+/// Where the operator puts the body they want the boundary to fabricate.
+///
+/// A **file**, not a variable, and deliberately so: the point of consequence
+/// mode is a response that looks like production, which means an HTML page or a
+/// JSON document, which means newlines and quotes. Asking an operator to get
+/// those through a shell variable intact invites a body that is subtly wrong in
+/// a run whose entire purpose is that nothing looks wrong.
+///
+/// The host base64-encodes it on the way to the observer (see
+/// [`chamber_capture::consequence`]), so what the file holds is what the guest
+/// sees.
+pub const CONSEQUENCE_BODY_FILE_VAR: &str = "CHAMBER_CONSEQUENCE_BODY_FILE";
+
+/// Reads a consequence configuration from two already-looked-up values.
+///
+/// Pure but for the one file read it is named after, so both refusal branches
+/// are testable without touching the process environment — which under edition
+/// 2024 is `unsafe` to write precisely because concurrent tests race on it.
+///
+/// `Ok(None)` means neither variable is set: the default, and not an error.
+///
+/// # Errors
+/// A message fit for a terminal if exactly one of the pair is set, the status is
+/// not a number or not a status code, or the body file cannot be read.
+pub fn consequence_from_values(
+    status: Option<&str>,
+    body_file: Option<&str>,
+) -> Result<Option<ConsequenceResponse>, String> {
+    match (status, body_file) {
+        (None, None) => Ok(None),
+        (Some(status), Some(path)) => {
+            let parsed: u16 = status
+                .trim()
+                .parse()
+                .map_err(|_| format!("{} is not a number: {status:?}", consequence::STATUS_VAR))?;
+            let body = std::fs::read_to_string(path)
+                .map_err(|e| format!("{CONSEQUENCE_BODY_FILE_VAR} {path}: {e}"))?;
+            ConsequenceResponse::new(parsed, body)
+                .map(Some)
+                .map_err(|e| e.to_string())
+        }
+        // Refused rather than defaulted. A half-configured run answers every
+        // request with the 403 tell the operator believed they had removed, and
+        // nothing in the evidence afterwards would show the difference.
+        (Some(_), None) => Err(format!(
+            "{} is set but {CONSEQUENCE_BODY_FILE_VAR} is not — consequence mode needs \
+             both, and half of it answers every request with the tell you meant to remove",
+            consequence::STATUS_VAR
+        )),
+        (None, Some(_)) => Err(format!(
+            "{CONSEQUENCE_BODY_FILE_VAR} is set but {} is not — consequence mode needs both",
+            consequence::STATUS_VAR
+        )),
+    }
+}
+
+/// [`consequence_from_values`], reading the process environment.
+///
+/// # Errors
+/// As [`consequence_from_values`].
+pub fn consequence_from_env() -> Result<Option<ConsequenceResponse>, String> {
+    let status = std::env::var(consequence::STATUS_VAR).ok();
+    let body_file = std::env::var(CONSEQUENCE_BODY_FILE_VAR).ok();
+    consequence_from_values(status.as_deref(), body_file.as_deref())
+}
+
 #[cfg(test)]
 pub(crate) mod tests_support {
     use super::*;
@@ -499,6 +568,74 @@ pub(crate) mod tests_support {
             },
             history: Vec::new(),
         }
+    }
+}
+
+#[cfg(test)]
+mod consequence_config_tests {
+    use super::*;
+
+    /// The default. An operator who asks for nothing gets the refusal, and does
+    /// not have to know this mode exists.
+    #[test]
+    fn neither_variable_set_is_off() {
+        assert_eq!(consequence_from_values(None, None), Ok(None));
+    }
+
+    /// The dangerous half-configuration. It looks configured, it would start
+    /// happily, and it would answer every request with the 403 the operator
+    /// believed they had removed — invalidating the whole realism run silently.
+    #[test]
+    fn a_status_without_a_body_file_is_refused() {
+        let err = consequence_from_values(Some("200"), None).unwrap_err();
+        assert!(
+            err.contains("needs") && err.contains(CONSEQUENCE_BODY_FILE_VAR),
+            "the refusal must name the missing variable: {err}"
+        );
+    }
+
+    #[test]
+    fn a_body_file_without_a_status_is_refused() {
+        let err = consequence_from_values(None, Some("/nonexistent")).unwrap_err();
+        assert!(
+            err.contains(consequence::STATUS_VAR),
+            "the refusal must name the missing variable: {err}"
+        );
+    }
+
+    /// A path that is not there is an operator error worth stopping for. Left
+    /// to default, the run would proceed with the boundary still announcing
+    /// itself and the operator none the wiser.
+    #[test]
+    fn an_unreadable_body_file_is_refused_not_defaulted() {
+        let err = consequence_from_values(Some("200"), Some("/no/such/page.html")).unwrap_err();
+        assert!(
+            err.contains("/no/such/page.html"),
+            "the refusal must name the path that could not be read: {err}"
+        );
+    }
+
+    #[test]
+    fn a_non_numeric_status_is_refused() {
+        assert!(consequence_from_values(Some("OK"), Some("/no/such/page.html")).is_err());
+    }
+
+    /// The body reaches the configuration byte for byte, newlines included —
+    /// that is the whole reason it travels as a file and then as base64.
+    #[test]
+    fn a_readable_body_file_is_carried_verbatim() {
+        let page = "<!doctype html>\n<title>Starter</title>\n";
+        let path =
+            std::env::temp_dir().join(format!("chamber-consequence-{}.html", std::process::id()));
+        std::fs::write(&path, page).expect("write the fixture page");
+
+        let configured = consequence_from_values(Some("200"), Some(&path.to_string_lossy()))
+            .expect("a readable page and a real status is a valid configuration")
+            .expect("both halves were set, so this is Some");
+
+        assert_eq!(configured.status(), 200);
+        assert_eq!(configured.body(), page);
+        let _ = std::fs::remove_file(&path);
     }
 }
 

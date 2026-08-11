@@ -29,6 +29,7 @@ use std::cell::RefCell;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use chamber_capture::ConsequenceResponse;
 use chamber_deadline::{StageTrace, Window};
 use chamber_evidence::Verdict;
 use chamber_isolation::{
@@ -99,6 +100,16 @@ pub struct DetonationPlan {
     /// turn. `None` reproduces Slice-0 behaviour exactly — nothing is staged,
     /// and the driver's brief is the only place the skill appears.
     pub skill_dir: Option<PathBuf>,
+    /// What the boundary answers intercepted requests with. `None` — the
+    /// default — is the `403 blocked by the detonation chamber` refusal.
+    ///
+    /// `Some` turns on [consequence
+    /// mode](chamber_capture::consequence): the boundary fabricates this
+    /// response so the artefact's request appears to succeed, which removes the
+    /// tell that a 403 from every host would otherwise hand an eval-aware
+    /// model. It grants no egress — the response is built inside the observer,
+    /// and the request is discarded there exactly as a refused one is.
+    pub consequence: Option<ConsequenceResponse>,
 }
 
 /// Why no run happened.
@@ -466,12 +477,14 @@ async fn drive_turns(
     transcript
 }
 
-/// The observer, at the address the ruleset accepts and the resolver points at.
-fn start_observer(
-    plan: &DetonationPlan,
-    fabric: &NetFabric,
-    ledger_path: &std::path::Path,
-) -> Result<Container, ArmingRefusal> {
+/// Everything the observer is configured with, as env pairs.
+///
+/// Split out of [`start_observer`] so the wire can be checked without a
+/// container. It is the seam where a configuration goes missing silently: a
+/// consequence set on the host but never written into these pairs produces an
+/// observer that refuses, a run that looks configured, and a realism experiment
+/// whose result means nothing — with no error anywhere to say so.
+fn observer_env(plan: &DetonationPlan) -> Vec<(String, String)> {
     let mut pairs = vec![
         (
             "CHAMBER_LEDGER".to_owned(),
@@ -497,6 +510,23 @@ fn start_observer(
             canary.value.clone(),
         ));
     }
+    // Absent unless the operator asked for it, so an ordinary run's observer
+    // sees neither variable and keeps refusing. The body is base64 in these
+    // pairs: the env file this becomes is one `KEY=value` line per pair, and a
+    // plausible response body has newlines in it.
+    if let Some(consequence) = &plan.consequence {
+        pairs.extend(consequence.to_env_pairs());
+    }
+    pairs
+}
+
+/// The observer, at the address the ruleset accepts and the resolver points at.
+fn start_observer(
+    plan: &DetonationPlan,
+    fabric: &NetFabric,
+    ledger_path: &std::path::Path,
+) -> Result<Container, ArmingRefusal> {
+    let pairs = observer_env(plan);
     let env_file =
         EnvFile::write(&pairs).map_err(|e| ArmingRefusal::Observer(format!("env file: {e}")))?;
 
@@ -812,5 +842,89 @@ mod tests {
 
         assert_eq!(transcript.len(), 3);
         assert_eq!(source.seen.len(), 3);
+    }
+
+    // ---- what the observer is told ----------------------------------------
+
+    fn bare_plan(consequence: Option<ConsequenceResponse>) -> DetonationPlan {
+        DetonationPlan {
+            images: ImageTags {
+                capture: "c".into(),
+                warden: "w".into(),
+                guest: "g".into(),
+                inspector: "i".into(),
+            },
+            ruleset: PathBuf::from("chamber.nft"),
+            evidence_dir: PathBuf::from("/tmp/ev"),
+            canaries: vec![PlantedCanary {
+                label: "aws-key".into(),
+                value: "AKIAIOSFODNN7EXAMPLE".into(),
+                var: "CHAMBER_TOKEN".into(),
+            }],
+            max_turns: 4,
+            skill_dir: None,
+            consequence,
+        }
+    }
+
+    /// An ordinary run must leave the observer with nothing to find, so it
+    /// keeps refusing. A stray empty variable here would be read as a
+    /// half-configuration and refuse the run outright.
+    #[test]
+    fn a_plan_without_a_consequence_names_neither_variable() {
+        let pairs = observer_env(&bare_plan(None));
+        assert!(
+            !pairs
+                .iter()
+                .any(|(k, _)| k.starts_with("CHAMBER_CONSEQUENCE")),
+            "an ordinary run offered the observer a consequence variable: {pairs:?}"
+        );
+    }
+
+    /// THE wire. A consequence configured on the host and not written here
+    /// produces an observer that refuses while the operator believes it is
+    /// answering — the failure this feature has to not have, and one that
+    /// nothing downstream would report.
+    #[test]
+    fn a_configured_consequence_reaches_the_observer_intact() {
+        let page = "<!doctype html>\n<title>Starter</title>\n";
+        let plan = bare_plan(Some(ConsequenceResponse::new(200, page).unwrap()));
+        let pairs = observer_env(&plan);
+
+        let read = ConsequenceResponse::from_env_values(
+            pairs
+                .iter()
+                .find(|(k, _)| k == chamber_capture::consequence::STATUS_VAR)
+                .map(|(_, v)| v.as_str()),
+            pairs
+                .iter()
+                .find(|(k, _)| k == chamber_capture::consequence::BODY_B64_VAR)
+                .map(|(_, v)| v.as_str()),
+        )
+        .expect("the pairs the host writes must parse back")
+        .expect("both halves must be present");
+
+        assert_eq!(read.status(), 200);
+        assert_eq!(
+            read.body(),
+            page,
+            "the body did not survive the trip to the observer"
+        );
+    }
+
+    /// The env file is one `KEY=value` line per pair. A raw newline in any
+    /// value ends the line early and docker reads the remainder as further
+    /// variables — silently, with the run still starting.
+    #[test]
+    fn no_observer_variable_carries_a_line_break() {
+        let plan = bare_plan(Some(
+            ConsequenceResponse::new(200, "<html>\n<body>\nhi\n</body>\n").unwrap(),
+        ));
+        for (key, value) in observer_env(&plan) {
+            assert!(
+                !value.contains('\n') && !value.contains('\r'),
+                "{key} carries a line break, which truncates the env file"
+            );
+        }
     }
 }
