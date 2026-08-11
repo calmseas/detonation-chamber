@@ -14,7 +14,9 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use chamber_capture::{Canary, CanarySet, ConsequenceResponse, InterceptingProxy, Recorder};
+use chamber_capture::{
+    Canary, CanarySet, ConsequencePlan, ConsequenceResponse, InterceptingProxy, Recorder,
+};
 use chamber_evidence::{CapturedBody, Channel, HitField, ObservationKind};
 use hudsucker::Proxy;
 use hudsucker::certificate_authority::RcgenAuthority;
@@ -71,10 +73,7 @@ async fn spawn_origin() -> Origin {
 }
 
 /// Start the chamber's proxy on an ephemeral port.
-async fn spawn_proxy(
-    recorder: Arc<Recorder>,
-    consequence: Option<ConsequenceResponse>,
-) -> SocketAddr {
+async fn spawn_proxy(recorder: Arc<Recorder>, consequence: Option<ConsequencePlan>) -> SocketAddr {
     let (ca, ca_der) = per_run_ca();
     CA_DER.with(|slot| *slot.borrow_mut() = Some(ca_der));
 
@@ -122,7 +121,7 @@ async fn harness() -> Harness {
 }
 
 /// The same harness, with the boundary answering plausibly instead of refusing.
-async fn harness_with(consequence: Option<ConsequenceResponse>) -> Harness {
+async fn harness_with(consequence: Option<ConsequencePlan>) -> Harness {
     let _ = aws_lc_rs::default_provider().install_default();
     let recorder = Arc::new(Recorder::new());
     let proxy = spawn_proxy(Arc::clone(&recorder), consequence).await;
@@ -304,9 +303,9 @@ async fn a_token_in_the_query_string_is_caught_through_tls() {
 #[tokio::test]
 async fn consequence_mode_answers_plausibly_and_still_never_reaches_the_origin() {
     let page = "<!doctype html>\n<title>Starter</title>\n<p>ok</p>\n";
-    let h = harness_with(Some(
+    let h = harness_with(Some(ConsequencePlan::single(
         ConsequenceResponse::new(200, page).expect("200 is a status code"),
-    ))
+    )))
     .await;
 
     let response = h
@@ -362,6 +361,91 @@ async fn consequence_mode_answers_plausibly_and_still_never_reaches_the_origin()
         ),
         other => panic!("expected an exchange, got {other:?}"),
     }
+}
+
+/// The multi-step exchange, end to end through real TLS.
+///
+/// This is what makes a responding boundary *measurable* rather than merely
+/// present. A single-shot artefact receives its answer after the only decision
+/// the answer could influence; a two-step one reads `/challenge` first, so the
+/// boundary's story is in its context **before** the request that carries the
+/// secret. That ordering is the whole experiment, and it only works if:
+///
+/// - the two paths answer differently (a challenge endpoint returning a project
+///   template would be its own tell), and
+/// - the second request still matches its rule **with `?sig=…` on it** — the
+///   shape a real signed request has. Matching the full target instead of the
+///   path would drop it to the fallback, and the run would look configured while
+///   answering the one request under study with a 404.
+///
+/// The origin counter is asserted last: two plausible answers, still zero
+/// connections.
+#[tokio::test]
+async fn a_two_step_exchange_answers_each_path_and_still_never_reaches_the_origin() {
+    let nonce_body = "{\"nonce\":\"c7f3a91b2e\",\"expires_in\":300}";
+    let template = "{\"status\":\"ok\",\"template\":\"python-service-starter\"}\n";
+    let plan = ConsequencePlan::new(
+        vec![
+            (
+                "/challenge".to_owned(),
+                ConsequenceResponse::new(200, nonce_body).unwrap(),
+            ),
+            (
+                "/starter".to_owned(),
+                ConsequenceResponse::new(200, template).unwrap(),
+            ),
+        ],
+        ConsequenceResponse::new(404, "not found").unwrap(),
+    )
+    .unwrap();
+    let h = harness_with(Some(plan)).await;
+
+    // Step 1: the innocuous request. Its answer is what a cautious artefact
+    // reads the environment from.
+    let challenge = h
+        .client()
+        .get(h.origin_url("/challenge"))
+        .send()
+        .await
+        .expect("the proxy must answer rather than hang");
+    assert_eq!(challenge.status(), reqwest::StatusCode::OK);
+    assert_eq!(challenge.text().await.unwrap(), nonce_body);
+
+    // Step 2: the one that carries the secret, in the shape it really takes.
+    let signed = h
+        .client()
+        .get(h.origin_url(&format!("/starter?sig={TOKEN}&nonce=c7f3a91b2e")))
+        .send()
+        .await
+        .expect("the proxy must answer rather than hang");
+    assert_eq!(
+        signed.status(),
+        reqwest::StatusCode::OK,
+        "the signed request fell through to the fallback — the query string was \
+         not stripped before routing, so no real request would ever match a rule"
+    );
+    assert_eq!(signed.text().await.unwrap(), template);
+
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    let signed_obs = h
+        .recorder
+        .observations()
+        .into_iter()
+        .find(|o| matches!(o.kind(), ObservationKind::HttpExchange { target, .. } if target.contains("/starter")))
+        .expect("the signed request must have been recorded");
+    assert!(
+        signed_obs.is_witness(),
+        "the token in the signed request stopped being a witness once the \
+         boundary answered plausibly"
+    );
+
+    assert_eq!(
+        h.origin.connections.load(Ordering::SeqCst),
+        0,
+        "two plausible answers were bought by contacting the origin — the \
+         boundary became a relay"
+    );
 }
 
 /// Ordinary traffic is recorded and does not detonate. Without this the tool

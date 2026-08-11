@@ -21,7 +21,7 @@
 
 use std::time::Duration;
 
-use chamber_capture::{ConsequenceResponse, consequence};
+use chamber_capture::{ConsequencePlan, ConsequenceResponse};
 use chamber_run::{AgentPrompt, Model, ModelChoice, ModelError, ModelReply};
 use serde::Deserialize;
 
@@ -479,45 +479,97 @@ impl Transport for HttpsTransport {
 /// sees.
 pub const CONSEQUENCE_BODY_FILE_VAR: &str = "CHAMBER_CONSEQUENCE_BODY_FILE";
 
-/// Reads a consequence configuration from two already-looked-up values.
+/// The status paired with [`CONSEQUENCE_BODY_FILE_VAR`] in the simple surface.
+pub const CONSEQUENCE_STATUS_VAR: &str = "CHAMBER_CONSEQUENCE_STATUS";
+
+/// Where the operator puts a **routed** plan: JSON, one response per path.
 ///
-/// Pure but for the one file read it is named after, so both refusal branches
-/// are testable without touching the process environment — which under edition
-/// 2024 is `unsafe` to write precisely because concurrent tests race on it.
+/// The simple pair above answers every request identically, which removes the
+/// tell but cannot measure it — a single-shot artefact receives its answer after
+/// the only decision the answer could influence. A multi-step exchange needs
+/// different responses from different paths, and a `/challenge` that replied with
+/// a project template would be its own tell.
 ///
-/// `Ok(None)` means neither variable is set: the default, and not an error.
+/// Shape:
+///
+/// ```json
+/// {
+///   "default": {"status": 404, "body": "not found"},
+///   "routes": [
+///     {"path": "/challenge", "status": 200, "body": "{\"nonce\":\"…\"}"},
+///     {"path": "/starter",   "status": 200, "body": "…"}
+///   ]
+/// }
+/// ```
+///
+/// JSON because it escapes the newlines a plausible body is full of, so the file
+/// an operator writes is the bytes the guest receives.
+pub const CONSEQUENCE_SPEC_FILE_VAR: &str = "CHAMBER_CONSEQUENCE_SPEC_FILE";
+
+/// Reads a consequence configuration from already-looked-up values.
+///
+/// Two surfaces, and they are mutually exclusive:
+/// - `status` + `body_file` — one response for everything.
+/// - `spec_file` — a routed plan.
+///
+/// Pure but for the one file read, so every refusal branch is testable without
+/// touching the process environment — which under edition 2024 is `unsafe` to
+/// write precisely because concurrent tests race on it.
+///
+/// `Ok(None)` means nothing is set: the default, and not an error.
 ///
 /// # Errors
-/// A message fit for a terminal if exactly one of the pair is set, the status is
-/// not a number or not a status code, or the body file cannot be read.
+/// A message fit for a terminal if the two surfaces are mixed, if exactly one of
+/// the simple pair is set, if a status is not a status code, or if a file cannot
+/// be read or parsed.
 pub fn consequence_from_values(
     status: Option<&str>,
     body_file: Option<&str>,
-) -> Result<Option<ConsequenceResponse>, String> {
+    spec_file: Option<&str>,
+) -> Result<Option<ConsequencePlan>, String> {
+    // Mixing them is ambiguous, and silently preferring one would hand the
+    // operator a boundary answering something other than what they wrote.
+    if spec_file.is_some() && (status.is_some() || body_file.is_some()) {
+        return Err(format!(
+            "{CONSEQUENCE_SPEC_FILE_VAR} is set together with \
+             {CONSEQUENCE_STATUS_VAR}/{CONSEQUENCE_BODY_FILE_VAR}. Use one surface or \
+             the other: the spec file is the routed plan, the pair is one response for \
+             every path."
+        ));
+    }
+
+    if let Some(path) = spec_file {
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| format!("{CONSEQUENCE_SPEC_FILE_VAR} {path}: {e}"))?;
+        return ConsequencePlan::from_json(&text)
+            .map(Some)
+            .map_err(|e| format!("{CONSEQUENCE_SPEC_FILE_VAR} {path}: {e}"));
+    }
+
     match (status, body_file) {
         (None, None) => Ok(None),
         (Some(status), Some(path)) => {
             let parsed: u16 = status
                 .trim()
                 .parse()
-                .map_err(|_| format!("{} is not a number: {status:?}", consequence::STATUS_VAR))?;
+                .map_err(|_| format!("{CONSEQUENCE_STATUS_VAR} is not a number: {status:?}"))?;
             let body = std::fs::read_to_string(path)
                 .map_err(|e| format!("{CONSEQUENCE_BODY_FILE_VAR} {path}: {e}"))?;
             ConsequenceResponse::new(parsed, body)
-                .map(Some)
+                .map(|r| Some(ConsequencePlan::single(r)))
                 .map_err(|e| e.to_string())
         }
         // Refused rather than defaulted. A half-configured run answers every
         // request with the 403 tell the operator believed they had removed, and
         // nothing in the evidence afterwards would show the difference.
         (Some(_), None) => Err(format!(
-            "{} is set but {CONSEQUENCE_BODY_FILE_VAR} is not — consequence mode needs \
-             both, and half of it answers every request with the tell you meant to remove",
-            consequence::STATUS_VAR
+            "{CONSEQUENCE_STATUS_VAR} is set but {CONSEQUENCE_BODY_FILE_VAR} is not — \
+             consequence mode needs both, and half of it answers every request with the \
+             tell you meant to remove"
         )),
         (None, Some(_)) => Err(format!(
-            "{CONSEQUENCE_BODY_FILE_VAR} is set but {} is not — consequence mode needs both",
-            consequence::STATUS_VAR
+            "{CONSEQUENCE_BODY_FILE_VAR} is set but {CONSEQUENCE_STATUS_VAR} is not — \
+             consequence mode needs both"
         )),
     }
 }
@@ -526,10 +578,15 @@ pub fn consequence_from_values(
 ///
 /// # Errors
 /// As [`consequence_from_values`].
-pub fn consequence_from_env() -> Result<Option<ConsequenceResponse>, String> {
-    let status = std::env::var(consequence::STATUS_VAR).ok();
+pub fn consequence_from_env() -> Result<Option<ConsequencePlan>, String> {
+    let status = std::env::var(CONSEQUENCE_STATUS_VAR).ok();
     let body_file = std::env::var(CONSEQUENCE_BODY_FILE_VAR).ok();
-    consequence_from_values(status.as_deref(), body_file.as_deref())
+    let spec_file = std::env::var(CONSEQUENCE_SPEC_FILE_VAR).ok();
+    consequence_from_values(
+        status.as_deref(),
+        body_file.as_deref(),
+        spec_file.as_deref(),
+    )
 }
 
 #[cfg(test)]
@@ -579,7 +636,68 @@ mod consequence_config_tests {
     /// not have to know this mode exists.
     #[test]
     fn neither_variable_set_is_off() {
-        assert_eq!(consequence_from_values(None, None), Ok(None));
+        assert_eq!(consequence_from_values(None, None, None), Ok(None));
+    }
+
+    fn scratch(name: &str, text: &str) -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(format!("chamber-consq-{}-{name}", std::process::id()));
+        std::fs::write(&p, text).expect("write the fixture");
+        p
+    }
+
+    /// The routed surface, which is what makes a multi-step fixture possible:
+    /// `/challenge` and `/starter` must be able to answer differently, or the
+    /// challenge endpoint replying with a project template becomes its own tell.
+    #[test]
+    fn a_spec_file_builds_a_routed_plan() {
+        let spec = scratch(
+            "spec.json",
+            r#"{"default":{"status":404,"body":"nope"},
+                "routes":[{"path":"/challenge","status":200,"body":"{\"nonce\":\"c7f3\"}"},
+                          {"path":"/starter","status":200,"body":"tmpl\nwith\nnewlines\n"}]}"#,
+        );
+        let plan = consequence_from_values(None, None, Some(&spec.to_string_lossy()))
+            .expect("a readable, valid spec is a valid configuration")
+            .expect("the spec was set, so this is Some");
+
+        assert_eq!(
+            plan.response_for("/challenge").body(),
+            "{\"nonce\":\"c7f3\"}"
+        );
+        assert_eq!(
+            plan.response_for("/starter").body(),
+            "tmpl\nwith\nnewlines\n"
+        );
+        assert_eq!(plan.response_for("/elsewhere").status(), 404);
+        let _ = std::fs::remove_file(&spec);
+    }
+
+    /// Mixing the surfaces is ambiguous. Silently preferring one would leave the
+    /// boundary answering something other than what the operator wrote — in a
+    /// run whose entire purpose is that the responses are exactly right.
+    #[test]
+    fn mixing_the_two_surfaces_is_refused() {
+        let err = consequence_from_values(Some("200"), Some("/a"), Some("/b")).unwrap_err();
+        assert!(
+            err.contains(CONSEQUENCE_SPEC_FILE_VAR),
+            "the refusal must name the conflict: {err}"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_spec_file_is_refused() {
+        let err = consequence_from_values(None, None, Some("/no/such/spec.json")).unwrap_err();
+        assert!(err.contains("/no/such/spec.json"), "{err}");
+    }
+
+    /// A spec whose JSON is wrong must stop the run, not silently degrade to the
+    /// fallback for every path.
+    #[test]
+    fn a_malformed_spec_file_is_refused() {
+        let spec = scratch("bad.json", "{\"routes\": []}");
+        let err = consequence_from_values(None, None, Some(&spec.to_string_lossy())).unwrap_err();
+        assert!(err.contains("JSON") || err.contains("json"), "{err}");
+        let _ = std::fs::remove_file(&spec);
     }
 
     /// The dangerous half-configuration. It looks configured, it would start
@@ -587,7 +705,7 @@ mod consequence_config_tests {
     /// believed they had removed — invalidating the whole realism run silently.
     #[test]
     fn a_status_without_a_body_file_is_refused() {
-        let err = consequence_from_values(Some("200"), None).unwrap_err();
+        let err = consequence_from_values(Some("200"), None, None).unwrap_err();
         assert!(
             err.contains("needs") && err.contains(CONSEQUENCE_BODY_FILE_VAR),
             "the refusal must name the missing variable: {err}"
@@ -596,9 +714,9 @@ mod consequence_config_tests {
 
     #[test]
     fn a_body_file_without_a_status_is_refused() {
-        let err = consequence_from_values(None, Some("/nonexistent")).unwrap_err();
+        let err = consequence_from_values(None, Some("/nonexistent"), None).unwrap_err();
         assert!(
-            err.contains(consequence::STATUS_VAR),
+            err.contains(CONSEQUENCE_STATUS_VAR),
             "the refusal must name the missing variable: {err}"
         );
     }
@@ -608,7 +726,8 @@ mod consequence_config_tests {
     /// itself and the operator none the wiser.
     #[test]
     fn an_unreadable_body_file_is_refused_not_defaulted() {
-        let err = consequence_from_values(Some("200"), Some("/no/such/page.html")).unwrap_err();
+        let err =
+            consequence_from_values(Some("200"), Some("/no/such/page.html"), None).unwrap_err();
         assert!(
             err.contains("/no/such/page.html"),
             "the refusal must name the path that could not be read: {err}"
@@ -617,7 +736,7 @@ mod consequence_config_tests {
 
     #[test]
     fn a_non_numeric_status_is_refused() {
-        assert!(consequence_from_values(Some("OK"), Some("/no/such/page.html")).is_err());
+        assert!(consequence_from_values(Some("OK"), Some("/no/such/page.html"), None).is_err());
     }
 
     /// The body reaches the configuration byte for byte, newlines included —
@@ -629,12 +748,13 @@ mod consequence_config_tests {
             std::env::temp_dir().join(format!("chamber-consequence-{}.html", std::process::id()));
         std::fs::write(&path, page).expect("write the fixture page");
 
-        let configured = consequence_from_values(Some("200"), Some(&path.to_string_lossy()))
+        let configured = consequence_from_values(Some("200"), Some(&path.to_string_lossy()), None)
             .expect("a readable page and a real status is a valid configuration")
             .expect("both halves were set, so this is Some");
 
-        assert_eq!(configured.status(), 200);
-        assert_eq!(configured.body(), page);
+        // A single-response plan answers every path with it.
+        assert_eq!(configured.response_for("/anything").status(), 200);
+        assert_eq!(configured.response_for("/anything").body(), page);
         let _ = std::fs::remove_file(&path);
     }
 }

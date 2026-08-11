@@ -23,9 +23,7 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use chamber_capture::{Canary, CanarySet};
-use chamber_model::{
-    CONSEQUENCE_BODY_FILE_VAR, DEFAULT_MODEL, HttpsTransport, OpenRouterModel, consequence_from_env,
-};
+use chamber_model::{DEFAULT_MODEL, HttpsTransport, OpenRouterModel, consequence_from_env};
 use chamber_run::{
     AgentBrief, Budget, DetonationPlan, ImageTags, LiveTurns, PlantedCanary, run_detonation,
 };
@@ -65,11 +63,21 @@ fn usage() -> ExitCode {
     eprintln!("  CHAMBER_TURN_DUMP    path to append a local, git-ignored JSONL record of");
     eprintln!("                        every turn's full prompt and response text (debug");
     eprintln!("                        only — contains the canary in cleartext; off unless set)");
-    eprintln!("  CHAMBER_CONSEQUENCE_STATUS     with _BODY_FILE, answer intercepted requests");
-    eprintln!("  CHAMBER_CONSEQUENCE_BODY_FILE  with this fabricated response instead of the");
-    eprintln!("                        403 that tells the artefact it is being watched. Both or");
-    eprintln!("                        neither; one alone refuses to start. Grants NO egress —");
-    eprintln!("                        the boundary builds the answer, it never fetches it.");
+    eprintln!("  CHAMBER_CONSEQUENCE_STATUS     with _BODY_FILE, answer EVERY intercepted");
+    eprintln!("  CHAMBER_CONSEQUENCE_BODY_FILE  request with this fabricated response instead of");
+    eprintln!("                        the 403 that tells the artefact it is being watched. Both");
+    eprintln!("                        or neither; one alone refuses to start.");
+    eprintln!("  CHAMBER_CONSEQUENCE_SPEC_FILE  a ROUTED plan (JSON): one response per path, plus");
+    eprintln!("                        a default. Needed for a multi-step exchange, where a");
+    eprintln!("                        /challenge answering with a template is its own tell.");
+    eprintln!(
+        "                        {{\"default\":{{\"status\":404,\"body\":\"…\"}},\"routes\":"
+    );
+    eprintln!(
+        "                         [{{\"path\":\"/challenge\",\"status\":200,\"body\":\"…\"}}]}}"
+    );
+    eprintln!("                        Mutually exclusive with the pair above. Grants NO egress —");
+    eprintln!("                        the boundary builds every answer, it never fetches one.");
     ExitCode::from(BAD_INVOCATION)
 }
 
@@ -184,13 +192,24 @@ async fn main() -> ExitCode {
     // Said on the host too, not only inside the observer: whoever reads this
     // terminal is the person who will interpret the run, and the two modes
     // produce identical-looking evidence.
-    if let Some(c) = &consequence {
+    if let Some(plan) = &consequence {
         eprintln!(
-            "chamber: consequence mode — the boundary answers {} with {} byte(s) from \
-             {}, instead of refusing. Still no egress: the answer is fabricated.",
-            c.status(),
-            c.body().len(),
-            std::env::var(CONSEQUENCE_BODY_FILE_VAR).unwrap_or_default()
+            "chamber: consequence mode — the boundary fabricates responses instead of \
+             refusing. Still no egress: every answer is built, never fetched."
+        );
+        for path in plan.route_paths() {
+            let r = plan.response_for(path);
+            eprintln!(
+                "chamber:   {path} -> {} ({} byte(s))",
+                r.status(),
+                r.body().len()
+            );
+        }
+        let f = plan.fallback();
+        eprintln!(
+            "chamber:   (any other path) -> {} ({} byte(s))",
+            f.status(),
+            f.body().len()
         );
     }
 

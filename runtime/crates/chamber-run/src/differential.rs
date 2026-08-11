@@ -28,7 +28,7 @@ use chamber_evidence::{
     CapturedBody, Channel, CoverageGap, GapCause, Observation, ObservationKind, RunEnding, Verdict,
 };
 
-use chamber_capture::ConsequenceResponse;
+use chamber_capture::ConsequencePlan;
 
 use crate::run::{ArmingRefusal, ImageTags, PlantedCanary};
 use crate::turns::TurnSource;
@@ -2341,7 +2341,7 @@ pub struct DifferentialPlan {
     /// that saw plausible 200s against one that saw 403s would diverge because
     /// of the boundary rather than because of the candidate, and the subtraction
     /// would report that difference as the artefact's behaviour.
-    pub consequence: Option<ConsequenceResponse>,
+    pub consequence: Option<ConsequencePlan>,
 }
 
 /// Why no differential happened.

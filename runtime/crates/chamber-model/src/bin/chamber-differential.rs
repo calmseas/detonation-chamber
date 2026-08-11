@@ -354,12 +354,24 @@ async fn main() -> ExitCode {
             return ExitCode::from(BAD_INVOCATION);
         }
     };
-    if let Some(c) = &consequence {
+    if let Some(plan) = &consequence {
         eprintln!(
-            "chamber: consequence mode — BOTH arms meet a boundary answering {} with \
-             {} fabricated byte(s), instead of refusing. Still no egress.",
-            c.status(),
-            c.body().len()
+            "chamber: consequence mode — BOTH arms meet a boundary that fabricates \
+             responses instead of refusing. Still no egress."
+        );
+        for path in plan.route_paths() {
+            let r = plan.response_for(path);
+            eprintln!(
+                "chamber:   {path} -> {} ({} byte(s))",
+                r.status(),
+                r.body().len()
+            );
+        }
+        let f = plan.fallback();
+        eprintln!(
+            "chamber:   (any other path) -> {} ({} byte(s))",
+            f.status(),
+            f.body().len()
         );
     }
 

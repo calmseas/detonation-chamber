@@ -41,7 +41,7 @@ pub mod recorder;
 pub mod writer;
 
 pub use canary::{Canary, CanarySet};
-pub use consequence::{ConsequenceConfigError, ConsequenceResponse};
+pub use consequence::{ConsequenceConfigError, ConsequencePlan, ConsequenceResponse};
 #[cfg(feature = "observer")]
 pub use dns::DnsSink;
 #[cfg(feature = "observer")]

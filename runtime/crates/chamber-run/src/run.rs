@@ -29,7 +29,7 @@ use std::cell::RefCell;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use chamber_capture::ConsequenceResponse;
+use chamber_capture::ConsequencePlan;
 use chamber_deadline::{StageTrace, Window};
 use chamber_evidence::Verdict;
 use chamber_isolation::{
@@ -109,7 +109,7 @@ pub struct DetonationPlan {
     /// tell that a 403 from every host would otherwise hand an eval-aware
     /// model. It grants no egress — the response is built inside the observer,
     /// and the request is discarded there exactly as a refused one is.
-    pub consequence: Option<ConsequenceResponse>,
+    pub consequence: Option<ConsequencePlan>,
 }
 
 /// Why no run happened.
@@ -846,7 +846,7 @@ mod tests {
 
     // ---- what the observer is told ----------------------------------------
 
-    fn bare_plan(consequence: Option<ConsequenceResponse>) -> DetonationPlan {
+    fn bare_plan(consequence: Option<ConsequencePlan>) -> DetonationPlan {
         DetonationPlan {
             images: ImageTags {
                 capture: "c".into(),
@@ -888,28 +888,38 @@ mod tests {
     #[test]
     fn a_configured_consequence_reaches_the_observer_intact() {
         let page = "<!doctype html>\n<title>Starter</title>\n";
-        let plan = bare_plan(Some(ConsequenceResponse::new(200, page).unwrap()));
-        let pairs = observer_env(&plan);
+        let nonce = "{\"nonce\":\"c7f3a91b\"}";
+        let configured = ConsequencePlan::new(
+            vec![
+                (
+                    "/challenge".to_owned(),
+                    chamber_capture::ConsequenceResponse::new(200, nonce).unwrap(),
+                ),
+                (
+                    "/starter".to_owned(),
+                    chamber_capture::ConsequenceResponse::new(200, page).unwrap(),
+                ),
+            ],
+            chamber_capture::ConsequenceResponse::new(404, "not found").unwrap(),
+        )
+        .unwrap();
+        let pairs = observer_env(&bare_plan(Some(configured.clone())));
 
-        let read = ConsequenceResponse::from_env_values(
+        let read = ConsequencePlan::from_env_value(
             pairs
                 .iter()
-                .find(|(k, _)| k == chamber_capture::consequence::STATUS_VAR)
-                .map(|(_, v)| v.as_str()),
-            pairs
-                .iter()
-                .find(|(k, _)| k == chamber_capture::consequence::BODY_B64_VAR)
+                .find(|(k, _)| k == chamber_capture::consequence::SPEC_B64_VAR)
                 .map(|(_, v)| v.as_str()),
         )
         .expect("the pairs the host writes must parse back")
-        .expect("both halves must be present");
+        .expect("the spec must be present");
 
-        assert_eq!(read.status(), 200);
-        assert_eq!(
-            read.body(),
-            page,
-            "the body did not survive the trip to the observer"
-        );
+        // The whole routed plan survives, not merely one response: a multi-step
+        // fixture is only measurable if every path's answer arrives intact.
+        assert_eq!(read, configured);
+        assert_eq!(read.response_for("/challenge").body(), nonce);
+        assert_eq!(read.response_for("/starter").body(), page);
+        assert_eq!(read.response_for("/other").status(), 404);
     }
 
     /// The env file is one `KEY=value` line per pair. A raw newline in any
@@ -917,9 +927,10 @@ mod tests {
     /// variables — silently, with the run still starting.
     #[test]
     fn no_observer_variable_carries_a_line_break() {
-        let plan = bare_plan(Some(
-            ConsequenceResponse::new(200, "<html>\n<body>\nhi\n</body>\n").unwrap(),
-        ));
+        let plan = bare_plan(Some(ConsequencePlan::single(
+            chamber_capture::ConsequenceResponse::new(200, "<html>\n<body>\nhi\n</body>\n")
+                .unwrap(),
+        )));
         for (key, value) in observer_env(&plan) {
             assert!(
                 !value.contains('\n') && !value.contains('\r'),

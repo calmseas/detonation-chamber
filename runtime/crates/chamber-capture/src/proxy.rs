@@ -40,7 +40,7 @@ use hudsucker::{Body, HttpContext, HttpHandler, RequestOrResponse};
 use sha2::{Digest, Sha256};
 
 use crate::CanarySet;
-use crate::consequence::ConsequenceResponse;
+use crate::consequence::{ConsequencePlan, ConsequenceResponse};
 use crate::recorder::Recorder;
 
 /// How much of a body is retained in the bundle.
@@ -68,7 +68,7 @@ pub struct InterceptingProxy {
     /// — the default — is the 403, and is what an ordinary detonation uses.
     /// `Some` is a **fabricated** response, never a forwarded one: see
     /// [`crate::consequence`].
-    consequence: Option<ConsequenceResponse>,
+    consequence: Option<ConsequencePlan>,
 }
 
 impl InterceptingProxy {
@@ -102,7 +102,7 @@ impl InterceptingProxy {
     /// the operator supplied, and the request that prompted it is discarded at
     /// the boundary exactly as a refused one is.
     #[must_use]
-    pub fn with_consequence(mut self, consequence: Option<ConsequenceResponse>) -> Self {
+    pub fn with_consequence(mut self, consequence: Option<ConsequencePlan>) -> Self {
         self.consequence = consequence;
         self
     }
@@ -189,7 +189,11 @@ impl InterceptingProxy {
         // consequence mode changes is what the guest is *told*, and both
         // answers are built from bytes this process already holds.
         RequestOrResponse::Response(match &self.consequence {
-            Some(configured) => Self::fabricate(configured),
+            // Routed on the PATH, with the query dropped. The requests under
+            // study carry `?sig=…`; matching the whole target would miss every
+            // one of them and quietly serve the fallback, so the run would look
+            // configured while answering the one request that matters with a 404.
+            Some(plan) => Self::fabricate(plan.response_for(parts.uri.path())),
             None => Self::refusal(),
         })
     }
@@ -306,9 +310,9 @@ mod tests {
     const STARTER_PAGE: &str = "<!doctype html>\n<title>Starter</title>\n<p>ok</p>\n";
 
     fn responding_proxy(recorder: &Arc<Recorder>) -> InterceptingProxy {
-        proxy(recorder).with_consequence(Some(
+        proxy(recorder).with_consequence(Some(ConsequencePlan::single(
             ConsequenceResponse::new(200, STARTER_PAGE).expect("200 is a status code"),
-        ))
+        )))
     }
 
     async fn body_of(res: Response<Body>) -> String {
@@ -416,6 +420,55 @@ mod tests {
             }
             RequestOrResponse::Request(_) => {
                 panic!("consequence mode answered by forwarding, which is live egress")
+            }
+        }
+    }
+
+    /// A routed plan picks by path, and does so on a REAL request target —
+    /// absolute-form, with a query string on it, which is the shape an
+    /// intercepted HTTPS request actually arrives in. If the query were not
+    /// stripped, `/starter?sig=…` would match no rule and quietly receive the
+    /// fallback: the run would look configured while answering the one request
+    /// under study with the wrong thing.
+    #[tokio::test]
+    async fn a_routed_plan_answers_each_path_on_a_real_request_target() {
+        let plan = ConsequencePlan::new(
+            vec![
+                (
+                    "/challenge".to_owned(),
+                    ConsequenceResponse::new(200, "{\"nonce\":\"c7f3\"}").unwrap(),
+                ),
+                (
+                    "/starter".to_owned(),
+                    ConsequenceResponse::new(200, STARTER_PAGE).unwrap(),
+                ),
+            ],
+            ConsequenceResponse::new(404, "not found").unwrap(),
+        )
+        .unwrap();
+
+        let r = Arc::new(Recorder::new());
+        let p = proxy(&r).with_consequence(Some(plan));
+
+        for (target, expect_status, expect_body) in [
+            (
+                "https://collector.example/challenge",
+                200,
+                "{\"nonce\":\"c7f3\"}",
+            ),
+            (
+                "https://collector.example/starter?sig=abc123",
+                200,
+                STARTER_PAGE,
+            ),
+            ("https://collector.example/unmapped", 404, "not found"),
+        ] {
+            match p.observe_and_decide(post(target, "")).await {
+                RequestOrResponse::Response(res) => {
+                    assert_eq!(res.status().as_u16(), expect_status, "status for {target}");
+                    assert_eq!(body_of(res).await, expect_body, "body for {target}");
+                }
+                RequestOrResponse::Request(_) => panic!("{target} was forwarded"),
             }
         }
     }

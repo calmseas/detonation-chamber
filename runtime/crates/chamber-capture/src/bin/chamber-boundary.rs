@@ -58,7 +58,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chamber_capture::{
-    Canary, CanarySet, ConsequenceResponse, DnsSink, InterceptingProxy, LedgerWriter, Recorder,
+    Canary, CanarySet, ConsequencePlan, DnsSink, InterceptingProxy, LedgerWriter, Recorder,
 };
 use chamber_evidence::{CanaryHit, HitField};
 use hickory_server::Server;
@@ -209,7 +209,7 @@ async fn main() -> ExitCode {
     // Read before anything binds. A half-configured consequence must refuse to
     // arm, and discovering that once the artefact is already running is
     // discovering it too late.
-    let consequence = match ConsequenceResponse::from_env() {
+    let consequence = match ConsequencePlan::from_env() {
         Ok(c) => c,
         Err(e) => {
             eprintln!("chamber-boundary: {e}");
@@ -343,13 +343,28 @@ async fn main() -> ExitCode {
     // be mistaken for real uplink, which is the one misreading this feature
     // could cause.
     match &consequence {
-        Some(c) => say(&format!(
-            "chamber-boundary: CONSEQUENCE MODE — intercepted requests are answered \
-             {} with {} fabricated byte(s) instead of refused. Nothing is forwarded \
-             to an origin; the request still dies here.",
-            c.status(),
-            c.body().len()
-        )),
+        Some(plan) => {
+            let routes = plan.route_paths();
+            say(
+                "chamber-boundary: CONSEQUENCE MODE — intercepted requests are answered \
+                 with fabricated responses instead of refused. Nothing is forwarded to \
+                 an origin; the request still dies here.",
+            );
+            for path in &routes {
+                let r = plan.response_for(path);
+                say(&format!(
+                    "chamber-boundary:   {path} -> {} ({} byte(s))",
+                    r.status(),
+                    r.body().len()
+                ));
+            }
+            let f = plan.fallback();
+            say(&format!(
+                "chamber-boundary:   (any other path) -> {} ({} byte(s))",
+                f.status(),
+                f.body().len()
+            ));
+        }
         None => say("chamber-boundary: intercepted requests are refused (403)"),
     }
     say("LISTENING");
