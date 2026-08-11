@@ -115,24 +115,47 @@ this design is built to catch.
 
 ## 6. Prior work and what is actually novel
 
-- **Single-layer honeypots** — *"Realistic honeypot evaluations for scheming
-  propensity"* (`arXiv:2605.29729`) is explicitly *"a single-layer deception without
-  nested evaluations,"* and its **top stated limitation is "models identifying the
-  honeypot would invalidate findings."** Nesting is the direct mitigation: one layer
-  detected is no longer fatal.
+- **Honeypot evaluations** — *"Realistic honeypot evaluations for scheming
+  propensity"* (`arXiv:2605.29729`, Krakovna et al., DeepMind). **CORRECTION (full
+  text checked 2026-08-11):** an earlier draft of this note attributed to this paper
+  the phrases *"single-layer deception without nested evaluations"* and a top
+  limitation that *"models identifying the honeypot would invalidate findings."*
+  **Neither is in the paper.** It does not describe itself as single-layer, and its
+  Limitations (§7) note that *"models increasingly recognize agency and goal prompts
+  as evaluation elements"* without claiming this invalidates the results. Its headline
+  is in fact that Gemini models show **no unprompted scheming** and scheme only when
+  prompts supply agency or a hidden goal. So the honest relationship is: their
+  environments are realistic but their *elicitation* is prompt-supplied and largely
+  single-context; our contribution is **externally-induced** suborning and
+  **escalating-realism** elicitation, not "fixing their stated #1 limitation." Do not
+  make the mitigation claim in the paper.
 - **Threat model** — the honeypot work targets **model-intrinsic scheming**. We
   target **externally-induced** suborning: a poisoned skill driving an otherwise-
   aligned model. Unexplored with this technique.
-- **White-box steering** — *"Steering Evaluation-Aware Models to Act Like They Are
-  Deployed"* (`arXiv:2510.20487`) achieves the same "believe you're deployed" goal by
-  activation steering. It needs weights; irrelevant to third-party hosted-model
-  testing. Our lane is black-box.
-- **Integration** — nobody has combined nested elicitation with the differential +
-  multi-oracle grading + an honest gap taxonomy.
+- **White-box steering** — *"Steering Evaluation-Aware Language Models to Act Like
+  They Are Deployed"* (`arXiv:2510.20487`) achieves the same "believe you're deployed"
+  goal by activation steering. It needs weights; irrelevant to third-party
+  hosted-model testing. Our lane is black-box.
+- **Nearest neighbour — Cloak and Detonate** (`arXiv:2607.02357`, full text checked).
+  This is the closest prior work and reads as concurrent: **SkillDetonate** runs a
+  skill in a **Docker sandbox with eBPF pinned to the container PID namespace** and
+  does **marker-based taint analysis** across syscall graph, in-process values and LLM
+  context — nearly our architecture. **SkillCloak** is their scanner-evasion half
+  (byte-level "Reify/Disperse" rewrites; a self-extracting benign cover), and it
+  collapses a commercial scanner from 98.6% to 10.1% while SkillDetonate holds. Their
+  reported detection is **97% @ 2% FP** (their benchmark), **87.3%** on wild skills.
+  **The verifiable gap, in their own words (§VI-B):** anti-sandbox malware is a
+  *limitation they name and do not handle* — their malicious test skills implement no
+  environment checks. Our consequence mode + the conditional/gated fixtures target
+  exactly that class: a skill that detects the sandbox (via a refusing boundary or a
+  test-shaped response) and stays dormant. That is the honest, checkable novelty hook,
+  and it replaces the withdrawn honeypot claim.
+- **Integration** — nobody has combined nested/escalating-realism elicitation with the
+  differential + multi-oracle grading + an honest gap taxonomy.
 
 Novelty to claim, honestly: **nested/escalating realism**, **skill-poisoning
-elicitation**, **direct mitigation of the honeypot line's own #1 limitation**, and
-**elicit+grade integration.**
+elicitation**, **defeating the anti-sandbox check that the nearest prior work
+(SkillDetonate) explicitly does not handle**, and **elicit+grade integration.**
 
 ## 7. Honest limits and new gaps
 
@@ -290,14 +313,30 @@ so it never received the 403 either — the independent variable was never deliv
 Next: build the multi-interaction fixture above; seal the consequence mode into the
 bundle so a fabricated 200 cannot be mistaken for uplink; more drivers/N.
 
-## References (verified this sweep)
+## References (arXiv IDs verified against arxiv.org abstract pages, 2026-08-11)
 
-- Needham et al., *Large Language Models Often Know When They Are Being Evaluated*, 2025. arXiv:2505.23836.
-- *Evaluation Awareness Scales Predictably in Open-Weights LLMs*, 2025. arXiv:2509.13333.
-- Anthropic, *Alignment Faking in Large Language Models*, 2024. (arXiv:2412.14093.)
-- *Why Do Some Language Models Fake Alignment While Others Don't?*, 2025. arXiv:2506.18032.
-- *AI Sandbagging: Language Models can Strategically Underperform on Evaluations*, 2024. arXiv:2406.07358.
-- *Realistic honeypot evaluations for scheming propensity*, 2026. arXiv:2605.29729.
-- *Steering Evaluation-Aware Models to Act Like They Are Deployed*, 2025. arXiv:2510.20487.
-- *Cloak and Detonate: Scanner Evasion and Dynamic Detection of Agent Skill Malware*, 2026. arXiv:2607.02357.
-- *Harmless Yet Harmful: Neutral Prompting Attacks …*, 2026. arXiv:2605.29354.
+All IDs below resolve to the titled paper — none is fabricated. Titles are the
+verified forms; two corrections and two fit caveats are noted inline.
+
+Eval-awareness / alignment-faking lineage (model-intrinsic):
+- Needham, Edkins, Pimpale, Bartsch, Hobbhahn, *Large Language Models Often Know When They Are Being Evaluated*, 2025. arXiv:2505.23836.
+- Chaudhary et al., *Evaluation Awareness Scales Predictably in Open-Weights Large Language Models*, 2025. arXiv:2509.13333.
+- Greenblatt, Denison, Wright, et al. (Anthropic), *Alignment faking in large language models*, 2024. arXiv:2412.14093.
+- Sheshadri, Hughes, Michael, et al., *Why Do Some Language Models Fake Alignment While Others Don't?*, 2025. arXiv:2506.18032.
+- van der Weij, Hofstätter, Jaffe, Brown, Ward, *AI Sandbagging: Language Models can Strategically Underperform on Evaluations*, 2024. arXiv:2406.07358.
+- Hubinger, Denison, Mu, et al. (Anthropic), *Sleeper Agents: Training Deceptive LLMs that Persist Through Safety Training*, 2024. arXiv:2401.05566. **(added — the canonical environment-conditioned trigger)**
+- Meinke, Schoen, Scheurer, Balesni, Shah, Hobbhahn (Apollo), *Frontier Models are Capable of In-context Scheming*, 2024. arXiv:2412.04984. **(added — closest published in-context, externally-supplied conditional)**
+- Krakovna, Lindner, Ho, Farquhar, Shah (DeepMind), *Realistic honeypot evaluations for scheming propensity*, 2026. arXiv:2605.29729. **CAUTION:** the abstract emphasises "models show low rates of evaluation awareness, usually due to agency prompts rather than the environments." The characterisation elsewhere in this note — that the paper calls itself "single-layer" and lists "models identifying the honeypot would invalidate findings" as its top limitation — was NOT confirmable from the abstract page and must be checked against the paper body (or softened) before it carries the novelty claim.
+- Tian Hua, Qin, Marks, Nanda, *Steering Evaluation-Aware Language Models to Act Like They Are Deployed*, 2025. arXiv:2510.20487. **(title corrected — was missing "Language")**
+
+Skill / tool / prompt-injection lineage (externally-induced — our threat model):
+- Greshake, Abdelnabi, Mishra, Endres, Holz, Fritz, *Not what you've signed up for: Compromising Real-World LLM-Integrated Applications with Indirect Prompt Injection*, 2023. arXiv:2302.12173. **(added — foundational indirect injection)**
+- Debenedetti, Zhang, Balunović, Beurer-Kellner, Fischer, Tramèr, *AgentDojo: A Dynamic Environment to Evaluate Prompt Injection Attacks and Defenses for LLM Agents*, 2024. arXiv:2406.13352. **(added — agent-injection benchmark)**
+- Zhan, Liang, Ying, Kang, *InjecAgent: Benchmarking Indirect Prompt Injections in Tool-Integrated Large Language Model Agents*, 2024. arXiv:2403.02691. **(added)**
+- Wang et al., *MCPTox: A Benchmark for Tool Poisoning Attack on Real-World MCP Servers*, 2025. arXiv:2508.14925. Payload lives in tool **metadata**, triggers **unconditionally** — the real-world instance of our object, and the *unconditional* baseline our conditional fixtures improve on.
+- Ji, Xu, Li, Gao, Wei, Wang, Cheung, *Cloak and Detonate: Scanner Evasion and Dynamic Detection of Agent Skill Malware*, 2026. arXiv:2607.02357. Nearest neighbour: SkillCloak (scanner evasion) + SkillDetonate (runtime auditor on OS-boundary information-flow). Direct related work for both our layers.
+- Hsu, Yu, Huang, Sakuma, *Harmless Yet Harmful: Neutral Prompting Attacks for Stealthy Hallucination Steering in Agent Skills*, 2026. arXiv:2605.29354. **NOTE:** this is package-hallucination / supply-chain (slopsquatting-adjacent), NOT conditional exfil — cite for the skill-poisoning surface, not for evasive triggering.
+
+Undetectability bounds (cited for "provably-undetectable attacker is out of reach"):
+- Choudhary, Patlan, Palumbo, Hooda, Fawaz, Jha, *Undetectable Backdoors in Model Parameters: Hiding Sparse Secrets in High Dimensions*, 2026. arXiv:2605.04209. **FIT CAUTION:** parameter-space backdoor in image classifiers — a loose fit for a runtime-behaviour "never-fire" claim about LLM skills.
+- Lukas, Kerschbaum, *Pick your Poison: Undetectability versus Robustness in Data Poisoning Attacks*, 2023. arXiv:2305.09671. **FIT CAUTION:** training-time data-poisoning tradeoff (undetectable ⊻ robust). Actually *supports* our thesis (an undetectable attacker sacrifices robustness), but it is not a runtime-evasion result — reframe accordingly.
