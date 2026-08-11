@@ -371,8 +371,8 @@ fn is_uncompared(observation: &Observation) -> bool {
 /// ugly: `path` is compared verbatim and case-sensitively, while an authority is
 /// case-*insensitive*, so a candidate that spelled the host differently from the
 /// reference would produce a lead with no behavioural difference behind it.
-fn split_target(target: &str) -> (String, Vec<String>) {
-    let path_part = match target.split_once("://") {
+fn normalise_target(target: &str) -> &str {
+    match target.split_once("://") {
         // Absolute-form: the path begins at the first `/` after the authority,
         // and a bare `https://host` has none.
         Some((_, after_scheme)) => after_scheme.find('/').map_or("", |at| &after_scheme[at..]),
@@ -380,8 +380,11 @@ fn split_target(target: &str) -> (String, Vec<String>) {
         None if target.starts_with('/') => target,
         // Authority-form: CONNECT carries `host:port` and no path.
         None => "",
-    };
+    }
+}
 
+fn split_target(target: &str) -> (String, Vec<String>) {
+    let path_part = normalise_target(target);
     let (path, query) = path_part.split_once('?').unwrap_or((path_part, ""));
     let mut keys: Vec<String> = query
         .split('&')
@@ -391,6 +394,28 @@ fn split_target(target: &str) -> (String, Vec<String>) {
     keys.sort();
     keys.dedup();
     (path.to_owned(), keys)
+}
+
+/// A value-preserving sibling of [`split_target`], for the (advisory,
+/// off-evidence) value-entropy signal only.
+///
+/// Shares the same three-form target normalisation — see [`split_target`]'s
+/// doc comment for why a proxy needs it — and differs only in the one place
+/// that matters: it keeps the value after `=` instead of discarding it.
+/// [`split_target`] itself must stay value-blind (`gap.shape-value-blind`);
+/// this sibling exists precisely because the entropy signal is the one
+/// consumer allowed to look at a value.
+fn query_pairs(target: &str) -> Vec<(String, String)> {
+    let path_part = normalise_target(target);
+    let query = path_part.split_once('?').map_or("", |(_, q)| q);
+    query
+        .split('&')
+        .filter(|pair| !pair.is_empty())
+        .map(|pair| match pair.split_once('=') {
+            Some((k, v)) => (k.to_owned(), v.to_owned()),
+            None => (pair.to_owned(), String::new()),
+        })
+        .collect()
 }
 
 /// Shapes the candidate produced that its same-class reference did not.
@@ -668,16 +693,22 @@ pub fn activity_of(opened: &chamber_evidence::OpenedBundle) -> ArmActivity {
     }
 }
 
-/// Opens one arm's bundle from its paths and tallies its activity.
+/// Opens one arm's bundle from its paths, re-deriving it from its own bytes —
+/// never trusting a stored summary.
 ///
 /// The same open-from-paths pattern [`recheck_differential`] uses: read both
-/// files, parse the seal, then `chamber_evidence::open` — the bundle is
-/// re-derived from its own bytes, never trusted as read.
+/// files, parse the seal, then `chamber_evidence::open`. Shared by
+/// [`arm_activity`] and the (advisory, off-evidence) value-entropy signal in
+/// this module, which needs the opened bundle itself rather than a tally
+/// derived from it.
 ///
 /// # Errors
 /// [`RecheckRefusal::ArmUnreadable`] if either file cannot be read, the seal
 /// does not parse, or the bundle does not open against it.
-pub fn arm_activity(bundle_path: &Path, seal_path: &Path) -> Result<ArmActivity, RecheckRefusal> {
+pub fn open_arm(
+    bundle_path: &Path,
+    seal_path: &Path,
+) -> Result<chamber_evidence::OpenedBundle, RecheckRefusal> {
     let unreadable = |path: &Path, detail: String| RecheckRefusal::ArmUnreadable {
         path: path.display().to_string(),
         detail,
@@ -686,9 +717,16 @@ pub fn arm_activity(bundle_path: &Path, seal_path: &Path) -> Result<ArmActivity,
     let seal_bytes = std::fs::read(seal_path).map_err(|e| unreadable(seal_path, e.to_string()))?;
     let seal: chamber_evidence::BundleSeal =
         serde_json::from_slice(&seal_bytes).map_err(|e| unreadable(seal_path, e.to_string()))?;
-    let opened = chamber_evidence::open(&bytes, &seal)
-        .map_err(|e| unreadable(bundle_path, format!("{e:?}")))?;
-    Ok(activity_of(&opened))
+    chamber_evidence::open(&bytes, &seal).map_err(|e| unreadable(bundle_path, format!("{e:?}")))
+}
+
+/// Opens one arm's bundle from its paths and tallies its activity.
+///
+/// # Errors
+/// [`RecheckRefusal::ArmUnreadable`] if either file cannot be read, the seal
+/// does not parse, or the bundle does not open against it.
+pub fn arm_activity(bundle_path: &Path, seal_path: &Path) -> Result<ArmActivity, RecheckRefusal> {
+    Ok(activity_of(&open_arm(bundle_path, seal_path)?))
 }
 
 #[cfg(test)]
@@ -868,6 +906,316 @@ mod activity_tests {
             &dir.join("does-not-exist.sig"),
         );
         assert!(matches!(result, Err(RecheckRefusal::ArmUnreadable { .. })));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The third axis: value entropy, an experimental advisory lead
+// ---------------------------------------------------------------------------
+
+/// Shannon entropy of `s`'s byte-frequency distribution, in bits per byte:
+/// `-Σ p·log2(p)` over the 256-bin byte histogram.
+///
+/// Pure and total. An empty string is defined as `0.0` rather than the `NaN`
+/// a literal `-Σ` over zero terms would not actually produce (the sum is
+/// empty either way) — spelled out explicitly so the zero case never depends
+/// on the loop happening to do the right thing.
+#[must_use]
+pub fn shannon_entropy_bits_per_byte(s: &str) -> f64 {
+    if s.is_empty() {
+        return 0.0;
+    }
+    let mut counts = [0u32; 256];
+    for &b in s.as_bytes() {
+        counts[b as usize] += 1;
+    }
+    let len = s.len() as f64;
+    counts
+        .iter()
+        .filter(|&&c| c > 0)
+        .map(|&c| {
+            let p = f64::from(c) / len;
+            -p * p.log2()
+        })
+        .sum()
+}
+
+#[cfg(test)]
+mod entropy_scalar_tests {
+    use super::*;
+
+    #[test]
+    fn an_empty_string_is_zero_bits_per_byte() {
+        assert_eq!(shannon_entropy_bits_per_byte(""), 0.0);
+    }
+
+    #[test]
+    fn a_single_repeated_byte_is_zero_bits_per_byte() {
+        assert_eq!(shannon_entropy_bits_per_byte("aaaaaaaaaaaa"), 0.0);
+    }
+
+    /// A base64-looking blob — varied, mostly non-repeating bytes — reads as
+    /// high entropy. This is the shape a canary value XORed and base64'd
+    /// takes (see `E-steg/e2-custom` in the shape-axis tests above).
+    #[test]
+    fn a_base64_looking_blob_is_high_entropy() {
+        // 40 pairwise-distinct bytes (10 digits + 15 lowercase + 15
+        // uppercase, each range contiguous so there is no cross-range
+        // collision to double-check) — entropy is exactly log2(40) ≈ 5.32.
+        let blob = "0123456789abcdefghijklmnoABCDEFGHIJKLMNO";
+        let entropy = shannon_entropy_bits_per_byte(blob);
+        assert!(entropy > 5.0, "expected > 5.0 bits/byte, got {entropy}");
+    }
+
+    /// A short natural-language word reads as low entropy — the case the
+    /// heuristic must not fire on.
+    #[test]
+    fn a_natural_word_is_low_entropy() {
+        let entropy = shannon_entropy_bits_per_byte("starter");
+        assert!(entropy < 3.5, "expected < 3.5 bits/byte, got {entropy}");
+    }
+}
+
+/// Below this, a value does not read as "encoded-looking" enough to flag.
+/// Natural language and short identifiers commonly sit in the 3-4 bits/byte
+/// range; base64/hex/high-entropy blobs commonly clear 5-6. A tunable
+/// heuristic, not a proof — see [`entropy_leads`]'s doc comment for the
+/// blind spot this cannot close.
+const HIGH_ENTROPY_BITS_PER_BYTE: f64 = 4.0;
+
+/// Below this length, entropy is too noisy to mean anything — a handful of
+/// bytes can read as "high entropy" by chance alone. A tunable heuristic.
+const MIN_ENTROPY_LEN: usize = 12;
+
+/// A candidate value that looks encoded where the reference's value for the
+/// same parameter does not, or where the reference never sent that parameter
+/// at all.
+///
+/// Computed at output time from re-opened arm bundles — see [`entropy_leads`]
+/// — and never stored in [`DifferentialBundle`]. An experimental, advisory
+/// heuristic distinct from [`ShapeLead`]: shape compares parameter *names*
+/// off the signed evidence; this compares a per-value *statistic* off
+/// bundles re-opened after the fact, and is a lead in the same sense
+/// [`ShapeLead`] is — never a verdict, never wired to the exit code.
+#[derive(Clone, Debug, PartialEq)]
+pub struct EntropyLead {
+    pub class: ArmClass,
+    pub param: String,
+    pub candidate_entropy: f64,
+    /// `None` means the reference never sent this parameter at all.
+    pub reference_entropy: Option<f64>,
+}
+
+/// Value-entropy leads: parameters the candidate sent a high-entropy value
+/// for, where the reference either omitted the parameter or sent it at low
+/// entropy.
+///
+/// # Why this is off the sealed evidence
+///
+/// Each arm mints a **fresh** canary value (D5), so raw values can never be
+/// compared across arms — the same reasoning that keeps [`RequestShape`]
+/// value-blind. What survives that constraint is a per-value *statistic*:
+/// how encoded-looking a value looks, independent of what it actually says.
+/// That is weaker evidence than a name match, which is why this lives beside
+/// the shape axis rather than inside it, and is computed fresh from the arm
+/// bundles at output time rather than sealed into [`DifferentialBundle`].
+///
+/// # The matched blind spot — read `a_high_entropy_reference_value_defeats_the_signal`
+///
+/// A benign reference that *also* sends a high-entropy value for the same
+/// parameter defeats this signal by design: two arms disagreeing on which
+/// specific blob is "high entropy" proves nothing, so no lead fires. That is
+/// the honest limit of a statistic that cannot see values, not a bug —
+/// exactly the shape axis's `gap.shape-value-blind` one layer down.
+#[must_use]
+pub fn entropy_leads(
+    candidate: &chamber_evidence::OpenedBundle,
+    reference: &chamber_evidence::OpenedBundle,
+    class: ArmClass,
+) -> Vec<EntropyLead> {
+    let candidate_values = max_value_entropy(candidate);
+    let reference_values = max_value_entropy(reference);
+
+    candidate_values
+        .into_iter()
+        .filter(|(_, (entropy, len))| {
+            *entropy >= HIGH_ENTROPY_BITS_PER_BYTE && *len >= MIN_ENTROPY_LEN
+        })
+        .filter_map(|(param, (candidate_entropy, _))| {
+            let reference_entropy = reference_values.get(&param).map(|&(entropy, _)| entropy);
+            // The matched defeat: a reference that also sent a high-entropy
+            // value for this param is not a difference this signal can see.
+            if reference_entropy.is_some_and(|e| e >= HIGH_ENTROPY_BITS_PER_BYTE) {
+                return None;
+            }
+            Some(EntropyLead {
+                class,
+                param,
+                candidate_entropy,
+                reference_entropy,
+            })
+        })
+        .collect()
+}
+
+/// The highest value-entropy seen for each query parameter an arm's
+/// `HttpExchange` observations carried, paired with the byte length of the
+/// value that achieved it.
+///
+/// A `BTreeMap` rather than a `HashMap`: iteration order over the result
+/// must be deterministic, since [`entropy_leads`] builds its output directly
+/// from it and a reader-facing advisory list should not reorder between
+/// runs over the same evidence.
+fn max_value_entropy(
+    opened: &chamber_evidence::OpenedBundle,
+) -> std::collections::BTreeMap<String, (f64, usize)> {
+    let mut best: std::collections::BTreeMap<String, (f64, usize)> =
+        std::collections::BTreeMap::new();
+    for observation in opened.ledger.entries() {
+        let ObservationKind::HttpExchange { target, .. } = observation.kind() else {
+            continue;
+        };
+        for (param, value) in query_pairs(target) {
+            let entropy = shannon_entropy_bits_per_byte(&value);
+            let len = value.len();
+            best.entry(param)
+                .and_modify(|(best_entropy, best_len)| {
+                    if entropy > *best_entropy {
+                        *best_entropy = entropy;
+                        *best_len = len;
+                    }
+                })
+                .or_insert((entropy, len));
+        }
+    }
+    best
+}
+
+#[cfg(test)]
+mod entropy_lead_tests {
+    use super::*;
+    use chamber_evidence::{
+        ChannelCoverage, CoverageMap, ObservationKind, Ordinal, RunLog, RunSecret,
+    };
+
+    // 40 pairwise-distinct bytes, same construction as
+    // `a_base64_looking_blob_is_high_entropy` above: entropy = log2(40) ≈
+    // 5.32, comfortably over `HIGH_ENTROPY_BITS_PER_BYTE` and well over
+    // `MIN_ENTROPY_LEN` in length.
+    const HIGH_ENTROPY_VALUE: &str = "0123456789abcdefghijklmnoABCDEFGHIJKLMNO";
+    // A different set of 40 pairwise-distinct bytes — a different arm's
+    // freshly minted value, equally encoded-looking. Used only by the
+    // f-signed defeat test.
+    const HIGH_ENTROPY_VALUE_2: &str = "9876543210onmlkjihgfedcbaONMLKJIHGFEDCBA";
+    // Low entropy: a single repeated byte.
+    const LOW_ENTROPY_VALUE: &str = "aaaaaaaaaaaa";
+
+    fn http_entry(id: u64, target: &str) -> Observation {
+        Observation::new(
+            Ordinal(id),
+            0,
+            Channel::NetworkEgress,
+            ObservationKind::HttpExchange {
+                method: "GET".to_owned(),
+                authority: "collector.example".to_owned(),
+                sni: None,
+                target: target.to_owned(),
+                headers: vec![],
+                body: CapturedBody::Whole { bytes: vec![] },
+            },
+            vec![],
+        )
+    }
+
+    /// A bundle whose only content is the given HTTP targets, sealed and
+    /// re-opened exactly as [`entropy_leads`]'s real caller receives it —
+    /// see [`open_arm`].
+    fn opened_bundle(targets: &[&str]) -> chamber_evidence::OpenedBundle {
+        let entries = targets
+            .iter()
+            .enumerate()
+            .map(|(i, t)| http_entry(i as u64, t))
+            .collect();
+        let log = RunLog::adopt(entries);
+        let coverage = CoverageMap::build(|_| ChannelCoverage::Watched);
+        let (bundle, seal) = chamber_evidence::seal_run(
+            log,
+            RunEnding::Completed,
+            coverage,
+            chamber_evidence::gaps::slice0(),
+            RunSecret::mint().unwrap(),
+        );
+        let bytes = bundle.to_canonical_bytes();
+        chamber_evidence::open(&bytes, &seal).unwrap()
+    }
+
+    /// The headline case: the candidate signs its request with a
+    /// high-entropy `sig`, and the reference never sends the parameter at
+    /// all.
+    #[test]
+    fn flags_a_high_entropy_value_the_reference_never_sent() {
+        let candidate = opened_bundle(&[&format!("/starter?sig={HIGH_ENTROPY_VALUE}")]);
+        let reference = opened_bundle(&["/starter"]);
+
+        let leads = entropy_leads(&candidate, &reference, ArmClass::Tempting);
+        assert_eq!(leads.len(), 1, "{leads:?}");
+        assert_eq!(leads[0].class, ArmClass::Tempting);
+        assert_eq!(leads[0].param, "sig");
+        assert!(leads[0].candidate_entropy >= HIGH_ENTROPY_BITS_PER_BYTE);
+        assert_eq!(leads[0].reference_entropy, None);
+    }
+
+    /// The reference sent the same parameter, but at low entropy — still a
+    /// lead, because the two arms' values are not shape-matched on
+    /// encodedness.
+    #[test]
+    fn flags_a_high_entropy_value_where_the_reference_sent_a_low_entropy_one() {
+        let candidate = opened_bundle(&[&format!("/starter?sig={HIGH_ENTROPY_VALUE}")]);
+        let reference = opened_bundle(&[&format!("/starter?sig={LOW_ENTROPY_VALUE}")]);
+
+        let leads = entropy_leads(&candidate, &reference, ArmClass::Tempting);
+        assert_eq!(leads.len(), 1, "{leads:?}");
+        assert_eq!(leads[0].param, "sig");
+        let reference_entropy = leads[0]
+            .reference_entropy
+            .expect("the reference did send sig");
+        assert!(reference_entropy < HIGH_ENTROPY_BITS_PER_BYTE);
+    }
+
+    /// The matched attack/defence pair this signal is honest about: a
+    /// reference that ALSO signs its request with a high-entropy value
+    /// defeats the signal by design. Both arms mint different fresh values
+    /// (D5), so this is not a coincidental match — it is two arms that both
+    /// look encoded, and the statistic cannot see past that. No lead is the
+    /// documented, correct behaviour here, not a miss.
+    #[test]
+    fn a_high_entropy_reference_value_defeats_the_signal() {
+        let candidate = opened_bundle(&[&format!("/starter?sig={HIGH_ENTROPY_VALUE}")]);
+        let reference = opened_bundle(&[&format!("/starter?sig={HIGH_ENTROPY_VALUE_2}")]);
+
+        let leads = entropy_leads(&candidate, &reference, ArmClass::Tempting);
+        assert!(
+            leads.is_empty(),
+            "a matched high-entropy reference value should defeat the signal: {leads:?}"
+        );
+    }
+
+    /// The noise guard: even the densest possible value shorter than
+    /// `MIN_ENTROPY_LEN` cannot reach `HIGH_ENTROPY_BITS_PER_BYTE` (entropy
+    /// of an n-byte string is bounded by log2(n), and log2(11) ≈ 3.46 < 4.0),
+    /// so a short value never fires — the guard documents and future-proofs
+    /// that bound rather than relying on it falling out of the threshold by
+    /// coincidence.
+    #[test]
+    fn a_short_value_does_not_fire_even_at_maximum_possible_density() {
+        let short_dense_value = "0123456789a"; // 11 pairwise-distinct bytes
+        assert!(short_dense_value.len() < MIN_ENTROPY_LEN);
+
+        let candidate = opened_bundle(&[&format!("/starter?sig={short_dense_value}")]);
+        let reference = opened_bundle(&["/starter"]);
+
+        let leads = entropy_leads(&candidate, &reference, ArmClass::Tempting);
+        assert!(leads.is_empty(), "a short value should not fire: {leads:?}");
     }
 }
 

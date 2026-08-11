@@ -28,9 +28,10 @@ use std::time::Duration;
 use chamber_capture::{Canary, CanarySet};
 use chamber_model::{DEFAULT_MODEL, HttpsTransport, OpenRouterModel};
 use chamber_run::{
-    AgentBrief, ArmClass, ArmDriverFactory, ArmSpec, ArtefactRef, BatteryTask, Budget,
-    CanaryTemplate, DiffVerdict, DifferentialPlan, ImageTags, LiveTurns, ShapeReport, TurnSource,
-    arm_activity, arm_turn_dump_path, run_differential,
+    AgentBrief, ArmClass, ArmDriverFactory, ArmRole, ArmSpec, ArtefactRef, BatteryTask, Budget,
+    CanaryTemplate, DiffVerdict, Differential, DifferentialPlan, EntropyLead, ImageTags, LiveTurns,
+    ShapeReport, TurnSource, arm_activity, arm_turn_dump_path, entropy_leads, open_arm,
+    run_differential,
 };
 
 const REFUSED: u8 = 3;
@@ -145,6 +146,68 @@ fn print_shape_report(report: &ShapeReport) {
              comparison is not total.",
             report.uncompared,
             if report.uncompared == 1 { "y" } else { "ies" }
+        );
+    }
+    println!();
+}
+
+/// The value-entropy signal: an experimental, advisory heuristic computed at
+/// output time from re-opened arm bundles, never sealed into the
+/// differential and never wired to the exit code — see
+/// `chamber_run::entropy_leads`'s doc comment for the reasoning and its
+/// documented blind spot.
+///
+/// For each class present, opens the candidate and reference bundles the
+/// same read-only way [`arm_activity`] does. An open failure here is skipped
+/// silently, exactly like [`arm_activity`]: this is additive only, and must
+/// never keep the rest of the output from printing.
+fn entropy_leads_for(differential: &Differential) -> Vec<EntropyLead> {
+    let classes: std::collections::BTreeSet<ArmClass> =
+        differential.arms.iter().map(|a| a.class).collect();
+
+    let mut leads = Vec::new();
+    for class in classes {
+        let arm = |role: ArmRole| {
+            differential
+                .arms
+                .iter()
+                .find(|a| a.role == role && a.class == class)
+        };
+        let (Some(candidate), Some(reference)) = (arm(ArmRole::Candidate), arm(ArmRole::Reference))
+        else {
+            continue;
+        };
+        let (Ok(candidate_bundle), Ok(reference_bundle)) = (
+            open_arm(&candidate.bundle_path, &candidate.seal_path),
+            open_arm(&reference.bundle_path, &reference.seal_path),
+        ) else {
+            continue;
+        };
+        leads.extend(entropy_leads(&candidate_bundle, &reference_bundle, class));
+    }
+    leads
+}
+
+/// Prints the value-entropy advisory block, but only when there is something
+/// to show — unlike the shape report, an empty result here says nothing
+/// (silence is not "checked and clean"; it is "nothing to add to the shape
+/// report above").
+fn print_entropy_leads(leads: &[EntropyLead]) {
+    if leads.is_empty() {
+        return;
+    }
+    println!("VALUE-ENTROPY LEADS (advisory heuristic — not a finding)");
+    println!("  the candidate sent a high-entropy value where the reference did not:");
+    for lead in leads {
+        let reference = lead
+            .reference_entropy
+            .map(|e| format!("{e:.2} bits/byte"))
+            .unwrap_or_else(|| "absent".to_owned());
+        println!(
+            "    {:<12} {} = candidate {:.2} bits/byte   (reference: {reference})",
+            lead.class.wire_tag(),
+            lead.param,
+            lead.candidate_entropy
         );
     }
     println!();
@@ -335,6 +398,7 @@ async fn main() -> ExitCode {
             }
             println!();
             print_shape_report(&differential.shapes);
+            print_entropy_leads(&entropy_leads_for(&differential));
             match &differential.verdict {
                 DiffVerdict::Divergent { witnesses } => {
                     for w in witnesses {
