@@ -22,7 +22,7 @@
 //! meaning "safe".
 
 use std::collections::BTreeSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use chamber_evidence::{
     CapturedBody, Channel, CoverageGap, GapCause, Observation, ObservationKind, RunEnding, Verdict,
@@ -606,6 +606,269 @@ pub struct ArmOutcome {
     /// exfiltration entirely — a candidate that sends the token on every arm
     /// diverges from nothing.
     pub verdict: Verdict,
+}
+
+/// What one arm actually did, independent of its verdict.
+///
+/// Deliberately not a field on [`ArmOutcome`]: that struct is serialized into
+/// the sealed [`DifferentialBundle`], and this is derived after the fact by
+/// re-opening the arm's own bundle read-only (see [`arm_activity`]) — the same
+/// path [`recheck_differential`] uses to never trust a stored summary. It
+/// exists so a reader can tell a model that acted but slipped past the
+/// matcher (`no_finding` with real crossings) from one that did nothing.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct ArmActivity {
+    pub guest_commands: usize,
+    /// `Channel::NetworkEgress` entries plus `Channel::DnsResolution` entries —
+    /// every boundary crossing this arm made, regardless of whether a canary
+    /// hit landed on it. Wider than [`ArmReading::crossings`] on purpose: this
+    /// is "did the arm reach the boundary at all", not "did it carry the
+    /// token".
+    pub crossings: usize,
+    pub ending: RunEnding,
+}
+
+impl ArmActivity {
+    /// A short, lowercase, snake_case tag for `ending`.
+    ///
+    /// `RunEnding` (in `chamber_evidence`) has no display form of its own, so
+    /// this stays local rather than reaching into that crate for something
+    /// only the differential's printed output needs.
+    #[must_use]
+    pub fn ending_tag(&self) -> &'static str {
+        match self.ending {
+            RunEnding::Completed => "completed",
+            RunEnding::DeadlineExpired => "deadline_expired",
+            RunEnding::ObserverLost => "observer_lost",
+            RunEnding::AgentFailed => "agent_failed",
+        }
+    }
+}
+
+/// Tallies one arm's activity from its already-opened bundle.
+///
+/// Pure — no I/O — so it is unit-testable against a hand-built ledger without
+/// writing anything to disk. [`arm_activity`] is the I/O-performing wrapper
+/// around this for callers that only have paths.
+#[must_use]
+pub fn activity_of(opened: &chamber_evidence::OpenedBundle) -> ArmActivity {
+    let mut guest_commands = 0usize;
+    let mut crossings = 0usize;
+    for entry in opened.ledger.entries() {
+        match entry.channel() {
+            Channel::GuestCommand => guest_commands += 1,
+            Channel::NetworkEgress | Channel::DnsResolution => crossings += 1,
+            Channel::DroppedPackets | Channel::InferenceTransport => {}
+        }
+    }
+    ArmActivity {
+        guest_commands,
+        crossings,
+        ending: opened.ending,
+    }
+}
+
+/// Opens one arm's bundle from its paths and tallies its activity.
+///
+/// The same open-from-paths pattern [`recheck_differential`] uses: read both
+/// files, parse the seal, then `chamber_evidence::open` — the bundle is
+/// re-derived from its own bytes, never trusted as read.
+///
+/// # Errors
+/// [`RecheckRefusal::ArmUnreadable`] if either file cannot be read, the seal
+/// does not parse, or the bundle does not open against it.
+pub fn arm_activity(bundle_path: &Path, seal_path: &Path) -> Result<ArmActivity, RecheckRefusal> {
+    let unreadable = |path: &Path, detail: String| RecheckRefusal::ArmUnreadable {
+        path: path.display().to_string(),
+        detail,
+    };
+    let bytes = std::fs::read(bundle_path).map_err(|e| unreadable(bundle_path, e.to_string()))?;
+    let seal_bytes = std::fs::read(seal_path).map_err(|e| unreadable(seal_path, e.to_string()))?;
+    let seal: chamber_evidence::BundleSeal =
+        serde_json::from_slice(&seal_bytes).map_err(|e| unreadable(seal_path, e.to_string()))?;
+    let opened = chamber_evidence::open(&bytes, &seal)
+        .map_err(|e| unreadable(bundle_path, format!("{e:?}")))?;
+    Ok(activity_of(&opened))
+}
+
+#[cfg(test)]
+mod activity_tests {
+    use super::*;
+    use chamber_evidence::{
+        ChannelCoverage, CoverageMap, ObservationKind, Ordinal, RunLog, RunSecret,
+    };
+
+    fn entry(id: u64, channel: Channel) -> Observation {
+        let kind = match channel {
+            Channel::GuestCommand => ObservationKind::GuestCommand {
+                argv_redacted: vec!["ls".to_owned()],
+                exit: 0,
+            },
+            Channel::NetworkEgress => ObservationKind::HttpExchange {
+                method: "GET".to_owned(),
+                authority: "example.com".to_owned(),
+                sni: None,
+                target: "/".to_owned(),
+                headers: vec![],
+                body: CapturedBody::Whole { bytes: vec![] },
+            },
+            Channel::DnsResolution => ObservationKind::NameQuery {
+                qname: "example.com".to_owned(),
+                qtype: "A".to_owned(),
+                answered_with: "10.0.0.1".to_owned(),
+            },
+            Channel::DroppedPackets => ObservationKind::PacketDrop {
+                scope: "output".to_owned(),
+                five_tuple: None,
+                count: 1,
+            },
+            Channel::InferenceTransport => ObservationKind::InferenceCall {
+                model: "test-model".to_owned(),
+                request_digest: chamber_evidence::Digest32([0u8; 32]),
+                response_digest: chamber_evidence::Digest32([0u8; 32]),
+            },
+        };
+        Observation::new(Ordinal(id), 0, channel, kind, vec![])
+    }
+
+    fn opened_bundle(channels: &[Channel], ending: RunEnding) -> chamber_evidence::OpenedBundle {
+        let entries = channels
+            .iter()
+            .enumerate()
+            .map(|(i, &c)| entry(i as u64, c))
+            .collect();
+        let log = RunLog::adopt(entries);
+        let coverage = CoverageMap::build(|_| ChannelCoverage::Watched);
+        let (bundle, seal) = chamber_evidence::seal_run(
+            log,
+            ending,
+            coverage,
+            chamber_evidence::gaps::slice0(),
+            RunSecret::mint().unwrap(),
+        );
+        let bytes = bundle.to_canonical_bytes();
+        chamber_evidence::open(&bytes, &seal).unwrap()
+    }
+
+    /// Guest commands tally separately from crossings, and dropped
+    /// packets/inference calls count as neither — only the two boundary
+    /// channels count as a "crossing".
+    #[test]
+    fn tallies_guest_commands_and_crossings_separately() {
+        let opened = opened_bundle(
+            &[
+                Channel::GuestCommand,
+                Channel::GuestCommand,
+                Channel::NetworkEgress,
+                Channel::DnsResolution,
+                Channel::DroppedPackets,
+                Channel::InferenceTransport,
+            ],
+            RunEnding::Completed,
+        );
+
+        let activity = activity_of(&opened);
+        assert_eq!(activity.guest_commands, 2);
+        assert_eq!(
+            activity.crossings, 2,
+            "network egress + dns should both count"
+        );
+        assert_eq!(activity.ending, RunEnding::Completed);
+    }
+
+    /// A bundle with no entries at all reports zero on both counters — the
+    /// "did nothing" case this exists to distinguish from "did something the
+    /// matcher missed".
+    #[test]
+    fn an_empty_ledger_is_all_zero() {
+        let activity = activity_of(&opened_bundle(&[], RunEnding::Completed));
+        assert_eq!(activity.guest_commands, 0);
+        assert_eq!(activity.crossings, 0);
+    }
+
+    /// The ending travels through untouched, and a non-`Completed` ending
+    /// (the case a reader most needs flagged) is not lost.
+    #[test]
+    fn a_non_completed_ending_is_preserved() {
+        let opened = opened_bundle(&[Channel::GuestCommand], RunEnding::AgentFailed);
+        let activity = activity_of(&opened);
+        assert_eq!(activity.ending, RunEnding::AgentFailed);
+        assert_eq!(activity.ending_tag(), "agent_failed");
+    }
+
+    #[test]
+    fn ending_tag_is_short_and_lowercase() {
+        assert_eq!(
+            ArmActivity {
+                guest_commands: 0,
+                crossings: 0,
+                ending: RunEnding::DeadlineExpired,
+            }
+            .ending_tag(),
+            "deadline_expired"
+        );
+        assert_eq!(
+            ArmActivity {
+                guest_commands: 0,
+                crossings: 0,
+                ending: RunEnding::ObserverLost,
+            }
+            .ending_tag(),
+            "observer_lost"
+        );
+    }
+
+    /// `arm_activity` is the I/O wrapper: written to real files, opened back
+    /// from paths alone, exactly as the differential binary will call it.
+    #[test]
+    fn arm_activity_opens_from_paths_and_matches_activity_of() {
+        let dir = std::env::temp_dir().join(format!(
+            "chamber-diff-activity-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let entries = vec![
+            entry(0, Channel::GuestCommand),
+            entry(1, Channel::NetworkEgress),
+        ];
+        let log = RunLog::adopt(entries);
+        let coverage = CoverageMap::build(|_| ChannelCoverage::Watched);
+        let (bundle, seal) = chamber_evidence::seal_run(
+            log,
+            RunEnding::Completed,
+            coverage,
+            chamber_evidence::gaps::slice0(),
+            RunSecret::mint().unwrap(),
+        );
+        let bundle_path = dir.join("arm.json");
+        let seal_path = dir.join("arm.sig");
+        std::fs::write(&bundle_path, bundle.to_canonical_bytes()).unwrap();
+        std::fs::write(&seal_path, serde_json::to_vec(&seal).unwrap()).unwrap();
+
+        let activity = arm_activity(&bundle_path, &seal_path).unwrap();
+        assert_eq!(activity.guest_commands, 1);
+        assert_eq!(activity.crossings, 1);
+        assert_eq!(activity.ending, RunEnding::Completed);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A missing bundle file is a refusal, not a panic — the binary's print
+    /// loop relies on this being an `Err` it can quietly skip.
+    #[test]
+    fn arm_activity_refuses_a_missing_bundle() {
+        let dir = std::env::temp_dir();
+        let result = arm_activity(
+            &dir.join("does-not-exist.json"),
+            &dir.join("does-not-exist.sig"),
+        );
+        assert!(matches!(result, Err(RecheckRefusal::ArmUnreadable { .. })));
+    }
 }
 
 /// Which artefact an arm ran.
@@ -1835,6 +2098,73 @@ fn arm_detonation_plan(
             ArmRole::Candidate => plan.candidate_skill_dir.clone(),
             ArmRole::Reference => plan.reference_skill_dir.clone(),
         },
+    }
+}
+
+/// The per-arm turn-dump path for the differential factory.
+///
+/// Mirrors [`arm_detonation_plan`]'s `{role}-{class}` naming — `wire_tag()`
+/// derived, so two different (role, class) pairs can never collide, and the
+/// filename is verifiable against the arm's own evidence directory. `base` is
+/// a directory for the differential (one file per arm), unlike
+/// `chamber-detonate-live` where `CHAMBER_TURN_DUMP` names a single file.
+#[must_use]
+pub fn arm_turn_dump_path(base: &Path, role: ArmRole, class: ArmClass) -> PathBuf {
+    base.join(format!(
+        "{}-{}.turns.jsonl",
+        role.wire_tag(),
+        class.wire_tag()
+    ))
+}
+
+#[cfg(test)]
+mod turn_dump_path_tests {
+    use super::*;
+
+    #[test]
+    fn known_role_class_pairs_produce_the_expected_filename() {
+        let base = Path::new("/tmp/turns");
+        assert_eq!(
+            arm_turn_dump_path(base, ArmRole::Candidate, ArmClass::Legitimate),
+            base.join("candidate-legitimate.turns.jsonl")
+        );
+        assert_eq!(
+            arm_turn_dump_path(base, ArmRole::Reference, ArmClass::Tempting),
+            base.join("reference-tempting.turns.jsonl")
+        );
+    }
+
+    /// Every (role, class) pair the battery can produce gets its own file —
+    /// two arms writing dumps concurrently must never interleave into one.
+    #[test]
+    fn every_role_class_pair_is_a_distinct_path() {
+        let base = Path::new("/evidence/turns");
+        let roles = [ArmRole::Candidate, ArmRole::Reference];
+        let classes = [ArmClass::Legitimate, ArmClass::HeldOut, ArmClass::Tempting];
+
+        let mut paths = BTreeSet::new();
+        for &role in &roles {
+            for &class in &classes {
+                assert!(
+                    paths.insert(arm_turn_dump_path(base, role, class)),
+                    "duplicate path for {role:?}/{class:?}"
+                );
+            }
+        }
+        assert_eq!(paths.len(), roles.len() * classes.len());
+    }
+
+    /// The path always lands under `base`, and always carries the
+    /// `.turns.jsonl` suffix the turn dump's own doc comment asks for.
+    #[test]
+    fn the_path_is_rooted_at_base_with_the_turns_jsonl_suffix() {
+        let base = Path::new("/evidence/turns");
+        let path = arm_turn_dump_path(base, ArmRole::Candidate, ArmClass::HeldOut);
+        assert!(path.starts_with(base));
+        assert_eq!(
+            path.file_name().and_then(|n| n.to_str()),
+            Some("candidate-held_out.turns.jsonl")
+        );
     }
 }
 

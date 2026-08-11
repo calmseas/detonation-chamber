@@ -30,7 +30,7 @@ use chamber_model::{DEFAULT_MODEL, HttpsTransport, OpenRouterModel};
 use chamber_run::{
     AgentBrief, ArmClass, ArmDriverFactory, ArmSpec, ArtefactRef, BatteryTask, Budget,
     CanaryTemplate, DiffVerdict, DifferentialPlan, ImageTags, LiveTurns, ShapeReport, TurnSource,
-    run_differential,
+    arm_activity, arm_turn_dump_path, run_differential,
 };
 
 const REFUSED: u8 = 3;
@@ -51,6 +51,12 @@ struct LiveArmFactory {
     model_id: String,
     budget: Budget,
     wall_clock: Duration,
+    /// Root of the per-arm turn dump, if `CHAMBER_TURN_DUMP` was set — a
+    /// directory, unlike `chamber-detonate-live` where the same variable
+    /// names a single file. Each arm gets its own `<role>-<class>.turns.jsonl`
+    /// under it (see [`arm_turn_dump_path`]), so the two arms sharing this
+    /// factory never interleave into one file.
+    turn_dump_base: Option<PathBuf>,
 }
 
 impl ArmDriverFactory for LiveArmFactory {
@@ -58,26 +64,31 @@ impl ArmDriverFactory for LiveArmFactory {
         let transport = HttpsTransport::new(self.api_key.clone(), self.wall_clock)
             .expect("the transport built once at startup builds again");
 
-        // Not wired to `with_turn_dump` here: both arms would share one
-        // factory, and one file, and their turns would interleave into it.
-        // Natural follow-up is a per-arm path (e.g. derived from `spec`);
-        // out of scope for this task.
-        Box::new(LiveTurns::new(
-            Box::new(OpenRouterModel::new(transport, self.model_id.clone())),
-            AgentBrief {
-                artefact: spec.artefact_text.to_owned(),
-                task: spec.task.to_owned(),
-            },
-            self.budget,
-            // This arm's own freshly minted values. No other arm's ledger can
-            // recognise them, which is what keeps the arms independent.
-            CanarySet::new(
-                spec.canaries
-                    .iter()
-                    .map(|c| Canary::new(c.label.clone(), c.value.clone()))
-                    .collect(),
-            ),
-        ))
+        let turn_dump = self
+            .turn_dump_base
+            .as_ref()
+            .map(|base| arm_turn_dump_path(base, spec.role, spec.class));
+
+        Box::new(
+            LiveTurns::new(
+                Box::new(OpenRouterModel::new(transport, self.model_id.clone())),
+                AgentBrief {
+                    artefact: spec.artefact_text.to_owned(),
+                    task: spec.task.to_owned(),
+                },
+                self.budget,
+                // This arm's own freshly minted values. No other arm's ledger
+                // can recognise them, which is what keeps the arms
+                // independent.
+                CanarySet::new(
+                    spec.canaries
+                        .iter()
+                        .map(|c| Canary::new(c.label.clone(), c.value.clone()))
+                        .collect(),
+                ),
+            )
+            .with_turn_dump(turn_dump),
+        )
     }
 }
 
@@ -178,6 +189,23 @@ async fn main() -> ExitCode {
             eprintln!(
                 "                          artefact's own, when it ships more than markdown)"
             );
+            eprintln!(
+                "  CHAMBER_TURN_DUMP      directory to write a per-arm local, git-ignored JSONL"
+            );
+            eprintln!(
+                "                          record of every turn's full prompt and response text"
+            );
+            eprintln!(
+                "                          (debug only — contains the canary in cleartext; off"
+            );
+            eprintln!(
+                "                          unless set). One <role>-<class>.turns.jsonl per arm,"
+            );
+            eprintln!("                          verifiable against that arm's own bundle. Unlike");
+            eprintln!(
+                "                          chamber-detonate-live, this names a directory, not a"
+            );
+            eprintln!("                          file — both arms would otherwise interleave.");
             return ExitCode::from(BAD_INVOCATION);
         }
     };
@@ -218,12 +246,28 @@ async fn main() -> ExitCode {
         }
     };
 
+    // A directory for the differential — one `<role>-<class>.turns.jsonl` per
+    // arm — unlike `chamber-detonate-live`, where the same variable names a
+    // single file. Created eagerly, before either arm runs, so a bad path
+    // fails loud here rather than partway through the battery.
+    let turn_dump_base = std::env::var("CHAMBER_TURN_DUMP").ok().map(PathBuf::from);
+    if let Some(dir) = &turn_dump_base
+        && let Err(e) = std::fs::create_dir_all(dir)
+    {
+        eprintln!(
+            "cannot create CHAMBER_TURN_DUMP directory {}: {e}",
+            dir.display()
+        );
+        return ExitCode::from(REFUSED);
+    }
+
     let model_id = env_or("CHAMBER_MODEL", DEFAULT_MODEL);
     let factory = LiveArmFactory {
         api_key,
         model_id: model_id.clone(),
         budget,
         wall_clock,
+        turn_dump_base,
     };
 
     let plan = DifferentialPlan {
@@ -267,8 +311,23 @@ async fn main() -> ExitCode {
             println!("verdict       {}", differential.verdict.wire_tag());
             println!();
             for arm in &differential.arms {
+                // Additive only: on an open error the verdict line prints
+                // unchanged and nothing is appended. `arm_activity` re-opens
+                // the arm's sealed bundle read-only — see its doc comment —
+                // so this can never affect the verdict above.
+                let activity = arm_activity(&arm.bundle_path, &arm.seal_path)
+                    .ok()
+                    .map(|a| {
+                        format!(
+                            "  ({} cmds, {} crossings, {})",
+                            a.guest_commands,
+                            a.crossings,
+                            a.ending_tag()
+                        )
+                    })
+                    .unwrap_or_default();
                 println!(
-                    "  {:<10} {:<12} {}",
+                    "  {:<10} {:<12} {}{activity}",
                     format!("{:?}", arm.role).to_lowercase(),
                     arm.class.wire_tag(),
                     arm.verdict.wire_tag()
