@@ -82,17 +82,30 @@ pub struct MetamorphicLead {
 
 impl MetamorphicArm {
     /// Reduce a sealed, opened bundle's observations to their outbound emissions.
+    ///
+    /// Delegates to [`Self::from_observations`], so the two constructors cannot
+    /// disagree about what counts as an emission.
     #[must_use]
     pub fn from_opened(secret_label: impl Into<String>, opened: &OpenedBundle) -> Self {
-        let emissions = opened
-            .ledger
-            .entries()
-            .iter()
-            .filter_map(|o| emission_of(o.kind()))
-            .collect();
+        Self::from_observations(
+            secret_label,
+            opened.ledger.entries().iter().map(|o| o.kind()),
+        )
+    }
+
+    /// Reduce a sequence of observations to their outbound emissions.
+    ///
+    /// The bundle-free constructor. [`crate::floor`] needs arms from
+    /// observations it already holds, and a caller with observations in hand
+    /// should not have to seal and reopen a bundle to get an arm.
+    #[must_use]
+    pub fn from_observations<'a>(
+        secret_label: impl Into<String>,
+        kinds: impl IntoIterator<Item = &'a ObservationKind>,
+    ) -> Self {
         Self {
             secret_label: secret_label.into(),
-            emissions,
+            emissions: kinds.into_iter().filter_map(emission_of).collect(),
         }
     }
 

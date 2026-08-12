@@ -40,6 +40,7 @@ pub mod bridge;
 pub mod bundle;
 pub mod corpus;
 pub mod differential;
+pub mod floor;
 pub mod integrity;
 pub mod liveturns;
 pub mod metamorphic;
@@ -60,6 +61,7 @@ pub use differential::{
     entropy_leads, open_arm, recheck_differential, run_differential, shannon_entropy_bits_per_byte,
     shape_gaps, shape_leads,
 };
+pub use floor::{FloorVerdict, floor_verdict, metamorphic_layer, supervise};
 pub use integrity::{
     AnswerUnderTest, Claim, GoldenSpec, IntegrityFinding, Jury, JuryBrief, JuryVerdict,
     OracleReading, PanelReading, Requirement, cross_reference_reading, filesystem_reading,
