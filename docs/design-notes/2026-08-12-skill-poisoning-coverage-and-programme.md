@@ -23,6 +23,10 @@ but is lightly validated or built-not-run, **[gap]** is unexplored.
 
 **Axis 2 — Payload (what the malicious act is)**
 - Credential / secret exfiltration — **[done]** (the whole canary line)
+- Integrity / induced-wrong-output — **[partial]** (B4, 2026-08-12: answer-level
+  multi-oracle panel in `chamber-run/src/integrity.rs` + `chamber-integrity`. Grades the
+  agent's *answer*; artefacts it *writes* are ungraded — `gap.filesystem-channel`, closed
+  by B3's `/work` oracle)
 - Destructive / sabotage — **[gap]**
 - Supply-chain / package hallucination — **[gap]** (NPA)
 - Persistence / backdoor install — **[gap]**
@@ -108,12 +112,25 @@ result.
 - **B3 — Sabotage / destructive payload + filesystem oracle.** A skill that corrupts or
   deletes `/work` content rather than exfiltrating. Needs a **filesystem-effect oracle**
   (diff the cell's `/work` before/after, in the differential: the candidate mutated what the
-  reference did not). *Fills:* Axis-2 destructive.
-- **B4 — Integrity axis / multi-oracle panel (the backlogged B5).** Golden +
-  metamorphic-consistency + cross-reference + confidence-gated jury on a held-out battery,
-  from the companion note. Catches a skill that produces subtly-*wrong* output rather than
-  exfiltrating — the "grading" complement to the elicitation work. *Fills:* Axis-2
-  integrity; a whole detection axis.
+  reference did not). *Fills:* Axis-2 destructive — **and the file-level half of Axis-2
+  integrity**, which is why it is now the next item rather than the second (see B4). Feed
+  the `/work` diff into the integrity panel as an additional `PanelReading`, not only into
+  the differential.
+- **B4 — Integrity axis / multi-oracle panel (the backlogged B5).** **DONE (answer level),
+  2026-08-12, `6cc11da`.** `chamber-run/src/integrity.rs` + the `chamber-integrity` bin:
+  golden, cross-reference, metamorphic-consistency and a confidence-gated jury (a trait, so
+  it is exercised by a scripted jury with no network), combined by a panel whose three-way
+  outcome keeps `NoDefectFound` apart from `Inconclusive` — all-abstain must never read as
+  clean. `JuryBrief` structurally cannot carry the artefact prose, answering the companion
+  note's §5 "poison the evaluator" warning. Answers are digest-bound to sealed evidence
+  before grading; an edited turn dump is refused.
+
+  **Scoped deliberately to the answer.** The companion note's §6 makes ingress/output
+  capture the prerequisite for "the integrity axis proper", meaning *files written AND
+  final answer*. Only the answer half was shipped (turn dump, `147837f`); the file half is
+  `gap.filesystem-channel` and belongs to B3. So a skill that writes a subtly-wrong file to
+  `/work` remains invisible to every axis — it crosses no boundary and need not corrupt the
+  answer. That is the honest residue, recorded rather than papered over.
 
 ### Phase C — larger scope / gated (longer-term)
 
@@ -134,9 +151,14 @@ result.
 Do **A6** (shared scorer) first — every other experiment depends on trustworthy
 measurement, and this session proved ad-hoc scoring is where the errors hide. Then **A1–A4**
 (cheap fixtures that fill real Axis-3/Axis-4 gaps) and **A5** (the standing harness that
-turns one-off runs into a durable instrument). **B4** (multi-oracle) is the highest-value
-Phase-B item because it opens an entire detection axis (integrity), not just one fixture.
-Phase C items each carry a scope decision and should be taken deliberately, not by default.
+turns one-off runs into a durable instrument). **B4** (multi-oracle) was the highest-value
+Phase-B item because it opens an entire detection axis (integrity), not just one fixture —
+**done 2026-08-12 at the answer level**.
+
+That promotes **B3** to next. Its `/work` before/after oracle is now load-bearing twice
+over: it fills Axis-2 destructive *and* closes the file-level half of the integrity axis B4
+opened, so one instrument completes two axes. Phase C items each carry a scope decision and
+should be taken deliberately, not by default.
 
 ## 5. What this programme deliberately does NOT promise
 
