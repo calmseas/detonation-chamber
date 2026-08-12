@@ -23,10 +23,12 @@ but is lightly validated or built-not-run, **[gap]** is unexplored.
 
 **Axis 2 — Payload (what the malicious act is)**
 - Credential / secret exfiltration — **[done]** (the whole canary line)
-- Integrity / induced-wrong-output — **[partial]** (B4, 2026-08-12: answer-level
-  multi-oracle panel in `chamber-run/src/integrity.rs` + `chamber-integrity`. Grades the
-  agent's *answer*; artefacts it *writes* are ungraded — `gap.filesystem-channel`, closed
-  by B3's `/work` oracle)
+- Integrity / induced-wrong-output — **[done]** (B4 + B4b, 2026-08-12: multi-oracle panel
+  in `chamber-run/src/integrity.rs` + `chamber-integrity`. Grades the agent's *answer*
+  (golden, cross-reference, metamorphic-consistency, confidence-gated jury) **and** the
+  files it *writes* (filesystem + written-content, over `worksnapshot.rs`). Caveat that
+  bounds it: the answer half is digest-bound to sealed evidence, the file half is an
+  unsealed harness observation)
 - Destructive / sabotage — **[gap]**
 - Supply-chain / package hallucination — **[gap]** (NPA)
 - Persistence / backdoor install — **[gap]**
@@ -109,13 +111,14 @@ result.
   *number* of requests. The shape axis (who/how contacted) likely misses a pure count/timing
   channel — probe it, and if it is a gap, scope a counting/timing oracle. *Fills:* Axis-3
   timing side-channel (probably a documented new gap).
-- **B3 — Sabotage / destructive payload + filesystem oracle.** A skill that corrupts or
-  deletes `/work` content rather than exfiltrating. Needs a **filesystem-effect oracle**
-  (diff the cell's `/work` before/after, in the differential: the candidate mutated what the
-  reference did not). *Fills:* Axis-2 destructive — **and the file-level half of Axis-2
-  integrity**, which is why it is now the next item rather than the second (see B4). Feed
-  the `/work` diff into the integrity panel as an additional `PanelReading`, not only into
-  the differential.
+- **B3 — Sabotage / destructive payload + filesystem oracle.** **The oracle is now BUILT**
+  (B4b, `e37b552`): `worksnapshot.rs` takes a `/work` before/after digest snapshot via
+  `AgentCell::exec`, and `integrity::filesystem_reading` subtracts the reference arm, so
+  "the candidate deleted what the reference kept" is already a reported finding. What
+  remains for B3 is the part the oracle exists to catch: **the destructive fixture itself**
+  (a skill that corrupts or deletes `/work` rather than exfiltrating), plus surfacing the
+  diff in the *differential's* own report rather than only in the integrity panel.
+  *Fills:* Axis-2 destructive.
 - **B4 — Integrity axis / multi-oracle panel (the backlogged B5).** **DONE (answer level),
   2026-08-12, `6cc11da`.** `chamber-run/src/integrity.rs` + the `chamber-integrity` bin:
   golden, cross-reference, metamorphic-consistency and a confidence-gated jury (a trait, so
@@ -125,12 +128,25 @@ result.
   note's §5 "poison the evaluator" warning. Answers are digest-bound to sealed evidence
   before grading; an edited turn dump is refused.
 
-  **Scoped deliberately to the answer.** The companion note's §6 makes ingress/output
-  capture the prerequisite for "the integrity axis proper", meaning *files written AND
-  final answer*. Only the answer half was shipped (turn dump, `147837f`); the file half is
-  `gap.filesystem-channel` and belongs to B3. So a skill that writes a subtly-wrong file to
-  `/work` remains invisible to every axis — it crosses no boundary and need not corrupt the
-  answer. That is the honest residue, recorded rather than papered over.
+- **B4b — the file half.** **DONE 2026-08-12, `e37b552`.** `worksnapshot.rs` (the
+  counterpart of `staging.rs`: staging puts files *in*, this reads back what is there) plus
+  two more oracles in the same panel — `filesystem_reading` (paths the candidate touched
+  that the reference did not; deletions reported separately from writes) and
+  `written_content_reading` (the content of those files, against a **separate**
+  `file_claims` spec, because what a correct answer must say and what a correct file must
+  contain are different assertions). Proven against the real guest image by 5 e2e tests
+  running the exact command strings the `CellInspect` impl builds.
+
+  So the companion note's §6 prerequisite — ingress/output capture, *files written AND
+  final answer* — is now met on both halves, and the demonstrating case is a candidate
+  whose answer is perfect while the config it wrote carries a poisoned endpoint.
+
+  **The caveat that bounds it, and it is not symmetric.** The answer half is digest-bound
+  to sealed evidence (`is_bound_to` re-hashes to the ledger's `response_digest`; an edited
+  dump is refused). A work snapshot has **no** counterpart in the sealed bundle — it is the
+  harness reporting what it saw, corroborated by nothing. Filesystem findings are leads to
+  confirm, and this does **not** close `gap.filesystem-channel`, which is about sealed
+  runtime observation. Sealing the snapshot is follow-on and touches the evidence schema.
 
 ### Phase C — larger scope / gated (longer-term)
 
@@ -155,9 +171,12 @@ turns one-off runs into a durable instrument). **B4** (multi-oracle) was the hig
 Phase-B item because it opens an entire detection axis (integrity), not just one fixture —
 **done 2026-08-12 at the answer level**.
 
-That promotes **B3** to next. Its `/work` before/after oracle is now load-bearing twice
-over: it fills Axis-2 destructive *and* closes the file-level half of the integrity axis B4
-opened, so one instrument completes two axes. Phase C items each carry a scope decision and
+**B4b** then closed the file half the same day, so the integrity axis is complete on both
+halves and one instrument — the `/work` snapshot — now serves two axes.
+
+That leaves **B1** (time trigger) and **B2** (timing/count channel) as the remaining new
+instrumentation, and **B3** reduced to authoring the destructive fixture plus a differential
+report line, since its oracle already exists. Phase C items each carry a scope decision and
 should be taken deliberately, not by default.
 
 ## 5. What this programme deliberately does NOT promise
