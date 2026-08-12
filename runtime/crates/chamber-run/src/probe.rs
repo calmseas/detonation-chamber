@@ -39,13 +39,15 @@
 //! failure mode the differential's own arm construction guards against for the
 //! same reason.
 
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use chamber_capture::consequence::ConsequencePlan;
 use chamber_evidence::Verdict;
 
 use crate::differential::{
-    ArmClass, ArmDriverFactory, ArmRole, ArmSpec, ArtefactRef, CanaryTemplate, mint_canary_value,
+    ArmClass, ArmDriverFactory, ArmReading, ArmRole, ArmSpec, ArtefactRef, CanaryTemplate,
+    RequestShape, mint_canary_value,
 };
 use crate::floor::{FloorVerdict, floor_verdict, metamorphic_layer};
 use crate::integrity::PanelReading;
@@ -137,6 +139,17 @@ pub struct ProbeOutcome {
     pub layer: crate::integrity::OracleReading,
     /// The floor verdict, with layer 1 as its only occupant so far.
     pub floor: FloorVerdict,
+    /// Every request shape the agent produced, **unioned across arms**.
+    ///
+    /// The union rather than one arm's, because a shape only one arm produced is
+    /// still something the agent did, and dropping it for being inconsistent
+    /// would hide behaviour from the judge. Arms differ only in the planted
+    /// secret and shapes exclude values, so a benign agent's arms should agree
+    /// here anyway — a union that is larger than any single arm is itself worth
+    /// a look.
+    ///
+    /// This is what [`crate::supervisor`] turns into a judge brief.
+    pub shapes: BTreeSet<RequestShape>,
 }
 
 /// The label for arm `n`, one-based.
@@ -173,6 +186,7 @@ pub async fn run_probe(
 
     let mut arms = Vec::new();
     let mut metamorphic_arms = Vec::new();
+    let mut shapes: BTreeSet<RequestShape> = BTreeSet::new();
 
     for n in 1..=plan.arms {
         let label = arm_label(n);
@@ -227,6 +241,13 @@ pub async fn run_probe(
         let opened = crate::differential::open_arm(&epilogue.bundle_path, &epilogue.seal_path)
             .map_err(|e| ProbeRefusal::Unreadable(format!("{label}: {e:?}")))?;
         metamorphic_arms.push(MetamorphicArm::from_opened(&label, &opened));
+        // The same reduction the differential uses, so the judge sees exactly
+        // what the shape axis would — names, never values.
+        shapes.extend(
+            ArmReading::from_opened(ArmRole::Candidate, ArmClass::HeldOut, &opened)
+                .shapes
+                .into_iter(),
+        );
 
         arms.push(ProbeArm {
             secret_label: label,
@@ -238,7 +259,12 @@ pub async fn run_probe(
 
     let layer = metamorphic_layer(&metamorphic_arms);
     let floor = floor_verdict(&[PanelReading::new("metamorphic", layer.clone())]);
-    Ok(ProbeOutcome { arms, layer, floor })
+    Ok(ProbeOutcome {
+        arms,
+        layer,
+        floor,
+        shapes,
+    })
 }
 
 #[cfg(test)]

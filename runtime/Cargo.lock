@@ -307,6 +307,7 @@ dependencies = [
 name = "chamber-e2e"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "chamber-evidence",
  "chamber-isolation",
  "chamber-run",

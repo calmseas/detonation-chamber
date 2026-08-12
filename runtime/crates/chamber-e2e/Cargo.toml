@@ -24,6 +24,9 @@ name = "matrix"
 path = "tests/matrix.rs"
 
 [dev-dependencies]
+# The supervisor's judge trait is async, so a scripted judge in a test needs the
+# same macro the trait was declared with.
+async-trait = "0.1.92"
 chamber-isolation = { path = "../chamber-isolation" }
 chamber-run = { path = "../chamber-run" }
 chamber-evidence = { path = "../chamber-evidence" }

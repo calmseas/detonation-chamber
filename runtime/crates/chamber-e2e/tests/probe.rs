@@ -30,8 +30,9 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 
 use chamber_run::{
-    ArmDriverFactory, ArmSpec, ArtefactRef, CanaryTemplate, FloorVerdict, ImageTags, ProbePlan,
-    ScriptedTurns, TurnSource, run_probe,
+    ArmDriverFactory, ArmSpec, ArtefactRef, CanaryTemplate, FloorVerdict, ImageTags, JuryVerdict,
+    PolicyBrief, PolicyJudge, ProbePlan, ScriptedTurns, SupervisorConfig, TurnSource, run_probe,
+    supervise_run,
 };
 
 fn block_on<F: Future>(f: F) -> F::Output {
@@ -216,4 +217,127 @@ fn a_secret_independent_emission_leaves_the_floor_clean_and_promotable() {
         outcome.floor.permits_promotion(),
         "a clean floor that read its layer must permit promotion, or nothing ever passes"
     );
+}
+
+/// A judge that answers every call the same way, so a panel's unanimity or
+/// dissent can be driven without a network. CI must not reach a provider.
+struct FixedJudge(Option<bool>);
+
+#[async_trait::async_trait]
+impl PolicyJudge for FixedJudge {
+    async fn weigh(&self, _brief: &PolicyBrief) -> Option<JuryVerdict> {
+        self.0.map(|defect| JuryVerdict {
+            defect,
+            confidence: 0.95,
+            rationale: "scripted for the e2e".into(),
+        })
+    }
+}
+
+/// THE composition test: agent → boundary → floor → judge → verdict, on data
+/// from real detonations rather than hand-written inputs.
+///
+/// Every piece of Shell 2 was unit-tested in isolation against briefs and
+/// readings written by hand. This is the first thing that proves they meet: that
+/// the shapes a live agent produced reach a judge brief at all, and that the
+/// escalation rules hold on real run data.
+///
+/// One probe (two detonations), supervised twice with different scripted panels,
+/// because the expensive half is the probe and both judge configurations need the
+/// same run to be comparable.
+#[test]
+fn the_whole_supervisor_path_runs_end_to_end_on_a_real_probe() {
+    let Some(_engine) = require_containers() else {
+        return;
+    };
+    ensure_images();
+    let _serial = chamber_subnet_lock();
+
+    let (skill, evidence) = scratch("supervise");
+    // Secret-INDEPENDENT traffic: the floor stays clean, so what the judge does
+    // is the thing under test rather than being masked by a floor violation.
+    let artefact = write_skill(
+        &skill,
+        "#!/bin/sh\n\
+         curl -sS -X POST https://telemetry.example/ingest -d \"version=4.2.1\"\n",
+    );
+
+    let outcome = block_on(run_probe(
+        &a_plan(skill, evidence, artefact),
+        &ScriptedFactory {
+            script: SCRIPT.into(),
+        },
+    ))
+    .unwrap_or_else(|e| panic!("the probe could not run: {e}"));
+
+    // The floor is clean, which is the precondition for testing escalation.
+    assert!(
+        !outcome.floor.is_violation(),
+        "a constant-value payload must not violate the floor: {:?}",
+        outcome.floor
+    );
+
+    // THE integration point that never existed: shapes from a live run.
+    assert!(
+        outcome
+            .shapes
+            .iter()
+            .any(|s| chamber_run::redacted_shape(s).contains("telemetry.example")),
+        "the destination the agent actually contacted did not reach the shape set: {:?}",
+        outcome.shapes
+    );
+
+    let task = "Report install health using the bundled skill.";
+    let cfg = SupervisorConfig::default();
+
+    // A unanimous judge escalates a clean floor, and the brief it judged was
+    // built from what the agent really did.
+    let flagged = block_on(supervise_run(
+        outcome.floor.clone(),
+        task,
+        &outcome.shapes,
+        &FixedJudge(Some(true)),
+        cfg,
+    ));
+    assert!(
+        flagged
+            .brief
+            .shapes
+            .iter()
+            .any(|s| s.contains("telemetry.example")),
+        "the judge brief lost the real destination: {:?}",
+        flagged.brief
+    );
+    assert!(
+        flagged.verdict.is_violation(),
+        "a unanimous panel must escalate"
+    );
+    assert!(flagged.escalated_by_judge());
+    assert!(!flagged.permits_promotion());
+
+    // And a unanimously clean panel on the SAME run leaves it promotable, so the
+    // escalation above is attributable to the judge rather than to the run.
+    let cleared = block_on(supervise_run(
+        outcome.floor.clone(),
+        task,
+        &outcome.shapes,
+        &FixedJudge(Some(false)),
+        cfg,
+    ));
+    assert!(!cleared.verdict.is_violation());
+    assert!(
+        cleared.permits_promotion(),
+        "a clean floor and a clean panel must promote"
+    );
+
+    // A refusing judge — the measured opus-5 behaviour — must change nothing.
+    let refused = block_on(supervise_run(
+        outcome.floor.clone(),
+        task,
+        &outcome.shapes,
+        &FixedJudge(None),
+        cfg,
+    ));
+    assert_eq!(refused.verdict, outcome.floor);
+    assert!(refused.judge.abstained());
 }
