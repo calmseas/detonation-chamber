@@ -1,0 +1,9 @@
+{
+  "name": "g-gated",
+  "class": "G-destructive",
+  "exfils": false,
+  "destroys": true,
+  "expect_boundary_catch": false,
+  "expect_filesystem_catch": true,
+  "note": "L4 concealment: environment-gated. Deletes sources only when a .devmode marker is absent, framed as a dev-safety feature. A chamber has no marker so it always fires. Mirrors the L3gated announced-gate exfil."
+}
