@@ -151,6 +151,13 @@ pub struct RunEpilogue {
     pub trace: StageTrace,
     pub exit_code: i32,
     pub turns_taken: usize,
+    /// What the agent did to `/work`, from a before/after digest snapshot.
+    ///
+    /// **Not sealed evidence.** Nothing in the bundle corroborates it — it is
+    /// the harness reporting what it saw when it looked, so a filesystem finding
+    /// is a lead to confirm. It does not close `gap.filesystem-channel`, which is
+    /// about sealed runtime observation.
+    pub work_diff: crate::worksnapshot::WorkDiff,
 }
 
 /// Destroys whatever was raised if arming does not complete.
@@ -290,6 +297,21 @@ pub async fn run_detonation(
             .map_err(|e| ArmingRefusal::Chamber(format!("staging the skill: {e}")))?;
     }
 
+    // The filesystem baseline, taken HERE and nowhere else: after staging, before
+    // the first turn. Earlier and every staged file reads as something the agent
+    // created, so every run would report a filesystem finding — a failure that
+    // looks exactly like the oracle working. Best-effort: this is a diagnostic
+    // axis, not sealed evidence, and it must never turn a runnable detonation
+    // into a refusal.
+    let work_before = crate::worksnapshot::snapshot(
+        arming.cell.as_ref().expect("just set"),
+        std::path::Path::new(crate::staging::SKILL_ROOT),
+    )
+    .unwrap_or_else(|e| {
+        eprintln!("chamber: could not snapshot /work before the run: {e:?}");
+        crate::worksnapshot::WorkSnapshot::default()
+    });
+
     // ---- armed. From here nothing aborts the run. The guard stays armed
     //      through the turn loop, so an unexpected early exit still tears the
     //      chamber down; it is disarmed only when ownership passes to the
@@ -298,6 +320,18 @@ pub async fn run_detonation(
     let transcript = {
         let cell = arming.cell.as_ref().expect("armed");
         drive_turns(turns, &ToolBridge::new(), cell, plan.max_turns).await
+    };
+
+    // The closing snapshot, while the cell is still alive and before ownership
+    // passes to the wind-down. Same best-effort contract as the baseline.
+    let work_diff = {
+        let cell = arming.cell.as_ref().expect("armed");
+        crate::worksnapshot::snapshot(cell, std::path::Path::new(crate::staging::SKILL_ROOT))
+            .map(|after| work_before.diff(&after))
+            .unwrap_or_else(|e| {
+                eprintln!("chamber: could not snapshot /work after the run: {e:?}");
+                crate::worksnapshot::WorkDiff::default()
+            })
     };
 
     // The chamber is up and its ownership moves to the wind-down, so the
@@ -423,6 +457,7 @@ pub async fn run_detonation(
         verdict: written.verdict,
         trace,
         turns_taken,
+        work_diff,
     })
 }
 

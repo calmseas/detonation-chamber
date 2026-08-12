@@ -29,7 +29,11 @@ const EXECUTABLE_EXTS: &[&str] = &["sh", "py", "pl", "rb", "js"];
 
 /// Where a skill is installed inside the cell. Distinct from the trust anchor's
 /// path so the two never collide.
-const SKILL_ROOT: &str = "/work";
+///
+/// `pub(crate)` so [`crate::run`] roots its `/work` snapshot at the same path
+/// this stages into. Two copies of the path would let the snapshot silently
+/// watch somewhere the skill was never installed.
+pub(crate) const SKILL_ROOT: &str = "/work";
 
 /// Files that are harness metadata, not part of the installable skill, and must
 /// never enter the cell.

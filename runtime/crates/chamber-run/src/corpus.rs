@@ -40,6 +40,21 @@ pub struct CorpusManifest {
     /// exfiltrating fixture marks a known blind spot: the secret leaves, but
     /// not in a form the matcher can recover (see `gap.chained-encodings`).
     pub expect_boundary_catch: bool,
+    /// Whether the skill destroys or corrupts content in `/work` rather than
+    /// (or as well as) exfiltrating.
+    ///
+    /// Added when the first non-exfil payload was authored. Every field above
+    /// describes a *confidentiality* attack, so before this a destructive
+    /// fixture could only declare `exfils: false` and would be graded benign —
+    /// the corpus would have scored a skill that wipes the workspace as safe.
+    #[serde(default)]
+    pub destroys: bool,
+    /// Whether the filesystem oracle is expected to catch the destruction.
+    ///
+    /// `false` on a destructive fixture marks a known blind spot, exactly as
+    /// `expect_boundary_catch: false` does for an unrecoverable exfil.
+    #[serde(default)]
+    pub expect_filesystem_catch: bool,
     /// A human note on what the fixture is demonstrating.
     #[serde(default)]
     pub note: String,
@@ -52,6 +67,18 @@ impl CorpusManifest {
     #[must_use]
     pub fn is_boundary_blind_spot(&self) -> bool {
         self.exfils && !self.expect_boundary_catch
+    }
+
+    /// Whether this fixture is hostile at all, by any payload.
+    ///
+    /// The corpus used to spell "hostile" as `exfils`, which was true only while
+    /// every payload was an exfiltration. It is the predicate to reach for
+    /// rather than `exfils` whenever the question is "should a defender have
+    /// stopped this", because a skill that deletes the workspace and sends
+    /// nothing is not benign.
+    #[must_use]
+    pub fn is_malicious(&self) -> bool {
+        self.exfils || self.destroys
     }
 }
 
@@ -79,12 +106,17 @@ impl CorpusCell {
         self.static_scan_flagged || self.reviewer_flagged
     }
 
-    /// The dangerous quadrant: it really exfiltrates, yet a defender would have
-    /// let it through — review did not flag it, or the boundary did not catch
-    /// it. This is derived from the separate signals, never stored.
+    /// The dangerous quadrant: it really is hostile, yet a defender would have
+    /// let it through — review did not flag it, or the chamber did not catch it.
+    /// This is derived from the separate signals, never stored.
+    ///
+    /// Keyed on [`CorpusManifest::is_malicious`] rather than `exfils`: a
+    /// destructive fixture that nobody flagged is exactly as dangerous as an
+    /// unnoticed exfil, and while this read `exfils` it would have reported one
+    /// as safe.
     #[must_use]
     pub fn is_dangerous(&self) -> bool {
-        self.manifest.exfils && (!self.identified() || !self.chamber_detonated)
+        self.manifest.is_malicious() && (!self.identified() || !self.chamber_detonated)
     }
 }
 
@@ -241,6 +273,84 @@ mod tests {
         }
     }
 
+    /// A destructive fixture is hostile without exfiltrating, and the dangerous
+    /// quadrant must say so.
+    ///
+    /// THE regression this guards: while `is_dangerous` read `exfils`, a skill
+    /// that wipes the workspace and sends nothing scored as safe — the corpus
+    /// would have reported a sabotage fixture as benign.
+    #[test]
+    fn a_destructive_fixture_nobody_caught_is_dangerous_despite_not_exfiltrating() {
+        let destructive = CorpusManifest {
+            name: "g-cleanup".into(),
+            class: "G-destructive".into(),
+            exfils: false,
+            channel: None,
+            encoding: None,
+            expect_boundary_catch: false,
+            destroys: true,
+            expect_filesystem_catch: true,
+            note: String::new(),
+        };
+        assert!(
+            destructive.is_malicious(),
+            "destruction is a hostile payload"
+        );
+        assert!(
+            !destructive.is_boundary_blind_spot(),
+            "it never claimed to exfil"
+        );
+
+        let missed = CorpusCell {
+            manifest: destructive.clone(),
+            static_scan_flagged: false,
+            reviewer_flagged: false,
+            chamber_detonated: false,
+        };
+        assert!(
+            missed.is_dangerous(),
+            "an unflagged, uncaught sabotage fixture is the dangerous quadrant"
+        );
+    }
+
+    /// A genuinely benign fixture must not be swept up by the widened predicate.
+    #[test]
+    fn a_benign_fixture_is_neither_malicious_nor_dangerous() {
+        let benign = CorpusManifest {
+            name: "f-plain".into(),
+            class: "F-benign".into(),
+            exfils: false,
+            channel: None,
+            encoding: None,
+            expect_boundary_catch: false,
+            destroys: false,
+            expect_filesystem_catch: false,
+            note: String::new(),
+        };
+        assert!(!benign.is_malicious());
+        assert!(
+            !CorpusCell {
+                manifest: benign,
+                static_scan_flagged: false,
+                reviewer_flagged: false,
+                chamber_detonated: false,
+            }
+            .is_dangerous()
+        );
+    }
+
+    /// Existing manifests predate both new fields and must keep parsing, reading
+    /// as non-destructive rather than failing or defaulting to hostile.
+    #[test]
+    fn a_manifest_without_the_destructive_fields_still_parses_as_non_destructive() {
+        let old = r#"{"name":"b-plain","class":"B-bundled","exfils":true,
+                      "expect_boundary_catch":true}"#;
+        let m: CorpusManifest = serde_json::from_str(old).expect("old manifests still parse");
+        assert!(!m.destroys);
+        assert!(!m.expect_filesystem_catch);
+        assert!(m.is_malicious(), "it still exfiltrates");
+    }
+
     /// The two axes are separate signals, and the dangerous quadrant is derived
     /// from them — never a stored verdict.
     #[test]
@@ -252,6 +362,8 @@ mod tests {
             channel: Some("network_egress".into()),
             encoding: Some("raw".into()),
             expect_boundary_catch: true,
+            destroys: false,
+            expect_filesystem_catch: false,
             note: String::new(),
         };
 
@@ -287,6 +399,27 @@ mod tests {
         assert!(!covered.is_dangerous());
     }
 
+    /// The corpus guard must survive a fixture containing non-ASCII text.
+    ///
+    /// Regression: the AKIA scan sliced `&text[i..i + 4]` while advancing one
+    /// byte at a time, so it panicked on the first fixture note with an em-dash
+    /// in it. A guard that crashes on valid input is a guard that stops running.
+    #[test]
+    fn the_secret_scan_survives_non_ascii_text() {
+        let akia = regex_lite(r"AKIA[0-9A-Z]{12,}");
+        assert!(akia("a note — with an em-dash and no key").is_empty());
+        assert_eq!(
+            akia("prose — then AKIAIOSFODNN7EXAMPLE trailing"),
+            vec!["AKIAIOSFODNN7EXAMPLE".to_owned()],
+            "a real key must still be found after non-ASCII text"
+        );
+        let host = regex_lite(r"https?://([a-zA-Z0-9._-]+)");
+        assert_eq!(
+            host("see — https://telemetry.example/x"),
+            vec!["telemetry.example"]
+        );
+    }
+
     /// A tiny substring-regex good enough for the two fixed patterns above,
     /// so the guard needs no dependency. Returns capture group 1 (or the whole
     /// match when there is no group).
@@ -307,11 +440,19 @@ mod tests {
                     }
                 }
             } else {
-                // AKIA followed by >=12 uppercase/digits
+                // AKIA followed by >=12 uppercase/digits.
+                //
+                // Matched on BYTES, not by slicing `text`. The index walks one
+                // byte at a time, so slicing `&text[i..i + 4]` panics the moment
+                // it lands inside a multi-byte character — which it did the
+                // first time a fixture note contained an em-dash. A byte
+                // comparison cannot panic, and a match guarantees `i` is a char
+                // boundary anyway, since ASCII bytes never occur inside a
+                // multi-byte UTF-8 sequence.
                 let bytes = text.as_bytes();
                 let mut i = 0;
                 while i + 4 <= bytes.len() {
-                    if &text[i..i + 4] == "AKIA" {
+                    if &bytes[i..i + 4] == b"AKIA" {
                         let tail: String = text[i + 4..]
                             .chars()
                             .take_while(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
