@@ -42,6 +42,7 @@ pub mod corpus;
 pub mod differential;
 pub mod floor;
 pub mod integrity;
+pub mod judge;
 pub mod liveturns;
 pub mod metamorphic;
 pub mod probe;
@@ -65,9 +66,10 @@ pub use differential::{
 pub use floor::{FloorVerdict, floor_verdict, metamorphic_layer, supervise};
 pub use integrity::{
     AnswerUnderTest, Claim, GoldenSpec, IntegrityFinding, Jury, JuryBrief, JuryVerdict,
-    OracleReading, PanelReading, Requirement, cross_reference_reading, filesystem_reading,
+    OracleReading, PanelReading, Requirement, cross_reference_reading, filesystem_reading, gate,
     golden_reading, jury_reading, metamorphic_consistency_reading, panel, written_content_reading,
 };
+pub use judge::{PolicyBrief, PolicyJudge, brief_from_shapes, policy_reading, redacted_shape};
 pub use liveturns::{
     AgentBrief, AgentPrompt, Budget, BudgetRefusal, Exchange, InferenceRecord, LiveTurns, Model,
     ModelChoice, ModelError, ModelReply, record_inference_calls,

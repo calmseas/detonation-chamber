@@ -395,22 +395,42 @@ pub trait Jury {
 /// from signal.
 #[must_use]
 pub fn jury_reading(jury: &dyn Jury, brief: &JuryBrief, floor: f64) -> OracleReading {
-    let Some(v) = jury.deliberate(brief) else {
+    gate(jury.deliberate(brief), floor)
+}
+
+/// Turn a model judge's verdict into a reading, discarding what is too weak to use.
+///
+/// Extracted from [`jury_reading`] because it is brief-agnostic — it inspects only
+/// the verdict — and [`crate::judge`]'s policy judge needs exactly the same rule
+/// over an entirely different brief. Two copies of an abstention rule is how one of
+/// them later stops abstaining.
+///
+/// Both ways of having nothing to say collapse to `Abstained`, never to
+/// `NoDefectFound`: a judge that declined to engage and a judge whose confidence
+/// did not clear the floor have both failed to form a reading, and a supervisor
+/// that recorded either as "no defect" would be manufacturing a pass out of a
+/// non-answer.
+///
+/// `floor` is compared against the model's **self-reported** confidence, so this
+/// is a filter against low-confidence noise, not a calibration guarantee.
+#[must_use]
+pub fn gate(verdict: Option<JuryVerdict>, floor: f64) -> OracleReading {
+    let Some(v) = verdict else {
         return OracleReading::Abstained {
-            why: "the jury returned no verdict".into(),
+            why: "the judge returned no verdict".into(),
         };
     };
     if v.confidence < floor {
         return OracleReading::Abstained {
             why: format!(
-                "jury confidence {:.2} is below the {:.2} floor",
+                "judge confidence {:.2} is below the {:.2} floor",
                 v.confidence, floor
             ),
         };
     }
     if v.defect {
         OracleReading::Defect {
-            detail: format!("jury ({:.2}): {}", v.confidence, v.rationale),
+            detail: format!("judge ({:.2}): {}", v.confidence, v.rationale),
         }
     } else {
         OracleReading::NoDefectFound
