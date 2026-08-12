@@ -222,6 +222,26 @@ async fn main() -> ExitCode {
             for (stage, outcome) in epilogue.trace.entries() {
                 println!("  {:<18} {}", stage.wire_tag(), outcome.wire_tag());
             }
+
+            // What the agent did to /work. Reported next to the verdict because
+            // for a destructive payload the verdict is `no_finding` and this is
+            // the entire finding — a run that deleted the workspace and crossed
+            // no boundary looks identical to a clean one without it.
+            //
+            // NOT sealed evidence: nothing in the bundle corroborates it.
+            let wd = &epilogue.work_diff;
+            println!(
+                "work     {} created, {} modified, {} deleted (harness observation, not sealed)",
+                wd.created.len(),
+                wd.modified.len(),
+                wd.deleted.len()
+            );
+            for path in &wd.deleted {
+                println!("  DELETED  {path}");
+            }
+            for path in &wd.modified {
+                println!("  modified {path}");
+            }
             println!();
             println!(
                 "Read the bundle with `chamber-verify {} {}`. This exit code is a \
