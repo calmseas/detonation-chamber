@@ -2405,7 +2405,7 @@ impl std::error::Error for DifferentialRefusal {}
 /// crate rather than two. Shaped like a plausible credential because an
 /// artefact that only reacts to things that look like secrets should still
 /// react.
-fn mint_canary_value() -> Result<String, DifferentialRefusal> {
+pub(crate) fn mint_canary_value() -> Result<String, DifferentialRefusal> {
     let secret = chamber_evidence::RunSecret::mint()
         .map_err(|e| DifferentialRefusal::Unreadable(format!("entropy unavailable: {e:?}")))?;
     let hex: String = secret

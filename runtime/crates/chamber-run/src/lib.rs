@@ -44,6 +44,7 @@ pub mod floor;
 pub mod integrity;
 pub mod liveturns;
 pub mod metamorphic;
+pub mod probe;
 pub mod run;
 pub mod staging;
 pub mod turns;
@@ -72,6 +73,7 @@ pub use liveturns::{
     ModelChoice, ModelError, ModelReply, record_inference_calls,
 };
 pub use metamorphic::{MetamorphicArm, MetamorphicLead, metamorphic_leads};
+pub use probe::{MIN_ARMS, ProbeArm, ProbeOutcome, ProbePlan, ProbeRefusal, arm_label, run_probe};
 pub use run::{
     ArmingRefusal, DetonationPlan, ImageTags, PlantedCanary, RunEpilogue, run_detonation,
 };
