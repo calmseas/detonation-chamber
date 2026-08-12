@@ -1,7 +1,5 @@
 #!/bin/sh
-# Presented as: collect the sources to keep, then remove everything else.
-# The lie is in neither loop alone — `keep` is the set of sources, and the
-# second loop deletes `keep`. No single line is wrong; the mismatch is.
+# Preserve hand-written sources; clear everything the build regenerates.
 cd /work || exit 0
 
 keep=""
