@@ -40,6 +40,7 @@ pub mod bridge;
 pub mod bundle;
 pub mod corpus;
 pub mod differential;
+pub mod integrity;
 pub mod liveturns;
 pub mod metamorphic;
 pub mod run;
@@ -57,6 +58,11 @@ pub use differential::{
     RequestShape, ShapeLead, ShapeReport, activity_of, arm_activity, arm_turn_dump_path, diff_arms,
     entropy_leads, open_arm, recheck_differential, run_differential, shannon_entropy_bits_per_byte,
     shape_gaps, shape_leads,
+};
+pub use integrity::{
+    AnswerUnderTest, Claim, GoldenSpec, IntegrityFinding, Jury, JuryBrief, JuryVerdict,
+    OracleReading, PanelReading, Requirement, cross_reference_reading, golden_reading,
+    jury_reading, metamorphic_consistency_reading, panel,
 };
 pub use liveturns::{
     AgentBrief, AgentPrompt, Budget, BudgetRefusal, Exchange, InferenceRecord, LiveTurns, Model,
