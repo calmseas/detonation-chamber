@@ -47,6 +47,7 @@ pub mod run;
 pub mod staging;
 pub mod turns;
 pub mod winddown;
+pub mod worksnapshot;
 
 pub use bridge::{CarriedTurn, ToolBridge, TurnTarget};
 pub use bundle::{BoundaryState, Emitted, Observed, emit};
@@ -61,8 +62,8 @@ pub use differential::{
 };
 pub use integrity::{
     AnswerUnderTest, Claim, GoldenSpec, IntegrityFinding, Jury, JuryBrief, JuryVerdict,
-    OracleReading, PanelReading, Requirement, cross_reference_reading, golden_reading,
-    jury_reading, metamorphic_consistency_reading, panel,
+    OracleReading, PanelReading, Requirement, cross_reference_reading, filesystem_reading,
+    golden_reading, jury_reading, metamorphic_consistency_reading, panel, written_content_reading,
 };
 pub use liveturns::{
     AgentBrief, AgentPrompt, Budget, BudgetRefusal, Exchange, InferenceRecord, LiveTurns, Model,
@@ -78,6 +79,10 @@ pub use turns::{
     TurnSource,
 };
 pub use winddown::wind_down;
+pub use worksnapshot::{
+    CellInspect, WorkDiff, WorkSnapshot, digest_tree_script, read_changed, read_file_script,
+    snapshot,
+};
 
 use chamber_evidence::Verdict;
 
