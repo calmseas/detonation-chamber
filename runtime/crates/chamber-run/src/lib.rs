@@ -41,6 +41,7 @@ pub mod bundle;
 pub mod corpus;
 pub mod differential;
 pub mod liveturns;
+pub mod metamorphic;
 pub mod run;
 pub mod staging;
 pub mod turns;
@@ -61,6 +62,7 @@ pub use liveturns::{
     AgentBrief, AgentPrompt, Budget, BudgetRefusal, Exchange, InferenceRecord, LiveTurns, Model,
     ModelChoice, ModelError, ModelReply, record_inference_calls,
 };
+pub use metamorphic::{MetamorphicArm, MetamorphicLead, metamorphic_leads};
 pub use run::{
     ArmingRefusal, DetonationPlan, ImageTags, PlantedCanary, RunEpilogue, run_detonation,
 };

@@ -373,7 +373,7 @@ fn is_uncompared(observation: &Observation) -> bool {
 /// ugly: `path` is compared verbatim and case-sensitively, while an authority is
 /// case-*insensitive*, so a candidate that spelled the host differently from the
 /// reference would produce a lead with no behavioural difference behind it.
-fn normalise_target(target: &str) -> &str {
+pub(crate) fn normalise_target(target: &str) -> &str {
     match target.split_once("://") {
         // Absolute-form: the path begins at the first `/` after the authority,
         // and a bare `https://host` has none.
@@ -385,7 +385,7 @@ fn normalise_target(target: &str) -> &str {
     }
 }
 
-fn split_target(target: &str) -> (String, Vec<String>) {
+pub(crate) fn split_target(target: &str) -> (String, Vec<String>) {
     let path_part = normalise_target(target);
     let (path, query) = path_part.split_once('?').unwrap_or((path_part, ""));
     let mut keys: Vec<String> = query
@@ -407,7 +407,7 @@ fn split_target(target: &str) -> (String, Vec<String>) {
 /// [`split_target`] itself must stay value-blind (`gap.shape-value-blind`);
 /// this sibling exists precisely because the entropy signal is the one
 /// consumer allowed to look at a value.
-fn query_pairs(target: &str) -> Vec<(String, String)> {
+pub(crate) fn query_pairs(target: &str) -> Vec<(String, String)> {
     let path_part = normalise_target(target);
     let query = path_part.split_once('?').map_or("", |(_, q)| q);
     query
