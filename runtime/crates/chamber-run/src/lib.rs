@@ -69,7 +69,10 @@ pub use integrity::{
     OracleReading, PanelReading, Requirement, cross_reference_reading, filesystem_reading, gate,
     golden_reading, jury_reading, metamorphic_consistency_reading, panel, written_content_reading,
 };
-pub use judge::{PolicyBrief, PolicyJudge, brief_from_shapes, policy_reading, redacted_shape};
+pub use judge::{
+    DEFAULT_PANEL, PolicyBrief, PolicyJudge, brief_from_shapes, judge_panel, policy_reading,
+    redacted_shape,
+};
 pub use liveturns::{
     AgentBrief, AgentPrompt, Budget, BudgetRefusal, Exchange, InferenceRecord, LiveTurns, Model,
     ModelChoice, ModelError, ModelReply, record_inference_calls,
