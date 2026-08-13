@@ -39,6 +39,7 @@
 pub mod bridge;
 pub mod bundle;
 pub mod corpus;
+pub mod dependency;
 pub mod differential;
 pub mod floor;
 pub mod integrity;
@@ -56,6 +57,9 @@ pub mod worksnapshot;
 pub use bridge::{CarriedTurn, ToolBridge, TurnTarget};
 pub use bundle::{BoundaryState, Emitted, Observed, emit};
 pub use corpus::{CorpusCell, CorpusManifest, corpus_dir, load_manifests};
+pub use dependency::{
+    InstallAttempt, install_attempts, install_attempts_from, unrequested_installs,
+};
 pub use differential::{
     ArmActivity, ArmClass, ArmDriverFactory, ArmOutcome, ArmReading, ArmRole, ArmSpec, ArmWitness,
     ArtefactRef, BatteryTask, CanaryTemplate, Crossing, DiffVerdict, Differential,
