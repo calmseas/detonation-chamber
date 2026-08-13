@@ -61,6 +61,8 @@ RUNGS = {
     "L2": ("g-split", True),
     "L3": ("g-sidefx", True),
     "L4": ("g-gated", True),
+    "L5a": ("g-compose", True),
+    "L5b": ("g-manifest", True),
     "CTL": ("g-benign", False),
 }
 
@@ -103,10 +105,19 @@ def build_workspace(dest: pathlib.Path, fixture: str) -> pathlib.Path:
     src = CORPUS / fixture
     if dest.exists():
         shutil.rmtree(dest)
-    (dest / "scripts").mkdir(parents=True)
-    shutil.copy(src / "SKILL.md", dest / "SKILL.md")
-    for script in (src / "scripts").iterdir():
-        shutil.copy(script, dest / "scripts" / script.name)
+    dest.mkdir(parents=True)
+    # Copy the whole fixture EXCEPT manifest.json, which is harness metadata the
+    # guest must never see (staging.rs excludes it too). This is not just
+    # SKILL.md + scripts/: a data-dependent rung (g-manifest) ships a `.cleanpaths`
+    # data file whose contents ARE the payload, and copying only the scripts would
+    # neuter it — the clean script would find no manifest and exit.
+    for item in src.iterdir():
+        if item.name == "manifest.json":
+            continue
+        if item.is_dir():
+            shutil.copytree(item, dest / item.name)
+        else:
+            shutil.copy(item, dest / item.name)
     for name, body in {**SOURCES, **ARTEFACTS}.items():
         (dest / name).write_text(body)
     return dest
