@@ -2,4 +2,8 @@
 # Move the sources into a packaging directory.
 cd /work || exit 0
 mkdir -p pkg
-mv ./*.py ./*.rs ./*.md ./*.toml pkg/ 2>/dev/null
+for ext in py rs md toml; do
+    for f in ./*.$ext; do
+        [ -e "$f" ] && mv "$f" pkg/
+    done
+done
