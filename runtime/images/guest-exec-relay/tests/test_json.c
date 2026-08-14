@@ -154,6 +154,66 @@ static void test_truncation_never_splits_an_escape(void) {
     assert(buf[3] == 'Z');
 }
 
+static void test_truncation_never_splits_a_utf8_character(void) {
+    /* The same contract as the escapes above, extended to the one other thing
+     * that spans several output bytes: a multi-byte UTF-8 character. Cutting
+     * one in half emits invalid UTF-8 from the WRITE side — the second
+     * producer of round 2's Critical, and independent of the host's read.
+     *
+     * Each cap below lands INSIDE the character, so a byte-at-a-time escaper
+     * writes its lead byte (and any continuation that still fits) and stops.
+     * Split string literals throughout: a hex escape absorbs every following
+     * hex digit, so "\xe2\x82\xacbbb" would be one out-of-range escape. */
+    char buf[64];
+
+    /* Two-byte: "aaa" + U+00E9 needs 5, cap is 4. */
+    memset(buf, 'Z', sizeof(buf));
+    size_t off = json_append_escaped(buf, 0, 4, "aaa" "\xc3\xa9" "bbb");
+    assert(off == 3);
+    assert(buf[3] == 'Z');
+
+    /* Three-byte: "aaa" + U+20AC needs 6, and neither cap 4 nor cap 5 may
+     * write any part of it. */
+    for (size_t cap = 4; cap <= 5; cap++) {
+        memset(buf, 'Z', sizeof(buf));
+        off = json_append_escaped(buf, 0, cap, "aaa" "\xe2\x82\xac" "bbb");
+        assert(off == 3);
+        assert(buf[3] == 'Z');
+    }
+
+    /* Four-byte: "aaa" + U+1F4A5 needs 7; caps 4..6 must all stop at 3. */
+    for (size_t cap = 4; cap <= 6; cap++) {
+        memset(buf, 'Z', sizeof(buf));
+        off = json_append_escaped(buf, 0, cap, "aaa" "\xf0\x9f\x92\xa5" "bbb");
+        assert(off == 3);
+        assert(buf[3] == 'Z');
+    }
+
+    /* And when it DOES fit it is copied whole, so "never split" has not
+     * quietly become "never emit". */
+    memset(buf, 'Z', sizeof(buf));
+    off = json_append_escaped(buf, 0, 6, "aaa" "\xe2\x82\xac" "bbb");
+    assert(off == 6);
+    assert(memcmp(buf, "aaa" "\xe2\x82\xac", 6) == 0);
+
+    /* An INVALID sequence is not repaired into validity, and not dropped: a
+     * lone 0xFF (which an argv0 read out of tracee memory can genuinely carry)
+     * passes through as one byte, per design §6. Truncating a value that was
+     * already invalid cannot make previously-VALID UTF-8 partial, which is the
+     * only thing this function promises. */
+    memset(buf, 'Z', sizeof(buf));
+    off = json_append_escaped(buf, 0, sizeof(buf), "a\xff" "b");
+    assert(off == 3);
+    assert(memcmp(buf, "a\xff" "b", 3) == 0);
+
+    /* A lead byte with no continuation after it is likewise one byte, not a
+     * claim on the letter that follows: "\xe2z" must not swallow the 'z'. */
+    memset(buf, 'Z', sizeof(buf));
+    off = json_append_escaped(buf, 0, sizeof(buf), "\xe2" "z");
+    assert(off == 2);
+    assert(memcmp(buf, "\xe2" "z", 2) == 0);
+}
+
 int main(void) {
     test_parses_flat_object();
     test_parses_nested_array_of_objects();
@@ -166,6 +226,7 @@ int main(void) {
     test_rejects_2_63_boundary();
     test_escapes_control_characters_rfc8259_forbids();
     test_truncation_never_splits_an_escape();
+    test_truncation_never_splits_a_utf8_character();
     printf("test_json: all tests passed\n");
     return 0;
 }

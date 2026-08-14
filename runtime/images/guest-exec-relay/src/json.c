@@ -263,12 +263,39 @@ const char *json_as_string(json_value_t *v) {
     return v->u.string;
 }
 
+/* How many bytes the UTF-8 sequence starting at `s` occupies, for the purpose
+ * of copying it out WHOLE — 1 for anything this function will not treat as a
+ * multi-byte character.
+ *
+ * A lead byte alone is not enough to claim a length: `\xe2` followed by an
+ * ASCII letter is not a truncated three-byte character, it is one stray byte
+ * and then a letter, and claiming 3 for it would swallow the letter. So the
+ * continuation bytes are checked too, and a sequence whose continuations are
+ * absent or malformed reports 1 — each of its bytes then passes through
+ * individually, exactly as before, which is what "a value that was not valid
+ * UTF-8 is not this layer's to repair" means (design §6). */
+static size_t utf8_seq_len(const unsigned char *s) {
+    unsigned char c = s[0];
+    size_t want;
+    if (c < 0x80) return 1;                    /* ASCII */
+    else if (c >= 0xc2 && c <= 0xdf) want = 2; /* 0xc0/0xc1 are overlong leads */
+    else if (c >= 0xe0 && c <= 0xef) want = 3;
+    else if (c >= 0xf0 && c <= 0xf4) want = 4;
+    else return 1;                             /* continuation byte, or 0xf5+ */
+    for (size_t i = 1; i < want; i++) {
+        if ((s[i] & 0xc0) != 0x80) return 1;   /* NUL included: 0x00 & 0xc0 != 0x80 */
+    }
+    return want;
+}
+
 size_t json_append_escaped(char *buf, size_t off, size_t bufcap, const char *s) {
     if (!s) return off;
-    for (; *s; s++) {
+    while (*s) {
         unsigned char c = (unsigned char)*s;
         char esc[8];
+        const char *src = esc;
         size_t n;
+        size_t consumed = 1;
         switch (c) {
             case '"':  esc[0] = '\\'; esc[1] = '"';  n = 2; break;
             case '\\': esc[0] = '\\'; esc[1] = '\\'; n = 2; break;
@@ -291,14 +318,27 @@ size_t json_append_escaped(char *buf, size_t off, size_t bufcap, const char *s) 
                 } else {
                     /* Bytes >= 0x80 pass through unchanged: a value that was
                      * valid UTF-8 stays valid UTF-8, and one that was not is
-                     * not this function's to repair. */
-                    esc[0] = (char)c;
-                    n = 1;
+                     * not this function's to repair.
+                     *
+                     * A well-formed multi-byte character is copied as ONE unit
+                     * — all of it or none of it. Byte-at-a-time was the second
+                     * producer of the corruption R1 (round 2's Critical) is
+                     * about: the caller stops this function at a per-field
+                     * budget, and a 3-byte character straddling that boundary
+                     * used to leave its first one or two bytes in the record,
+                     * which is invalid UTF-8 emitted by the WRITE side, before
+                     * any reader is involved. Same contract the escape
+                     * sequences above already have (written atomically or not
+                     * at all), for the same reason. */
+                    consumed = utf8_seq_len((const unsigned char *)s);
+                    src = s;
+                    n = consumed;
                 }
         }
         if (off + n > bufcap) break;
-        memcpy(buf + off, esc, n);
+        memcpy(buf + off, src, n);
         off += n;
+        s += consumed;
     }
     return off;
 }
