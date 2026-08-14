@@ -55,7 +55,7 @@ pub mod winddown;
 pub mod worksnapshot;
 
 pub use bridge::{CarriedTurn, ToolBridge, TurnTarget};
-pub use bundle::{BoundaryState, Emitted, Observed, emit};
+pub use bundle::{BoundaryState, Emitted, ExecInterception, Observed, emit};
 pub use corpus::{CorpusCell, CorpusManifest, corpus_dir, load_manifests};
 pub use dependency::{
     InstallAttempt, install_attempts, install_attempts_from, unrequested_installs,
@@ -85,7 +85,8 @@ pub use liveturns::{
 pub use metamorphic::{MetamorphicArm, MetamorphicLead, metamorphic_leads};
 pub use probe::{MIN_ARMS, ProbeArm, ProbeOutcome, ProbePlan, ProbeRefusal, arm_label, run_probe};
 pub use run::{
-    ArmingRefusal, DetonationPlan, ImageTags, PlantedCanary, RunEpilogue, run_detonation,
+    ArmingRefusal, DetonationPlan, EXEC_RELAY_GUEST_IMAGE, ImageTags, PlantedCanary, RunEpilogue,
+    run_detonation,
 };
 pub use staging::{CellFiles, StagingError, skill_dir_beside, stage_skill_dir};
 pub use supervisor::{Supervision, SupervisorConfig, supervise_run};

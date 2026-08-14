@@ -115,6 +115,24 @@ fn records_with_verb(records: &[serde_json::Value], verb: &str) -> Vec<serde_jso
         .collect()
 }
 
+/// The image this suite exercises is the one production recognises as
+/// relay-capable.
+///
+/// `run_detonation` now refuses to arm an `exec_consequence` unless the guest
+/// image's repository is `EXEC_RELAY_GUEST_IMAGE` — so if that constant and the
+/// image this suite actually builds and drives ever part company, the refusal
+/// would fire on the real thing while every test here kept passing. Needs no
+/// container, so it runs even where the rest of this file skips.
+#[test]
+fn the_suite_drives_the_image_production_treats_as_relay_capable() {
+    assert!(
+        IMAGE.starts_with(&format!("{}:", chamber_run::EXEC_RELAY_GUEST_IMAGE)),
+        "this suite builds {IMAGE}, but run_detonation only arms an exec_consequence \
+         against the {} repository",
+        chamber_run::EXEC_RELAY_GUEST_IMAGE
+    );
+}
+
 #[test]
 fn passthrough_is_byte_identical_to_no_interception() {
     let Some(_engine) = require_containers() else {

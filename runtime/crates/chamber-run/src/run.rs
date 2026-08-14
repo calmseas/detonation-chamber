@@ -74,6 +74,59 @@ pub struct ImageTags {
     pub inspector: String,
 }
 
+/// The repository name of the ONLY guest image that carries the exec-relay.
+///
+/// `runtime/images/guest-exec-relay/` is the one Dockerfile that builds
+/// `execrelayd` (as PID 1) and `stub`; `runtime/images/guest/` — the ordinary
+/// cell — has neither. There is nothing else to distinguish them by: both are
+/// alpine, both expose the same `/work` contract, and a plain guest answers
+/// `docker exec <cell> stub ...` with `stub: not found`, exit 127, which the
+/// harness would otherwise attribute to the artefact under test.
+pub const EXEC_RELAY_GUEST_IMAGE: &str = "chamber-guest-exec-relay";
+
+/// Does this image tag name the relay-capable guest?
+///
+/// Compares the REPOSITORY, not the whole tag: `chamber-guest-exec-relay:test`,
+/// `chamber-guest-exec-relay:v3` and `ghcr.io/acme/chamber-guest-exec-relay:x`
+/// are all the same image built for different destinations, and pinning the
+/// literal `:test` tag would refuse a perfectly good production build.
+fn guest_image_carries_exec_relay(tag: &str) -> bool {
+    // Strip the tag, being careful with a registry host that carries a port
+    // (`localhost:5000/foo`): the tag separator is the last colon AFTER the
+    // last slash, if any.
+    let repo = match tag.rfind('/') {
+        Some(slash) => match tag[slash..].rfind(':') {
+            Some(colon) => &tag[..slash + colon],
+            None => tag,
+        },
+        None => tag.split_once(':').map_or(tag, |(r, _)| r),
+    };
+    repo == EXEC_RELAY_GUEST_IMAGE || repo.ends_with(&format!("/{EXEC_RELAY_GUEST_IMAGE}"))
+}
+
+/// Refuses a plan that arms exec-consequence against an image with no relay in
+/// it.
+///
+/// The bridge prefixes every turn with `stub` the moment `exec_consequence` is
+/// `Some` — that is the only condition it has ever consulted. Point that at the
+/// ordinary guest image and every turn of the run becomes
+/// `docker exec <cell> stub <argv>` -> `stub: not found`, exit 127: a whole run
+/// of nothing but 127s, recorded as though the artefact's own commands had
+/// failed. The evidence would be entirely fictitious and nothing anywhere would
+/// say so, which is precisely the failure an [`ArmingRefusal`] exists for — a
+/// run that cannot mean what it claims should not happen at all.
+fn check_exec_relay_capability(plan: &DetonationPlan) -> Result<(), ArmingRefusal> {
+    if plan.exec_consequence.is_none() {
+        return Ok(());
+    }
+    if guest_image_carries_exec_relay(&plan.images.guest) {
+        return Ok(());
+    }
+    Err(ArmingRefusal::ExecRelayImage {
+        guest: plan.images.guest.clone(),
+    })
+}
+
 /// A token to plant, and where.
 #[derive(Debug, Clone)]
 pub struct PlantedCanary {
@@ -121,16 +174,33 @@ pub enum ArmingRefusal {
     Chamber(String),
     Environment(String),
     Observer(String),
+    /// An `exec_consequence` plan against a guest image with no relay in it.
+    ExecRelayImage {
+        guest: String,
+    },
 }
 
 impl std::fmt::Display for ArmingRefusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let relay_detail;
         let (what, detail) = match self {
             Self::NoEngine(d) => ("no usable container engine", d),
             Self::Preflight(d) => ("the host's structural asserts did not hold", d),
             Self::Chamber(d) => ("the chamber could not be raised", d),
             Self::Environment(d) => ("the cell's environment could not be sealed", d),
             Self::Observer(d) => ("the observer never came up", d),
+            Self::ExecRelayImage { guest } => {
+                relay_detail = format!(
+                    "the plan configures an exec_consequence, which prefixes every turn with \
+                     `stub`, but the guest image is {guest} and only {EXEC_RELAY_GUEST_IMAGE} \
+                     carries the relay. Every turn would be `stub: not found`, exit 127, \
+                     recorded against the artefact"
+                );
+                (
+                    "the guest image has no exec-interception relay",
+                    &relay_detail,
+                )
+            }
         };
         write!(
             f,
@@ -243,6 +313,12 @@ pub async fn run_detonation(
     plan: &DetonationPlan,
     turns: &mut dyn TurnSource,
 ) -> Result<RunEpilogue, ArmingRefusal> {
+    // First, before the engine is even probed. It costs nothing, it depends on
+    // nothing outside the plan, and a refusal that has to raise a network and a
+    // warden before it can be reached is a refusal that leaves wreckage — and
+    // one no test can reach without a Docker daemon.
+    check_exec_relay_capability(plan)?;
+
     let engine = Docker::probe().map_err(|e| ArmingRefusal::NoEngine(e.to_string()))?;
     eprintln!(
         "chamber: docker {} on {}/{}",
@@ -469,6 +545,17 @@ pub async fn run_detonation(
                 boundary: state,
                 drops_collected: true,
                 turns_driven: turns_taken,
+                // Both halves as they actually happened: whether a relay was
+                // armed at all, and whether its log came back. Neither is
+                // inferable from the turn count, which is what this used to be
+                // reported from.
+                exec_interception: if plan.exec_consequence.is_some() {
+                    bundle::ExecInterception::Armed {
+                        disclosure_log_read: exec_consequence_log.is_some(),
+                    }
+                } else {
+                    bundle::ExecInterception::NotConfigured
+                },
                 inference_calls: inference_calls.len(),
             };
             let written = bundle::emit(&plan.evidence_dir, log, &observed, &provenance)
@@ -1070,5 +1157,92 @@ mod tests {
         apply_exec_consequence_env(&mut draft, None).unwrap();
         let sealed = draft.seal(&CanaryPlacements::none()).unwrap();
         assert!(!sealed.contains_binding(chamber_capture::exec_consequence::EXEC_SPEC_B64_VAR));
+    }
+
+    // ---- exec_consequence against an image with no relay in it -------------
+
+    fn empty_exec_plan() -> chamber_capture::exec_consequence::ExecConsequencePlan {
+        chamber_capture::exec_consequence::ExecConsequencePlan {
+            rules: vec![],
+            timeout_ms: 60_000,
+            max_concurrent_handlers: 32,
+        }
+    }
+
+    /// THE refusal. `ToolBridge` prefixes every turn with `stub` purely because
+    /// `exec_consequence` is `Some`; against the ordinary guest image that is a
+    /// whole run of `stub: not found`, exit 127, recorded as the artefact's own
+    /// failures with nothing anywhere saying the harness was misconfigured.
+    ///
+    /// Driven through `run_detonation` itself, not through the check function,
+    /// so it proves the check is WIRED IN and not merely present — and it
+    /// reaches the refusal without a container engine, which is exactly why the
+    /// check runs before `Docker::probe`.
+    #[tokio::test]
+    async fn refuses_to_arm_an_exec_consequence_against_a_non_relay_image() {
+        let mut plan = bare_plan(None);
+        plan.images.guest = "chamber-guest:test".to_owned();
+        plan.exec_consequence = Some(empty_exec_plan());
+        let mut source = DeafSource::default();
+
+        let refusal = run_detonation(&plan, &mut source)
+            .await
+            .expect_err("a plan that would run every turn as `stub: not found` must not arm");
+
+        match &refusal {
+            ArmingRefusal::ExecRelayImage { guest } => assert_eq!(guest, "chamber-guest:test"),
+            other => panic!("wrong refusal: {other:?}"),
+        }
+        let printed = refusal.to_string();
+        assert!(printed.contains("chamber-guest-exec-relay"), "{printed}");
+        assert!(printed.contains("stub"), "{printed}");
+        assert_eq!(
+            source.turns_asked, 0,
+            "the refusal must happen before any turn is driven"
+        );
+    }
+
+    /// The relay-capable image is accepted — asserted on the check itself,
+    /// since going further needs a Docker daemon.
+    #[test]
+    fn the_relay_image_arms_an_exec_consequence() {
+        let mut plan = bare_plan(None);
+        plan.images.guest = "chamber-guest-exec-relay:test".to_owned();
+        plan.exec_consequence = Some(empty_exec_plan());
+        assert!(check_exec_relay_capability(&plan).is_ok());
+    }
+
+    /// And a run WITHOUT an exec_consequence is unaffected on any image — the
+    /// check must not turn every ordinary detonation into a refusal.
+    #[test]
+    fn a_plan_without_an_exec_consequence_is_never_refused_for_its_image() {
+        let plan = bare_plan(None);
+        assert_eq!(plan.images.guest, "g");
+        assert!(check_exec_relay_capability(&plan).is_ok());
+    }
+
+    #[test]
+    fn the_relay_image_is_recognised_by_repository_not_by_tag() {
+        // A production build of the same image under a different tag or a
+        // registry prefix is still the relay image; pinning `:test` would
+        // refuse it.
+        for tag in [
+            "chamber-guest-exec-relay:test",
+            "chamber-guest-exec-relay:v3",
+            "chamber-guest-exec-relay",
+            "ghcr.io/acme/chamber-guest-exec-relay:2026-08",
+            "localhost:5000/chamber-guest-exec-relay:dev",
+        ] {
+            assert!(guest_image_carries_exec_relay(tag), "{tag}");
+        }
+        for tag in [
+            "chamber-guest:test",
+            "chamber-guest-exec-relay-old:test",
+            "alpine:3.20",
+            "ghcr.io/acme/chamber-guest:2026-08",
+            "notchamber-guest-exec-relay:test",
+        ] {
+            assert!(!guest_image_carries_exec_relay(tag), "{tag}");
+        }
     }
 }

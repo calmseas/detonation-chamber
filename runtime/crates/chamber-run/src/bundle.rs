@@ -54,6 +54,26 @@ pub enum BoundaryState {
     Missing,
 }
 
+/// What became of the run's exec-interception relay.
+///
+/// A run that configured no `exec_consequence` has no relay at all — the guest
+/// image is the ordinary one, nothing is intercepted, and there is no
+/// disclosure log anywhere. Reporting that as a watched channel (which
+/// `turns_driven > 0` alone did) is a bundle claiming a form of observation the
+/// run never had: every ordinary detonation, with no relay in the picture,
+/// declared `exec_consequence: Watched`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecInterception {
+    /// No `exec_consequence` in the plan. Nothing was intercepted, and nothing
+    /// was meant to be.
+    NotConfigured,
+    /// The relay was armed. `disclosure_log_read` is whether its log actually
+    /// came back out of the cell — the read happens over `docker exec` while
+    /// the cell is still up, and a failure there means the channel was armed
+    /// and then lost, which is a different thing from never arming it.
+    Armed { disclosure_log_read: bool },
+}
+
 /// What the run actually managed to observe.
 ///
 /// Stated by the caller rather than inferred here, because the caller is the
@@ -66,6 +86,9 @@ pub struct Observed {
     pub drops_collected: bool,
     /// Turns actually carried out in the cell.
     pub turns_driven: usize,
+    /// Whether exec interception was configured for this run, and whether its
+    /// evidence was recovered.
+    pub exec_interception: ExecInterception,
     /// Inference calls the driver made and scanned. Zero for a scripted run,
     /// which is what lets the coverage detail tell a channel that was narrowed
     /// from one that was never exercised at all.
@@ -164,18 +187,38 @@ pub fn coverage_for(observed: &Observed) -> CoverageMap {
         // verdict: this channel does not bear one. The exec-consequence relay's
         // activity is disclosed to reviewers but does not itself constitute a
         // boundary departure.
-        Channel::ExecConsequence => {
-            if observed.turns_driven > 0 {
-                ChannelCoverage::Watched
-            } else {
-                ChannelCoverage::Absent {
-                    cause: GapCause::ObserverFailed,
-                    detail: "no turn was carried out, so the exec interception \
-                             relay never activated"
-                        .into(),
-                }
-            }
-        }
+        //
+        // What it is NOT is a function of `turns_driven` alone. That was the
+        // whole condition, so any run with a turn in it reported this channel
+        // Watched — including every ordinary run, which has no relay in the
+        // image, no interception configured and no disclosure log to read. A
+        // bundle is a claim about what was observed; claiming a channel that
+        // was never armed is the one thing coverage must not do.
+        Channel::ExecConsequence => match observed.exec_interception {
+            ExecInterception::NotConfigured => ChannelCoverage::Absent {
+                cause: GapCause::ExcludedByDesign,
+                detail: "this run configured no exec_consequence, so no exec \
+                         interception was armed and nothing was watched on this \
+                         channel"
+                    .into(),
+            },
+            ExecInterception::Armed {
+                disclosure_log_read: false,
+            } => ChannelCoverage::Absent {
+                cause: GapCause::ObserverFailed,
+                detail: "the exec-interception relay was armed but its disclosure \
+                         log could not be read out of the cell, so what it \
+                         intercepted is unknown"
+                    .into(),
+            },
+            ExecInterception::Armed { .. } if observed.turns_driven > 0 => ChannelCoverage::Watched,
+            ExecInterception::Armed { .. } => ChannelCoverage::Absent {
+                cause: GapCause::ObserverFailed,
+                detail: "no turn was carried out, so the exec interception \
+                         relay never activated"
+                    .into(),
+            },
+        },
 
         // Absent either way, and deliberately so: the transport from the
         // driver to the provider is never claimed watched-whole, which is what
@@ -248,6 +291,9 @@ mod inference_coverage_tests {
             boundary: BoundaryState::Sealed,
             drops_collected: true,
             turns_driven: 2,
+            exec_interception: ExecInterception::Armed {
+                disclosure_log_read: true,
+            },
             inference_calls,
         }
     }
@@ -384,7 +430,19 @@ pub fn record_guest_commands(log: &mut RunLog, transcript: &Transcript, secrets:
 /// `runtime/images/guest-exec-relay/src/relayd.c`'s `disclosure_record`) into
 /// `Channel::ExecConsequence` observations. The first line (the
 /// `known_residual_tells` header) carries no turn data and is skipped, not
-/// treated as malformed. Unparseable lines are silently skipped, not
+/// treated as malformed.
+///
+/// `verb_applied` is passed through verbatim and deliberately not interpreted
+/// here. Besides the three verbs and their `*-failed-*` variants it also
+/// carries the relay's lifecycle outcomes — `watchdog-timeout`,
+/// `worker-signaled`, `passthrough-exec-failed`, `protocol-refused` — which is
+/// what makes those distinguishable in the bundle from an ordinary non-zero
+/// guest command. A protocol refusal in particular reaches the caller as exit
+/// 112 (`EXIT_PROTOCOL_ERROR`) and would otherwise be indistinguishable from
+/// the command itself failing; nothing here needs to special-case that code,
+/// because the record beside it says the relay refused the request and why.
+/// Adding a Rust-side meaning for 112 would put the same fact in two places
+/// and let them disagree. Unparseable lines are silently skipped, not
 /// errored — the caller has no recovery available other than "this run has
 /// less exec-consequence disclosure than it should," which is a coverage
 /// gap the bundle's own gap-reporting machinery surfaces, not a reason to
@@ -492,6 +550,12 @@ mod tests {
             boundary: BoundaryState::Sealed,
             drops_collected: true,
             turns_driven: 3,
+            // The healthy baseline arms the relay: the channel's own tests
+            // below vary this deliberately, and every other test wants a run
+            // where nothing is unexpectedly absent.
+            exec_interception: ExecInterception::Armed {
+                disclosure_log_read: true,
+            },
             inference_calls: 0,
         }
     }
@@ -590,8 +654,69 @@ mod tests {
         assert!(coverage.blocking_absences().is_empty());
     }
 
-    /// ExecConsequence is watched when turns are driven, absent otherwise.
-    /// Like GuestCommand, it is not verdict-bearing.
+    /// A run that never configured exec interception must not report the
+    /// channel as watched.
+    ///
+    /// This is the whole finding: the status was computed from `turns_driven`
+    /// alone, so EVERY ordinary detonation — no relay in the guest image, no
+    /// interception configured, no disclosure log in existence — sealed a
+    /// bundle declaring `exec_consequence: Watched`. A coverage map is the
+    /// bundle's claim about what was observed, and this one claimed a channel
+    /// that was never armed.
+    #[test]
+    fn a_run_with_no_exec_consequence_does_not_report_the_channel_as_watched() {
+        let observed = Observed {
+            exec_interception: ExecInterception::NotConfigured,
+            ..healthy()
+        };
+        let coverage = coverage_for(&observed);
+        assert!(
+            matches!(
+                coverage.status(Channel::ExecConsequence),
+                ChannelCoverage::Absent {
+                    cause: GapCause::ExcludedByDesign,
+                    ..
+                }
+            ),
+            "a run that armed no relay reported the channel as {:?}",
+            coverage.status(Channel::ExecConsequence)
+        );
+        // Absent by design, so it must not block: an ordinary run without an
+        // exec_consequence is not a run with insufficient coverage.
+        assert!(
+            coverage.blocking_absences().is_empty(),
+            "{:?}",
+            coverage.blocking_absences()
+        );
+    }
+
+    /// Armed, turns driven, and the log never came back: armed-and-lost is not
+    /// the same as never armed, and neither is Watched.
+    #[test]
+    fn an_unreadable_disclosure_log_is_not_a_watched_channel() {
+        let observed = Observed {
+            exec_interception: ExecInterception::Armed {
+                disclosure_log_read: false,
+            },
+            ..healthy()
+        };
+        let coverage = coverage_for(&observed);
+        assert!(matches!(
+            coverage.status(Channel::ExecConsequence),
+            ChannelCoverage::Absent {
+                cause: GapCause::ObserverFailed,
+                ..
+            }
+        ));
+        assert!(coverage.blocking_absences().is_empty());
+    }
+
+    /// ExecConsequence is watched when the relay was armed AND turns were
+    /// driven, absent otherwise. Like GuestCommand, it is not verdict-bearing.
+    ///
+    /// (Edited in this wave: `healthy()` now states an armed relay, and the
+    /// no-turns half of the assertion is unchanged — an armed relay with no
+    /// turns is still `ObserverFailed`.)
     #[test]
     fn exec_consequence_is_watched_when_turns_driven() {
         let with_turns = healthy();
@@ -670,6 +795,7 @@ mod tests {
                 boundary: BoundaryState::Sealed,
                 drops_collected: true,
                 turns_driven: 1,
+                exec_interception: ExecInterception::NotConfigured,
                 inference_calls: 0,
             },
             &TurnProvenance::Scripted {
@@ -847,6 +973,7 @@ mod tests {
                 boundary: BoundaryState::Sealed,
                 drops_collected: true,
                 turns_driven: 1,
+                exec_interception: ExecInterception::NotConfigured,
                 inference_calls: 0,
             },
             &TurnProvenance::Scripted {
