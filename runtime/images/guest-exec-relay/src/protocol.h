@@ -2,6 +2,7 @@
 #define EXEC_RELAY_PROTOCOL_H
 
 #include <stddef.h>
+#include <stdint.h>
 #include <sys/types.h>
 
 /* The stub -> relayd request framing, in ONE place because both ends have to
@@ -57,6 +58,45 @@
  * "could not reach the relay", 124 is the watchdog timeout, 125/126 are the
  * worker's pre-exec failures and 127 is "not found". */
 #define EXIT_PROTOCOL_ERROR 112
+
+/* ------------------------ the response direction --------------------------
+ *
+ *   <tag:1> <len:4 big-endian>  <len bytes>
+ *
+ * TAG_STDOUT/TAG_STDERR carry output; TAG_EXIT carries a 4-byte big-endian
+ * exit code and ends the response. A single logical stream is ONE OR MORE
+ * frames of the same tag: the receiver concatenates them in arrival order and
+ * stops at TAG_EXIT. */
+#define TAG_STDOUT 1
+#define TAG_STDERR 2
+#define TAG_EXIT   3
+
+/* The largest payload one frame may carry, and the hard limit the receiver
+ * enforces: a frame claiming more than this makes the stub abandon its read
+ * loop outright.
+ *
+ * It lives HERE, with the rest of the wire limits, because the two ends must
+ * agree on it byte for byte and they used to not even share the definition —
+ * stub.c owned it alone, as a private MAX_FRAME_LEN, while relayd.c had no
+ * notion of a frame ceiling at all and simply passed whatever length it had to
+ * send_frame.
+ *
+ * That asymmetry was a live defect, not a tidiness problem. The rewrite verb's
+ * transform legitimately EXPANDS its input — that is what a replacement longer
+ * than its find string does — and once the truncation-within-the-buffer bug was
+ * fixed, the expanded result was handed to send_frame whole. An 8 KiB read of
+ * slash-heavy output under `stdout_find: "/"`, `stdout_replace:
+ * "[REDACTED-PATH]"` is 8192 x 15 = 122880 bytes: one frame, nearly twice this
+ * limit. The stub read the header, saw the over-long length, and `break`ed —
+ * dropping that output AND never reading the TAG_EXIT frame behind it, so it
+ * returned its initialiser `exit_code = 1` and the real exit code was lost too.
+ * Silent truncation plus a corrupted exit status, from a rule doing exactly
+ * what it was configured to do.
+ *
+ * proto_send_stream below is the fix, and this constant is what it slices on.
+ * Anything writing output frames must go through it rather than composing a
+ * frame by hand. */
+#define EXEC_RELAY_MAX_FRAME_LEN 65536
 
 /* ------------------------------- the reader -------------------------------
  *
@@ -144,5 +184,28 @@ int proto_parse_count(const char *s, long *out);
  * of a hang or a read of uninitialised memory. Both retry on EINTR. */
 ssize_t proto_read_full(int fd, void *buf, size_t n);
 ssize_t proto_write_full(int fd, const void *buf, size_t n);
+
+/* ---------------------------- the frame writer ----------------------------
+ *
+ * Both live here rather than in relayd.c for the reason the reader does:
+ * nothing in relayd.c can be compiled off aarch64, so a frame writer living
+ * there is a frame writer no test can reach — and "the writer can emit a frame
+ * the reader refuses" is precisely the class of defect that shipped.
+ *
+ * proto_send_frame writes ONE frame and refuses (-1, nothing written) a
+ * payload over EXEC_RELAY_MAX_FRAME_LEN, so the un-sliced call cannot silently
+ * produce a frame the peer will reject. Use it for the fixed-size control
+ * frames — TAG_EXIT's 4 bytes, a bounded TAG_STDERR refusal message.
+ *
+ * proto_send_stream writes `len` bytes as as many same-tag frames as it takes,
+ * none over the limit, and is what every OUTPUT path must use: output length is
+ * a function of the command's behaviour and the rewrite rule's expansion
+ * factor, neither of which this process gets to bound. A zero-length call
+ * writes one empty frame, exactly as a single proto_send_frame would.
+ *
+ * Both return 0 on success and -1 if the connection could not be written.
+ */
+int proto_send_frame(int fd, uint8_t tag, const void *payload, uint32_t len);
+int proto_send_stream(int fd, uint8_t tag, const void *payload, size_t len);
 
 #endif

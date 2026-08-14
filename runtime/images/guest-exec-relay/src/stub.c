@@ -24,7 +24,6 @@
 #define SOCK_ABSTRACT_NAME "chamber-exec-relay"
 _Static_assert(sizeof(SOCK_ABSTRACT_NAME) <= sizeof(((struct sockaddr_un *)0)->sun_path),
                "abstract socket name must fit sun_path alongside its leading NUL");
-#define MAX_FRAME_LEN 65536
 
 /* Mirror of relayd.c's fill_abstract_addr. The addrlen is what carries the
  * name's length to the kernel — an abstract name is not NUL-terminated — so it
@@ -58,7 +57,41 @@ static ssize_t write_full(int fd, const void *buf, size_t n) {
     return (ssize_t)n;
 }
 
+/* The relay's own configuration, cleared out of THIS process before it does
+ * anything else. Mirrors relayd.c's scrub_relay_private_env, and exists for a
+ * window that one does not cover.
+ *
+ * execrelayd scrubs its own environment at startup, so no relayed worker
+ * inherits the plan and /proc/1/environ no longer hands it out. But the stub is
+ * not forked from execrelayd — it is started by `docker exec`, which builds its
+ * environment from the CONTAINER's config, where the spec necessarily lives
+ * (that is how the relay receives it in the first place). So every live stub
+ * carried the full base64 ExecConsequencePlan in its own environ, and the
+ * agent's commands run as root in the same cell: a relayed command that walked
+ * /proc while any other turn was in flight could read the complete ruleset out
+ * of that stub's /proc/<pid>/environ. Measured, on the otherwise-fixed image.
+ *
+ * The stub reads none of these variables and passes its environment to nothing
+ * — the worker's environment comes from execrelayd, not from here — so clearing
+ * them costs nothing. As in relayd.c, unsetenv() alone would not do: it rewrites
+ * the `environ` array, while /proc/<pid>/environ is served from the original
+ * stack region, which only overwriting the bytes in place clears. */
+static void scrub_relay_private_env(void) {
+    static const char *const RELAY_PRIVATE_ENV[] = {
+        "CHAMBER_EXEC_CONSEQUENCE_SPEC_B64",
+    };
+    for (size_t i = 0; i < sizeof(RELAY_PRIVATE_ENV) / sizeof(RELAY_PRIVATE_ENV[0]); i++) {
+        char *val = getenv(RELAY_PRIVATE_ENV[i]);
+        if (val) memset(val, 0, strlen(val));
+        unsetenv(RELAY_PRIVATE_ENV[i]);
+    }
+}
+
 int main(int argc, char **argv) {
+    /* First, before any failure path can return early and leave the window
+     * open for the life of the process. */
+    scrub_relay_private_env();
+
     if (argc < 2) { fprintf(stderr, "usage: stub [--turn-id=ID] <argv0> [args...]\n"); return 2; }
 
     const char *id = "-";
@@ -132,25 +165,36 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    /* One logical stream is one OR MORE frames of the same tag: each output
+     * frame's payload is written straight through in arrival order, so
+     * concatenation is what this loop already does and always did. That is what
+     * lets the relay slice an output larger than EXEC_RELAY_MAX_FRAME_LEN into
+     * several frames rather than composing one the loop below would refuse —
+     * see proto_send_stream. Only TAG_EXIT ends the loop.
+     *
+     * The initialiser matters to that refusal: an over-long frame `break`s
+     * without ever reaching the TAG_EXIT frame behind it, so the caller would
+     * see this 1 rather than the command's real status. Output loss and a
+     * corrupted exit code, from the same byte. */
     int exit_code = 1;
     for (;;) {
         uint8_t hdr[5];
         if (read_full(sfd, hdr, 5) != 5) break;
         uint32_t len = ((uint32_t)hdr[1]<<24)|((uint32_t)hdr[2]<<16)|((uint32_t)hdr[3]<<8)|hdr[4];
         uint8_t tag = hdr[0];
-        if (len > MAX_FRAME_LEN) break;
-        if (tag == 3) { /* exit */
+        if (len > EXEC_RELAY_MAX_FRAME_LEN) break;
+        if (tag == TAG_EXIT) {
             uint8_t p[4];
             if (len == 4 && read_full(sfd, p, 4) == 4) {
                 int32_t code = (int32_t)(((uint32_t)p[0]<<24)|((uint32_t)p[1]<<16)|((uint32_t)p[2]<<8)|p[3]);
                 exit_code = code;
             }
             break;
-        } else if (tag == 1 || tag == 2) {
+        } else if (tag == TAG_STDOUT || tag == TAG_STDERR) {
             char *buf = malloc(len ? len : 1);
             if (!buf) break;
             if (len && read_full(sfd, buf, len) != (ssize_t)len) { free(buf); break; }
-            int outfd = (tag == 1) ? 1 : 2;
+            int outfd = (tag == TAG_STDOUT) ? STDOUT_FILENO : STDERR_FILENO;
             if (write_full(outfd, buf, len) < 0) { free(buf); break; }
             free(buf);
         } else {

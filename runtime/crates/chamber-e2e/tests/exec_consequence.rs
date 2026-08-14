@@ -526,6 +526,95 @@ fn rewrite_does_not_truncate_an_expanding_replacement() {
 }
 
 #[test]
+fn a_rewritten_stream_over_the_frame_limit_arrives_whole_with_its_exit_code() {
+    let Some(_engine) = require_containers() else {
+        return;
+    };
+    let _serialised = chamber_subnet_lock();
+
+    // The defect the fix above introduced, one layer down. Not truncating the
+    // expanding replacement inside rewrite.c's own buffer meant the whole
+    // expanded result was then handed to a single send_frame — and the wire
+    // protocol has a ceiling that nothing on the sending side enforced. The
+    // stub refuses any frame over EXEC_RELAY_MAX_FRAME_LEN (65536) by breaking
+    // out of its read loop, which loses that frame's output AND never reaches
+    // the TAG_EXIT frame behind it, so the caller falls back to the stub's
+    // initialiser `exit_code = 1`.
+    //
+    // So the silent-truncation defect was not closed, only moved to a higher
+    // threshold — and given a second symptom, a corrupted exit code, that the
+    // in-buffer version never had.
+    //
+    // The shape here is the one from the review: a one-byte find and a 15-byte
+    // replacement, i.e. 15x expansion. The relay reads the worker's pipe 8192
+    // bytes at a time, so ONE read becomes 122880 bytes of transform output —
+    // nearly twice the frame limit, in a single continuous transform with no
+    // nested exec to interrupt it.
+    //
+    // Pre-fix this test sees an empty stdout and status 1. Both, from one
+    // over-long frame.
+    const REPLACEMENT: &str = "[REDACTED-PATH]";
+    // 2^14 slashes, built by doubling a shell variable — every step is an ash
+    // builtin, so no nested exec clears `active_rewrite` mid-stream and the
+    // whole output goes through one transform.
+    const SLASHES: usize = 1 << 14;
+    let plan = ExecConsequencePlan {
+        rules: vec![ExecConsequenceRule {
+            name: "rw-over-frame-limit".to_owned(),
+            match_argv: ArgvMatcher::Argv0 {
+                name: "/bin/sh".to_owned(),
+            },
+            verb: ExecVerb::Rewrite {
+                stdout_find: Some("/".to_owned()),
+                stdout_replace: Some(REPLACEMENT.to_owned()),
+                stderr_find: None,
+                stderr_replace: None,
+            },
+        }],
+        timeout_ms: 60_000,
+        max_concurrent_handlers: 32,
+    };
+    let cell = start_cell(&plan);
+    cell.start().expect("start");
+    std::thread::sleep(Duration::from_millis(300));
+
+    // `exit 42` is the other half of the assertion: a distinctive status that
+    // is neither 0 nor the stub's fallback 1, so "the exit code survived" and
+    // "the exit code was corrupted" cannot be confused.
+    let script = "s=/; i=0; while [ $i -lt 14 ]; do s=\"$s$s\"; i=$((i+1)); done; \
+                  printf %s \"$s\"; exit 42";
+    let out = cell
+        .exec(&["stub", "/bin/sh", "-c", script], OP_WINDOW)
+        .expect("exec");
+
+    let expected_len = SLASHES * REPLACEMENT.len();
+    assert!(
+        expected_len > 65536,
+        "the test must force a rewritten stream past the frame limit, got {expected_len}"
+    );
+    // (a) every byte of the correctly-rewritten output arrives — not merely
+    // "some", and not merely "up to the limit".
+    assert_eq!(
+        out.stdout.len(),
+        expected_len,
+        "the rewritten stream lost {} of {expected_len} bytes crossing the wire",
+        expected_len.saturating_sub(out.stdout.len())
+    );
+    assert_eq!(
+        out.stdout,
+        REPLACEMENT.repeat(SLASHES),
+        "the rewritten stream arrived whole but altered"
+    );
+    // (b) and the real exit code came with it, rather than the stub's
+    // initialiser standing in for a TAG_EXIT frame it never read.
+    assert_eq!(
+        out.status,
+        Some(42),
+        "the exit code was lost with the over-long frame"
+    );
+}
+
+#[test]
 fn a_watchdog_timeout_is_disclosed() {
     let Some(_engine) = require_containers() else {
         return;
@@ -730,6 +819,88 @@ fn a_relayed_command_gets_the_same_signal_environment_as_a_direct_one() {
         "a relayed command carries a variable no plain docker exec has:\n{}",
         via_relay.stdout
     );
+
+    // The much larger version of the same leak, and the reason the name-set
+    // comparison below is no longer a plain equality.
+    //
+    // CHAMBER_EXEC_CONSEQUENCE_SPEC_B64 is the entire interception plan: every
+    // rule, every match pattern, every fabricate payload, every substitute
+    // target. It reaches the cell as container environment, execrelayd reads it
+    // at startup, and the worker used to inherit it wholesale — so `env | grep
+    // CHAMBER_EXEC_CONSEQUENCE` inside any relayed command handed the agent
+    // under evaluation the complete ruleset it is being measured against.
+    // Strictly worse than the RELAY_REQ_ID tell: that one only revealed THAT
+    // something was intercepting, this one reveals exactly what and how, which
+    // is what an adversarial agent needs to evade it.
+    //
+    // Deliberately asserted against the real spec value rather than the name
+    // alone, so this cannot pass because the plan happened not to be set.
+    let spec_value = plan.to_env_pairs().remove(0).1;
+    assert!(
+        !spec_value.is_empty(),
+        "the spec variable is unset in this cell, so scrubbing it proves nothing"
+    );
+    assert!(
+        direct.stdout.contains(&spec_value),
+        "the cell does not carry the spec at all — the assertions below are vacuous"
+    );
+    assert!(
+        !via_relay.stdout.contains("CHAMBER_EXEC_CONSEQUENCE"),
+        "a relayed command can read its own interception configuration:\n{}",
+        via_relay.stdout
+    );
+
+    // unsetenv() only rewrites the `environ` array a child inherits. It does
+    // NOT touch /proc/<pid>/environ, which the kernel serves from the original
+    // stack region — and execrelayd is PID 1 of a cell whose commands run as
+    // root, so the plan was readable there by anything that thought to look.
+    // Overwriting the value bytes in place is the other half of the fix, and
+    // this is what proves it: the name may survive, the plan must not.
+    let pid1_env = cell
+        .exec(
+            &[
+                "stub",
+                "/bin/sh",
+                "-c",
+                "cat /proc/1/environ | tr '\\0' '\\n'",
+            ],
+            OP_WINDOW,
+        )
+        .expect("read pid 1's environ via relay");
+    assert!(
+        !pid1_env.stdout.contains(&spec_value),
+        "the relay's own /proc/1/environ still hands out the interception plan:\n{}",
+        pid1_env.stdout
+    );
+
+    // And the window PID 1's scrub does not cover. The stub is not forked from
+    // execrelayd — `docker exec` builds its environment from the container's
+    // config, where the spec necessarily lives — so every live stub carried the
+    // whole plan in its own environ while execrelayd's was already clean. The
+    // agent's commands run as root in the same cell, so one turn could read the
+    // ruleset out of another turn's in-flight stub. Held open here with a
+    // detached sleep, then read from a *different* relayed command, which is
+    // exactly the shape of the leak.
+    cell.exec_detached(&["stub", "/bin/sleep", "8"], OP_WINDOW)
+        .expect("hold a stub process open");
+    std::thread::sleep(Duration::from_millis(500));
+    let other_env = cell
+        .exec(
+            &[
+                "stub",
+                "/bin/sh",
+                "-c",
+                "for p in /proc/[0-9]*; do tr '\\0' '\\n' < $p/environ 2>/dev/null; done",
+            ],
+            OP_WINDOW,
+        )
+        .expect("read every process's environ via relay");
+    assert!(
+        !other_env.stdout.contains(&spec_value),
+        "a concurrently-running process in the cell still hands out the \
+         interception plan through its own /proc/<pid>/environ"
+    );
+
     let names = |out: &str| -> Vec<String> {
         let mut v: Vec<String> = out
             .lines()
@@ -738,10 +909,21 @@ fn a_relayed_command_gets_the_same_signal_environment_as_a_direct_one() {
         v.sort();
         v
     };
+    // The relayed environment must differ from a direct exec's by EXACTLY the
+    // relay-internal variables and nothing else. §3's "zero config is
+    // indistinguishable from no interception" still holds for every variable
+    // the agent's own command has any business seeing; the one deliberate
+    // exception is the relay's own configuration, whose whole purpose is to be
+    // invisible to the thing it configures interception for.
+    let mut relayed = names(&via_relay.stdout);
+    let mut expected = names(&direct.stdout);
+    expected.retain(|n| n != "CHAMBER_EXEC_CONSEQUENCE_SPEC_B64");
+    relayed.sort();
+    expected.sort();
     assert_eq!(
-        names(&via_relay.stdout),
-        names(&direct.stdout),
-        "the relayed environment names differ from a direct exec's"
+        relayed, expected,
+        "the relayed environment differs from a direct exec's by more than the \
+         relay-internal variables"
     );
 }
 

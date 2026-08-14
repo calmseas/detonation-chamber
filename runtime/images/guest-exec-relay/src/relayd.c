@@ -128,19 +128,14 @@ static void logline(const char *fmt, ...) {
  * be reached by the host-run C unit tests, and a parser nobody can test is a
  * parser whose refusal paths get checked by hand once and never again. */
 
-/* frame tags for the response protocol */
-#define TAG_STDOUT 1
-#define TAG_STDERR 2
-#define TAG_EXIT   3
-
-static void send_frame(int fd, uint8_t tag, const void *payload, uint32_t len) {
-    uint8_t hdr[5];
-    hdr[0] = tag;
-    hdr[1] = (len >> 24) & 0xff; hdr[2] = (len >> 16) & 0xff;
-    hdr[3] = (len >> 8) & 0xff;  hdr[4] = len & 0xff;
-    proto_write_full(fd, hdr, 5);
-    if (len) proto_write_full(fd, payload, len);
-}
+/* The response frame tags and the frame writer itself are protocol.h's now,
+ * alongside the request framing and for the same reason: the two ends have to
+ * agree, and while the writer lived here — in the one file that compiles
+ * nowhere but aarch64 — no test could reach it. A writer that could emit a
+ * frame the reader refuses is exactly what that bought, and exactly what
+ * happened: see EXEC_RELAY_MAX_FRAME_LEN's note. Output goes through
+ * proto_send_stream (sliced to the limit); bounded control frames go through
+ * proto_send_frame. */
 
 /* Read tracee's NUL-terminated string at remote address via /proc/pid/mem */
 static int read_tracee_str(int pid, unsigned long long addr, char *out, size_t outsz) {
@@ -264,9 +259,20 @@ static int disclosure_init(void) {
                 DISCLOSURE_LOG_PATH, strerror(errno));
         return -1;
     }
+    /* The tells this relay knows it leaves and does not mask, declared up front
+     * so a reader of the sealed evidence is not left to discover them. The
+     * substitute entry is new with full-argv replacement: repointing only
+     * argv[0] left the requested arguments visible in the tracee's own argv,
+     * whereas replacing the whole array means /proc/<pid>/cmdline and `ps` now
+     * show the REPLACEMENT argv and no trace of what was actually requested —
+     * an observable difference from plain `docker exec` that did not exist
+     * before, and the requested command survives only in this log. */
     static const char header[] =
         "{\"known_residual_tells\":[\"TracerPid nonzero in /proc/self/status "
-        "\\u2014 structural to ptrace, not masked\"]}\n";
+        "\\u2014 structural to ptrace, not masked\","
+        "\"a substituted process shows the replacement argv in "
+        "/proc/self/cmdline and ps, not the argv that was requested "
+        "\\u2014 the requested one appears only in this log\"]}\n";
     if (proto_write_full(g_disclosure_fd, header, sizeof(header) - 1) < 0) {
         fprintf(stderr, "execrelayd: refusing to start — the disclosure log %s could not "
                         "be written: %s\n", DISCLOSURE_LOG_PATH, strerror(errno));
@@ -383,12 +389,12 @@ static void forward_stream(int fd, uint8_t tag, struct rewrite_stream *rs,
          || strcmp(rs->replace, rule_replace ? rule_replace : "") != 0)) {
         const char *tail = NULL; size_t tail_len = 0;
         if (rewrite_stream_finish(rs, &tail, &tail_len) == 0 && tail_len) {
-            send_frame(fd, tag, tail, (uint32_t)tail_len);
+            proto_send_stream(fd, tag, tail, tail_len);
         }
         rewrite_stream_end(rs);
     }
     if (!rule_find) {
-        if (len) send_frame(fd, tag, buf, (uint32_t)len);
+        if (len) proto_send_stream(fd, tag, buf, len);
         return;
     }
     if (!rs->active) rewrite_stream_begin(rs, rule_find, rule_replace);
@@ -397,13 +403,25 @@ static void forward_stream(int fd, uint8_t tag, struct rewrite_stream *rs,
     if (rewrite_stream_push(rs, buf, len, &out, &out_len) != 0) {
         /* Allocation failure. Fail CLOSED — forwarding the raw bytes here would
          * emit exactly the string the rule exists to remove, at the one moment
-         * nobody is watching. Loud in the container log; the record for this
-         * exec already named the rule that was in force. */
+         * nobody is watching. */
         logline("req=%s rewrite: transform failed (out of memory), %zu bytes dropped",
                 req_id ? req_id : "-", len);
+        /* And into the sealed evidence, not the container log alone. Dropping
+         * the bytes is the right call; dropping them SILENTLY is not — the
+         * exec's own record says a rewrite rule was in force and the output
+         * then arrives short, with nothing anywhere saying a chunk never made
+         * it. That is the invariant stated above trap_target_is_loadable, in
+         * its output-shaped form. Named for the substitute-failed-* /
+         * fabricate-failed-* convention: the verb, then the step that gave
+         * way. */
+        char why[128];
+        snprintf(why, sizeof(why),
+                 "%s transform out of memory; %zu bytes dropped",
+                 tag == TAG_STDERR ? "stderr" : "stdout", len);
+        disclosure_record(req_id, "-", "-", "rewrite-transform-failed", why);
         return;
     }
-    if (out_len) send_frame(fd, tag, out, (uint32_t)out_len);
+    if (out_len) proto_send_stream(fd, tag, out, out_len);
 }
 
 /* Releases whatever the stream is still holding back, at pipe EOF. */
@@ -411,7 +429,7 @@ static void finish_stream(int fd, uint8_t tag, struct rewrite_stream *rs) {
     if (!rs->active) return;
     const char *tail = NULL; size_t tail_len = 0;
     if (rewrite_stream_finish(rs, &tail, &tail_len) == 0 && tail_len) {
-        send_frame(fd, tag, tail, (uint32_t)tail_len);
+        proto_send_stream(fd, tag, tail, tail_len);
     }
     rewrite_stream_end(rs);
 }
@@ -767,12 +785,34 @@ static int run_traced(char *const argv[],
                                 if (set_regs(w, &regs) != 0) {
                                     verb_name = "substitute-failed-set-regs";
                                 } else {
+                                    /* The replacement argv, space-joined, into
+                                     * a fixed buffer — and SAID SO when it does
+                                     * not fit. It silently stopped at the
+                                     * buffer's end before, so a reader of the
+                                     * sealed evidence saw a complete-looking
+                                     * argv that was merely the first 1199 bytes
+                                     * of a longer one: EXEC_RELAY_MAX_ARGV
+                                     * elements of up to
+                                     * EXEC_RELAY_MAX_ARGV_ELEM bytes overruns
+                                     * this many times over. A record that is
+                                     * wrong about what ran is worse than one
+                                     * that admits it is partial. */
                                     size_t dl = 0;
-                                    for (int ai = 0; ai < sub_argc && dl < sizeof(detail) - 1; ai++) {
-                                        int n = snprintf(detail + dl, sizeof(detail) - dl,
+                                    int truncated = 0;
+                                    for (int ai = 0; ai < sub_argc; ai++) {
+                                        size_t room = sizeof(detail) - dl;
+                                        int n = snprintf(detail + dl, room,
                                                          ai ? " %s" : "%s", sub_argv[ai]);
-                                        if (n < 0) break;
-                                        dl += (size_t)n < sizeof(detail) - dl ? (size_t)n : sizeof(detail) - dl - 1;
+                                        /* snprintf returns what it WANTED to
+                                         * write, so n >= room is exactly the
+                                         * "did not fit" test. */
+                                        if (n < 0 || (size_t)n >= room) { truncated = 1; break; }
+                                        dl += (size_t)n;
+                                    }
+                                    if (truncated) {
+                                        static const char MARK[] = "...[truncated]";
+                                        memcpy(detail + sizeof(detail) - sizeof(MARK),
+                                               MARK, sizeof(MARK));
                                     }
                                 }
                             }
@@ -948,9 +988,16 @@ static void protocol_error(int cfd, const char *id, const char *what) {
     disclosure_record(id, "-", "-", "protocol-refused", what);
     char msg[256];
     int n = snprintf(msg, sizeof(msg), "relay: protocol error: %s\n", what);
-    if (n > 0) send_frame(cfd, TAG_STDERR, msg, (uint32_t)n);
+    /* Bounded by the buffer above, so the single-frame form is right here —
+     * and snprintf's return is the length it WANTED, which can exceed the
+     * buffer. Clamped, or an over-long `what` would make this claim more bytes
+     * than msg holds. */
+    if (n > 0) {
+        size_t mlen = (size_t)n < sizeof(msg) ? (size_t)n : sizeof(msg) - 1;
+        proto_send_frame(cfd, TAG_STDERR, msg, (uint32_t)mlen);
+    }
     uint8_t payload[4] = { 0, 0, 0, (uint8_t)EXIT_PROTOCOL_ERROR };
-    send_frame(cfd, TAG_EXIT, payload, 4);
+    proto_send_frame(cfd, TAG_EXIT, payload, 4);
     close(cfd);
 }
 
@@ -962,6 +1009,18 @@ static void handle_conn(int cfd, const struct exec_plan *plan) {
     if (rc == PROTO_CLOSED) {
         /* EOF before END: nothing to answer on, and nothing to run. */
         logline("req id=%s REFUSED: connection closed mid-request", req.id);
+        /* If the ID frame had already arrived, this turn is IDENTIFIABLE and
+         * gets a record. That case is not hypothetical: it is what a host-side
+         * `docker exec` timeout killing the stub mid-request looks like from
+         * here, and it used to leave the turn with no guest output and no relay
+         * record at all — indistinguishable in the bundle from a turn that was
+         * never attempted. A request that closed before sending its id has
+         * nothing to file the record against, so it stays a log line only. */
+        if (strcmp(req.id, "-") != 0) {
+            disclosure_record(req.id, "-", "-", "protocol-abandoned",
+                              "the client closed the connection after sending its "
+                              "turn id but before the request was complete; nothing ran");
+        }
         close(cfd);
         protocol_request_free(&req);
         return;
@@ -983,7 +1042,7 @@ static void handle_conn(int cfd, const struct exec_plan *plan) {
 
     uint32_t code_be = (uint32_t)ecode;
     uint8_t payload[4] = { (code_be>>24)&0xff, (code_be>>16)&0xff, (code_be>>8)&0xff, code_be&0xff };
-    send_frame(cfd, TAG_EXIT, payload, 4);
+    proto_send_frame(cfd, TAG_EXIT, payload, 4);
     logline("req id=%s done exit=%d", req.id, ecode);
     close(cfd);
     protocol_request_free(&req);
@@ -1013,21 +1072,36 @@ static uint32_t g_active_handlers = 0;
 static pid_t *g_handler_pids = NULL;
 static size_t g_handler_cap = 0;
 
+/* Makes room for one more tracked handler, BEFORE the fork that would need it.
+ * Returns 0 if there is room and -1 if there is not.
+ *
+ * The ordering is the point. This grow used to live inside handler_track,
+ * which the accept loop calls AFTER forking — so an allocation failure had no
+ * way left to refuse the work, and simply returned without tracking the pid.
+ * The comment there claimed that was safe because the cap ran "permanently one
+ * tighter"; the code did the opposite. An untracked pid is invisible to
+ * handler_untrack, so its exit never decrements g_active_handlers — but it was
+ * never INCREMENTED either, so the handler ran while the counter said it did
+ * not, and the cap admitted one extra concurrent request for the life of the
+ * process. That is the same fail-OPEN direction as the orphan-reaping drift
+ * this tracked set exists to fix, arrived at by a different route.
+ *
+ * Reserving first makes the failure answerable: the caller still holds an
+ * unforked connection it can refuse in-frame, so the cap fails CLOSED and the
+ * refusal is disclosed like every other. */
+static int handler_reserve(void) {
+    if (g_active_handlers < g_handler_cap) return 0;
+    size_t want = g_handler_cap ? g_handler_cap * 2 : 16;
+    pid_t *grown = realloc(g_handler_pids, want * sizeof(*g_handler_pids));
+    if (!grown) return -1;
+    g_handler_pids = grown;
+    g_handler_cap = want;
+    return 0;
+}
+
+/* Capacity is guaranteed by the handler_reserve() the caller made before
+ * forking, so this cannot fail and no longer has a failure path to get wrong. */
 static void handler_track(pid_t pid) {
-    if (g_active_handlers >= g_handler_cap) {
-        size_t want = g_handler_cap ? g_handler_cap * 2 : 16;
-        pid_t *grown = realloc(g_handler_pids, want * sizeof(*g_handler_pids));
-        if (!grown) {
-            /* Untracked, so its exit will not decrement the counter and this
-             * process's cap becomes permanently one tighter. Refusing work is
-             * the safe direction, and this is a malloc of 128 bytes. */
-            logline("handler tracking: out of memory, pid %d untracked (cap will run tight)",
-                    (int)pid);
-            return;
-        }
-        g_handler_pids = grown;
-        g_handler_cap = want;
-    }
     g_handler_pids[g_active_handlers++] = pid;
 }
 
@@ -1106,6 +1180,15 @@ static int run_server(const struct exec_plan *plan) {
             continue;
         }
 
+        /* Before the fork, so a failure here is still refusable. See
+         * handler_reserve: doing this afterwards is what made an OOM admit an
+         * untracked handler and loosen the cap. */
+        if (handler_reserve() != 0) {
+            logline("rejecting connection: out of memory reserving a handler slot");
+            protocol_error(cfd, "-", "the relay is out of memory; request refused");
+            continue;
+        }
+
         pid_t hpid = fork();
         if (hpid < 0) { perror("fork(handler)"); close(cfd); continue; }
         if (hpid == 0) {
@@ -1153,6 +1236,52 @@ static int ptrace_self_check(void) {
     return 0;
 }
 
+/* ---------------------- relay-internal environment ------------------------
+ *
+ * Every variable execrelayd reads from its OWN environment at startup, and
+ * which therefore must not ride along into the agent's command. The list is
+ * the audit: anything added to it here has to be named here too, and the
+ * grep that finds a new getenv() in this image finds this array beside it.
+ *
+ * Today there is exactly one, and it is the whole interception plan.
+ * CHAMBER_EXEC_CONSEQUENCE_SPEC_B64 is the base64 ExecConsequencePlan — every
+ * rule, every match pattern, every fabricate payload, every substitute target.
+ * The worker inherits `environ` wholesale, which is correct and deliberate for
+ * the agent's own variables and was catastrophic for this one: `env | grep
+ * CHAMBER_EXEC_CONSEQUENCE` inside a relayed command handed the agent under
+ * evaluation the complete ruleset it is being measured against — a strictly
+ * larger disclosure than the RELAY_REQ_ID tell removed alongside it, because
+ * it does not merely reveal that interception exists, it reveals exactly what
+ * is intercepted and how, which is what an adversarial agent needs in order to
+ * evade it.
+ *
+ * Done ONCE here rather than in the worker's pre-exec path, because this
+ * process's own environment is readable too: execrelayd is PID 1 of the cell
+ * and the agent's commands run as root in it, so `cat /proc/1/environ` reaches
+ * the same bytes that `env` did. One scrub at startup covers both, and covers
+ * every fork path — handler processes and --self-test alike — rather than one
+ * exec site that a later path could forget.
+ *
+ * The memset is not belt-and-braces, it is half the fix. unsetenv() rewrites
+ * the `environ` POINTER array, which is what execve() passes on and what
+ * getenv() reads — but /proc/<pid>/environ is served from the original
+ * stack region the kernel populated at exec, which unsetenv never touches.
+ * Overwriting the value bytes in place is what clears that copy; unsetenv is
+ * what clears the inherited one. Neither alone is sufficient.
+ *
+ * Nothing re-reads this variable after config_load_from_env: the parsed plan
+ * lives in memory and is passed by pointer from here down. */
+static void scrub_relay_private_env(void) {
+    static const char *const RELAY_PRIVATE_ENV[] = {
+        "CHAMBER_EXEC_CONSEQUENCE_SPEC_B64",
+    };
+    for (size_t i = 0; i < sizeof(RELAY_PRIVATE_ENV) / sizeof(RELAY_PRIVATE_ENV[0]); i++) {
+        char *val = getenv(RELAY_PRIVATE_ENV[i]);
+        if (val) memset(val, 0, strlen(val));
+        unsetenv(RELAY_PRIVATE_ENV[i]);
+    }
+}
+
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IOLBF, 0);
 
@@ -1162,6 +1291,7 @@ int main(int argc, char **argv) {
                          "is absent, malformed, or invalid\n");
         return 1;
     }
+    scrub_relay_private_env();
     /* The disclosure log (disclosure_init) lives under RELAY_DIR; create it
      * before the log is opened. The control socket no longer needs this
      * directory — it is abstract-namespace now — but the log genuinely does,

@@ -39,6 +39,34 @@ ssize_t proto_read_full(int fd, void *buf, size_t n) {
     return (ssize_t)n;
 }
 
+int proto_send_frame(int fd, uint8_t tag, const void *payload, uint32_t len) {
+    /* Refused rather than truncated or sent anyway. A caller that reaches here
+     * with an over-long payload has a bug the peer would otherwise absorb as
+     * silent data loss — the stub abandons its read loop on an over-long
+     * length, taking the TAG_EXIT frame behind it down too. */
+    if (len > EXEC_RELAY_MAX_FRAME_LEN) return -1;
+    uint8_t hdr[5];
+    hdr[0] = tag;
+    hdr[1] = (uint8_t)((len >> 24) & 0xff); hdr[2] = (uint8_t)((len >> 16) & 0xff);
+    hdr[3] = (uint8_t)((len >> 8) & 0xff);  hdr[4] = (uint8_t)(len & 0xff);
+    if (proto_write_full(fd, hdr, 5) < 0) return -1;
+    if (len && proto_write_full(fd, payload, len) < 0) return -1;
+    return 0;
+}
+
+int proto_send_stream(int fd, uint8_t tag, const void *payload, size_t len) {
+    const char *p = (const char *)payload;
+    /* do/while, so a zero-length call still writes one empty frame — the exact
+     * behaviour a single proto_send_frame call would have had. */
+    do {
+        size_t n = len > EXEC_RELAY_MAX_FRAME_LEN ? (size_t)EXEC_RELAY_MAX_FRAME_LEN : len;
+        if (proto_send_frame(fd, tag, p, (uint32_t)n) != 0) return -1;
+        p += n;
+        len -= n;
+    } while (len);
+    return 0;
+}
+
 int proto_read_line(int fd, char *buf, size_t bufsz) {
     size_t i = 0;
     for (;;) {

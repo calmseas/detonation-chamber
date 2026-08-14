@@ -190,8 +190,21 @@ mod tests {
                 match_argv: ArgvMatcher::Prefix {
                     argv: vec!["pip".to_owned(), "install".to_owned()],
                 },
+                // The COMPLETE argv, spelled out. This example used to be a
+                // bare `["/opt/pkg/fake-pip"]` matched against `pip install
+                // <pkg>`, which read as "redirect to a fake pip that still
+                // sees `install <pkg>`" — argument inheritance the relay does
+                // not do. The replacement's argv is exactly this list, so
+                // `fake-pip` never learns which package was asked for from
+                // argv; if it needs to know, the rule has to name it, or the
+                // fake has to get it some other way (a file it reads, an env
+                // var, or a `fabricate` verb instead).
                 verb: ExecVerb::Substitute {
-                    replacement_argv: vec!["/opt/pkg/fake-pip".to_owned()],
+                    replacement_argv: vec![
+                        "/opt/pkg/fake-pip".to_owned(),
+                        "install".to_owned(),
+                        "--pretend-only".to_owned(),
+                    ],
                 },
             }],
             timeout_ms: 5_000,
@@ -268,6 +281,13 @@ pub enum ArgvMatcher {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ExecVerb {
     /// Run a different program, reporting nothing that reveals the swap.
+    ///
+    /// `replacement_argv` is the COMPLETE argv the replacement runs with:
+    /// element 0 becomes its `argv[0]` and every further element is passed
+    /// through verbatim. The requested command's own arguments are NOT
+    /// inherited — a rule that wants arguments has to spell them out. See
+    /// "Task 4 — Later revision: `substitute` replaces the whole argv" below
+    /// for the argv[0]-only behaviour this replaced.
     Substitute { replacement_argv: Vec<String> },
     /// Let the real command run; transform its captured output before the
     /// caller ever sees it. Literal substring find/replace in v1 — not
@@ -1856,6 +1876,20 @@ Expected: same three forward-reference errors as before (`plan`, `active_rewrite
 cd runtime && git add images/guest-exec-relay/src/base64.h images/guest-exec-relay/src/base64.c images/guest-exec-relay/src/fabricate-emit.c images/guest-exec-relay/src/config.c images/guest-exec-relay/src/relayd.c images/guest-exec-relay/tests/run_c_tests.sh
 git commit -m "fix: per-process scratch addressing and argv-based fabricate so substitute/fabricate/coverage extend to nested execs, not just the top-level command"
 ```
+
+---
+
+### Task 4 — Later revision: `substitute` replaces the whole argv, not only argv[0]
+
+**Supersedes the `VERB_SUBSTITUTE` branch in both code blocks above.** Every version of that branch shown earlier in this plan — Task 4's original and the revision's — repoints only the syscall's *pathname* register at `rule->replacement_argv[0]` and leaves the tracee's own argv pointer untouched. Those blocks are kept as the historical record; the shipped code does something different, and this section is what it does.
+
+**What was wrong.** `config.c` has always parsed the full `replacement_argv` array (up to `EXEC_RELAY_MAX_ARGV` elements), and the dispatch used index 0 and nothing else. So a rule configured `replacement_argv: ["/bin/echo", "intercepted"]` ran `/bin/echo` with the *originally requested* argv and silently dropped every element past the first. Nothing refused that config and nothing recorded the discrepancy — the relay simply did something other than what the rule said, which is the one failure mode this whole layer exists to not have.
+
+**What ships.** The whole replacement argv is packed into the tracee's scratch region (`scratch_pack_argv`, shared with `fabricate`'s redirect-to-helper, in `scratch.c` where it is unit-tested), and BOTH registers are rewritten — pathname and argv pointer. Each step is checked, with its own `substitute-failed-scratch-too-small` / `-mem-write` / `-set-regs` verb name in the disclosure record, because on a failed poke the real syscall proceeds unmodified and recording a plain `"substitute"` would file a failed substitution as a successful one.
+
+**The behaviour change this implies, stated plainly:** a substituted command's arguments are now exactly what the rule configured, and the requested command's own arguments are **not inherited**. A one-element `replacement_argv` therefore runs the replacement with *no* arguments — where the old code would have handed it the requested command's. That is what `replacement_argv` means, and a rule that wants arguments has to say so. Any worked example phrased as "intercept `pip install <pkg>` and redirect it to a fake pip that still needs to know `<pkg>`" describes the old behaviour: the fake binary cannot learn `<pkg>` from its argv any more, so the rule must name it, the fake must obtain it another way, or the case wants `fabricate` rather than `substitute`.
+
+**New residual tell, disclosed.** Because the replacement's argv is what the kernel installs, a substituted process's `/proc/self/cmdline` and `ps` output show the *replacement* argv with no trace of what was requested — an observable difference from plain `docker exec` that the argv[0]-only version did not have. It is declared in the `known_residual_tells` header `disclosure_init()` writes, alongside the ptrace `TracerPid` tell, and the originally-requested argv survives in the record's `requested_argv0` field.
 
 ---
 

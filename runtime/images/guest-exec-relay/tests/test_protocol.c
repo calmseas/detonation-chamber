@@ -388,6 +388,156 @@ static void test_parse_count_rejects_everything_that_is_not_a_count(void) {
     assert(proto_parse_count("nope", &keep) != 0 && keep == 777);
 }
 
+/* --------------------------- the frame WRITER -----------------------------
+ *
+ * The response direction, which had no test at all while its only
+ * implementation lived in relayd.c — the one file that compiles nowhere but
+ * aarch64. What that bought: a writer able to compose a frame its own reader
+ * refuses, which is what shipped once the rewrite verb stopped truncating an
+ * expanding replacement. The transform's output is the command's output times
+ * the rule's expansion factor, neither of which the relay bounds, so
+ * `stdout_find: "/"` with a 15-byte replacement turned an 8 KiB read into a
+ * single 122 KiB frame. The stub read the header, saw a length over its limit,
+ * and abandoned the loop — losing that output AND the TAG_EXIT frame behind
+ * it, so the caller got the stub's initialiser 1 instead of the real status.
+ *
+ * The reader below is deliberately a copy of stub.c's loop, including its
+ * `len > EXEC_RELAY_MAX_FRAME_LEN` refusal, so the property under test is the
+ * real one: what the writer emits, the real receiver accepts.
+ */
+
+/* The stub's own big-endian exit-code encoding. */
+static void put_exit_payload(uint8_t p[4], int32_t code) {
+    uint32_t c = (uint32_t)code;
+    p[0] = (uint8_t)((c >> 24) & 0xff); p[1] = (uint8_t)((c >> 16) & 0xff);
+    p[2] = (uint8_t)((c >> 8) & 0xff);  p[3] = (uint8_t)(c & 0xff);
+}
+
+static void test_a_stream_over_the_frame_limit_is_sliced_not_dropped(void) {
+    /* Over the limit by more than 3x, and deliberately NOT a multiple of it, so
+     * the short final slice is exercised alongside the full ones. */
+    const size_t N = 200u * 1024u + 7u;
+    char *payload = malloc(N);
+    assert(payload != NULL);
+    for (size_t i = 0; i < N; i++) payload[i] = (char)('a' + (i % 26));
+
+    int sv[2];
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+
+    /* Forked, because 200 KiB does not fit a socket buffer: the writer must
+     * block until the reader drains, which is precisely the streaming case. */
+    pid_t pid = fork();
+    assert(pid >= 0);
+    if (pid == 0) {
+        close(sv[1]);
+        uint8_t ep[4];
+        put_exit_payload(ep, 42);
+        /* Exactly what forward_stream does with a rewritten chunk, followed by
+         * the TAG_EXIT frame handle_conn sends behind it. */
+        int ok = proto_send_stream(sv[0], TAG_STDOUT, payload, N) == 0
+                 && proto_send_frame(sv[0], TAG_EXIT, ep, 4) == 0;
+        close(sv[0]);
+        _exit(ok ? 0 : 1);
+    }
+    close(sv[0]);
+
+    char *got = malloc(N);
+    assert(got != NULL);
+    size_t got_len = 0;
+    int frames = 0, saw_exit = 0, exit_code = 1;  /* stub.c's initialiser */
+    for (;;) {
+        uint8_t hdr[5];
+        if (proto_read_full(sv[1], hdr, 5) != 5) break;
+        uint32_t len = ((uint32_t)hdr[1] << 24) | ((uint32_t)hdr[2] << 16)
+                       | ((uint32_t)hdr[3] << 8) | hdr[4];
+        /* stub.c's refusal, reproduced. Pre-fix this tripped on the first
+         * frame and the loop ended right here. */
+        if (len > EXEC_RELAY_MAX_FRAME_LEN) {
+            fprintf(stderr, "frame %d claims %u bytes, over the %d limit — the "
+                            "receiver drops this and everything behind it\n",
+                    frames, len, EXEC_RELAY_MAX_FRAME_LEN);
+        }
+        assert(len <= EXEC_RELAY_MAX_FRAME_LEN);
+        if (hdr[0] == TAG_EXIT) {
+            uint8_t p[4];
+            assert(len == 4);
+            assert(proto_read_full(sv[1], p, 4) == 4);
+            exit_code = (int)(int32_t)(((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16)
+                                       | ((uint32_t)p[2] << 8) | p[3]);
+            saw_exit = 1;
+            break;
+        }
+        assert(hdr[0] == TAG_STDOUT);
+        assert(got_len + len <= N);
+        assert(proto_read_full(sv[1], got + got_len, len) == (ssize_t)len);
+        got_len += len;
+        frames++;
+    }
+    close(sv[1]);
+    int st = 0;
+    waitpid(pid, &st, 0);
+    assert(WIFEXITED(st) && WEXITSTATUS(st) == 0);
+
+    /* (a) every byte arrives, in order, unaltered — not merely "under the
+     * limit". */
+    assert(got_len == N);
+    assert(memcmp(got, payload, N) == 0);
+    /* Sliced, not sent whole: at 200 KiB this is at least four frames. */
+    assert(frames >= 4);
+    /* (b) the exit code behind the output is still readable, and is the real
+     * one rather than the receiver's fallback. */
+    assert(saw_exit);
+    assert(exit_code == 42);
+
+    free(payload);
+    free(got);
+}
+
+/* The common case must not have grown a frame: output under the limit is still
+ * exactly one frame, so this fix costs the ordinary path nothing. */
+static void test_a_stream_under_the_frame_limit_is_a_single_frame(void) {
+    int sv[2];
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    const char msg[] = "hello";
+    assert(proto_send_stream(sv[0], TAG_STDOUT, msg, sizeof(msg) - 1) == 0);
+    assert(shutdown(sv[0], SHUT_WR) == 0);
+
+    uint8_t hdr[5];
+    assert(proto_read_full(sv[1], hdr, 5) == 5);
+    assert(hdr[0] == TAG_STDOUT);
+    uint32_t len = ((uint32_t)hdr[1] << 24) | ((uint32_t)hdr[2] << 16)
+                   | ((uint32_t)hdr[3] << 8) | hdr[4];
+    assert(len == sizeof(msg) - 1);
+    char buf[16];
+    assert(proto_read_full(sv[1], buf, len) == (ssize_t)len);
+    assert(memcmp(buf, msg, len) == 0);
+    /* Nothing else: one frame, not one plus an empty terminator. */
+    assert(proto_read_full(sv[1], hdr, 5) == 0);
+    close(sv[0]);
+    close(sv[1]);
+}
+
+/* The single-frame primitive REFUSES an over-limit payload rather than writing
+ * one the peer will abandon. Without this, a future caller reaching for
+ * proto_send_frame where it wanted proto_send_stream reintroduces the same
+ * defect silently; here it fails at the call instead. */
+static void test_a_single_frame_over_the_limit_is_refused(void) {
+    int sv[2];
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    size_t too_big = (size_t)EXEC_RELAY_MAX_FRAME_LEN + 1;
+    char *payload = calloc(1, too_big);
+    assert(payload != NULL);
+    assert(proto_send_frame(sv[0], TAG_STDOUT, payload, (uint32_t)too_big) == -1);
+    /* And wrote nothing at all — a lone header would desync every frame
+     * after it. */
+    assert(shutdown(sv[0], SHUT_WR) == 0);
+    uint8_t hdr[5];
+    assert(proto_read_full(sv[1], hdr, 5) == 0);
+    free(payload);
+    close(sv[0]);
+    close(sv[1]);
+}
+
 int main(void) {
     test_a_well_formed_request_round_trips();
     test_an_argv_element_containing_a_newline_survives_intact();
@@ -410,6 +560,10 @@ int main(void) {
 
     test_a_signal_mid_request_does_not_corrupt_it();
     test_parse_count_rejects_everything_that_is_not_a_count();
+
+    test_a_stream_over_the_frame_limit_is_sliced_not_dropped();
+    test_a_stream_under_the_frame_limit_is_a_single_frame();
+    test_a_single_frame_over_the_limit_is_refused();
 
     printf("test_protocol: all tests passed\n");
     return 0;
