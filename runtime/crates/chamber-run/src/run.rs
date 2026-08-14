@@ -341,6 +341,35 @@ pub async fn run_detonation(
             })
     };
 
+    // The exec-relay's disclosure log, read here for the same reason as the
+    // closing snapshot just above: this is the last point the cell is
+    // guaranteed to still be RUNNING, not just Rust-owned. AgentHalt
+    // (wind_down's first stage) calls `docker stop` on the cell — a stopped
+    // container refuses `docker exec`, so reading this any later (even
+    // inside BoundarySeal, the *second* stage) would always hit an
+    // already-stopped container. A read failure here is logged, not fatal —
+    // this secondary channel does not bear a verdict, so the run's own
+    // evidence emission is never blocked on it.
+    let exec_consequence_log: Option<String> = if plan.exec_consequence.is_some() {
+        let cell = arming.cell.as_ref().expect("armed");
+        match cell.exec(&["cat", "/work/.execrelay.log"], OP_WINDOW) {
+            Ok(outcome) if outcome.ok() => Some(outcome.stdout),
+            Ok(outcome) => {
+                eprintln!(
+                    "chamber: exec-consequence disclosure log read failed: {}",
+                    outcome.stderr
+                );
+                None
+            }
+            Err(e) => {
+                eprintln!("chamber: could not read exec-consequence disclosure log: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // The chamber is up and its ownership moves to the wind-down, so the
     // arming guard must not destroy any of it.
     let turns_taken = transcript.len();
@@ -358,11 +387,6 @@ pub async fn run_detonation(
     // Taken before the wind-down borrows the closure: the source is done being
     // driven, and what it did is now evidence.
     let inference_calls = turns.inference_calls().to_vec();
-    // Carries the exec-relay's disclosure log out of the `BoundarySeal` stage
-    // (where the cell is still alive) so the `RunRecord` stage can fold it
-    // into the ledger, mirroring how `transcript` is captured before this
-    // point and read back inside a later closure.
-    let exec_consequence_log: std::rc::Rc<std::cell::RefCell<Option<String>>> = Default::default();
 
     wind_down(
         Window::standard(),
@@ -390,31 +414,14 @@ pub async fn run_detonation(
         // would correctly, but needlessly, report insufficient coverage.
         || async {
             let capture = chamber.borrow_mut().capture.take();
-            let stopped = match capture {
+            match capture {
                 Some(capture) => {
                     let stopped = capture.stop(OBSERVER_SEAL_GRACE).map_err(|e| e.to_string());
                     let _ = capture.destroy(OP_WINDOW);
                     stopped
                 }
                 None => Ok(()),
-            };
-            // Read out of the cell HERE: after the observer is stopped (its own
-            // ledger is already flushed) but strictly before `SandboxTeardown`
-            // destroys the cell, since that is the only window the cell is
-            // still alive to `cat` the file from. A read failure is logged, not
-            // fatal — this secondary channel does not bear a verdict, so the
-            // run's own evidence emission is not blocked on it.
-            if plan.exec_consequence.is_some()
-                && let Some(cell) = chamber.borrow().cell.as_ref()
-            {
-                match cell.exec(&["cat", "/work/.execrelay.log"], OP_WINDOW) {
-                    Ok(outcome) => *exec_consequence_log.borrow_mut() = Some(outcome.stdout),
-                    Err(e) => {
-                        eprintln!("chamber: could not read exec-consequence disclosure log: {e}");
-                    }
-                }
             }
-            stopped
         },
         || async {
             let (cell, warden, fabric) = {
@@ -452,7 +459,7 @@ pub async fn run_detonation(
             // could never ride into the artefact.
             let secrets: Vec<String> = plan.canaries.iter().map(|c| c.value.clone()).collect();
             bundle::record_guest_commands(&mut log, &transcript, &secrets);
-            if let Some(text) = exec_consequence_log.borrow().as_deref() {
+            if let Some(text) = exec_consequence_log.as_deref() {
                 bundle::record_exec_consequence_log(&mut log, text, &secrets);
             }
             // The model's side of the run, beside the agent's. Digests only —
