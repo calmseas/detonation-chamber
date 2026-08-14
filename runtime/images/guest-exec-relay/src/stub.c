@@ -10,6 +10,7 @@
 #include <sys/un.h>
 
 #define SOCK_PATH "/tmp/relay.sock"
+#define MAX_FRAME_LEN 65536
 
 static ssize_t read_full(int fd, void *buf, size_t n) {
     char *p = buf; size_t left = n;
@@ -45,21 +46,45 @@ int main(int argc, char **argv) {
     char **real_argv = argv + start;
 
     int sfd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (sfd < 0) {
+        perror("stub: socket");
+        return 111;
+    }
     struct sockaddr_un addr = { .sun_family = AF_UNIX };
     strncpy(addr.sun_path, SOCK_PATH, sizeof(addr.sun_path)-1);
     if (connect(sfd, (struct sockaddr*)&addr, sizeof(addr)) != 0) {
         perror("stub: connect");
+        close(sfd);
         return 111;
     }
 
     char line[2048];
     int n = snprintf(line, sizeof(line), "ID %s\nARGC %d\n", id, real_argc);
-    write_full(sfd, line, n);
+    if (n < 0 || (size_t)n >= sizeof(line)) {
+        fprintf(stderr, "stub: ID line truncated\n");
+        close(sfd);
+        return 2;
+    }
+    if (write_full(sfd, line, (size_t)n) < 0) {
+        close(sfd);
+        return 1;
+    }
     for (int i = 0; i < real_argc; i++) {
         n = snprintf(line, sizeof(line), "ARG %s\n", real_argv[i]);
-        write_full(sfd, line, n);
+        if (n < 0 || (size_t)n >= sizeof(line)) {
+            fprintf(stderr, "stub: ARG line truncated\n");
+            close(sfd);
+            return 2;
+        }
+        if (write_full(sfd, line, (size_t)n) < 0) {
+            close(sfd);
+            return 1;
+        }
     }
-    write_full(sfd, "END\n", 4);
+    if (write_full(sfd, "END\n", 4) < 0) {
+        close(sfd);
+        return 1;
+    }
 
     int exit_code = 1;
     for (;;) {
@@ -67,6 +92,7 @@ int main(int argc, char **argv) {
         if (read_full(sfd, hdr, 5) != 5) break;
         uint32_t len = ((uint32_t)hdr[1]<<24)|((uint32_t)hdr[2]<<16)|((uint32_t)hdr[3]<<8)|hdr[4];
         uint8_t tag = hdr[0];
+        if (len > MAX_FRAME_LEN) break;
         if (tag == 3) { /* exit */
             uint8_t p[4];
             if (len == 4 && read_full(sfd, p, 4) == 4) {
@@ -74,12 +100,15 @@ int main(int argc, char **argv) {
                 exit_code = code;
             }
             break;
-        } else {
+        } else if (tag == 1 || tag == 2) {
             char *buf = malloc(len ? len : 1);
+            if (!buf) break;
             if (len && read_full(sfd, buf, len) != (ssize_t)len) { free(buf); break; }
             int outfd = (tag == 1) ? 1 : 2;
-            write_full(outfd, buf, len);
+            if (write_full(outfd, buf, len) < 0) { free(buf); break; }
             free(buf);
+        } else {
+            break;
         }
     }
     close(sfd);
