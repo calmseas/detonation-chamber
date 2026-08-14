@@ -380,6 +380,51 @@ pub fn record_guest_commands(log: &mut RunLog, transcript: &Transcript, secrets:
     }
 }
 
+/// Parses the exec-relay's disclosure log (one JSON object per line, per
+/// `runtime/images/guest-exec-relay/src/relayd.c`'s `disclosure_record`) into
+/// `Channel::ExecConsequence` observations. The first line (the
+/// `known_residual_tells` header) carries no turn data and is skipped, not
+/// treated as malformed. Unparseable lines are silently skipped, not
+/// errored — the caller has no recovery available other than "this run has
+/// less exec-consequence disclosure than it should," which is a coverage
+/// gap the bundle's own gap-reporting machinery surfaces, not a reason to
+/// fail an entire run's evidence emission over one bad line in a log a
+/// separate C program wrote.
+pub fn record_exec_consequence_log(
+    log: &mut RunLog,
+    disclosure_log_text: &str,
+    secrets: &[String],
+) {
+    for line in disclosure_log_text.lines() {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let Some(obj) = value.as_object() else {
+            continue;
+        };
+        if obj.contains_key("known_residual_tells") {
+            continue;
+        }
+        let (Some(turn_id), Some(argv0), Some(rule), Some(verb), Some(detail)) = (
+            obj.get("turn_id").and_then(|v| v.as_str()),
+            obj.get("requested_argv0").and_then(|v| v.as_str()),
+            obj.get("matched_rule").and_then(|v| v.as_str()),
+            obj.get("verb_applied").and_then(|v| v.as_str()),
+            obj.get("detail").and_then(|v| v.as_str()),
+        ) else {
+            continue;
+        };
+        let kind = ObservationKind::ExecConsequence {
+            turn_id: redact_secrets(turn_id.to_owned(), secrets),
+            requested_argv0: redact_secrets(argv0.to_owned(), secrets),
+            matched_rule: rule.to_owned(),
+            verb_applied: verb.to_owned(),
+            detail: redact_secrets(detail.to_owned(), secrets),
+        };
+        log.note(0, Channel::ExecConsequence, kind, vec![]);
+    }
+}
+
 /// Replaces any canary value found inside an argument with a marker.
 fn redact_secrets(arg: String, secrets: &[String]) -> String {
     secrets
@@ -817,5 +862,54 @@ mod tests {
         assert_eq!(opened.ledger.observations_on(Channel::GuestCommand), 1);
         assert_eq!(opened.verdict, Verdict::NoFinding);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- recording the exec-consequence disclosure log into the ledger ----
+
+    #[test]
+    fn record_exec_consequence_log_parses_one_line_per_record() {
+        let mut log = RunLog::open();
+        let text = concat!(
+            "{\"known_residual_tells\":[\"TracerPid nonzero\"]}\n",
+            "{\"turn_id\":\"t1\",\"timestamp\":1.0,\"requested_argv0\":\"pip\",",
+            "\"matched_rule\":\"fake-pip\",\"verb_applied\":\"fabricate\",\"detail\":\"exit=0\"}\n",
+        );
+        record_exec_consequence_log(&mut log, text, &[]);
+        assert_eq!(log.len(), 1);
+        let entry = &log.entries()[0];
+        assert_eq!(entry.channel(), Channel::ExecConsequence);
+        match entry.kind() {
+            ObservationKind::ExecConsequence {
+                turn_id,
+                matched_rule,
+                verb_applied,
+                ..
+            } => {
+                assert_eq!(turn_id, "t1");
+                assert_eq!(matched_rule, "fake-pip");
+                assert_eq!(verb_applied, "fabricate");
+            }
+            other => panic!("wrong kind: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn record_exec_consequence_log_ignores_malformed_lines() {
+        let mut log = RunLog::open();
+        record_exec_consequence_log(&mut log, "not json\n{}\n", &[]);
+        assert_eq!(log.len(), 0);
+    }
+
+    #[test]
+    fn record_exec_consequence_log_redacts_secrets() {
+        let mut log = RunLog::open();
+        let text = "{\"turn_id\":\"t1\",\"timestamp\":1.0,\"requested_argv0\":\"pip\",\"matched_rule\":\"r\",\"verb_applied\":\"fabricate\",\"detail\":\"secret-token-xyz\"}\n";
+        record_exec_consequence_log(&mut log, text, &["secret-token-xyz".to_owned()]);
+        match log.entries()[0].kind() {
+            ObservationKind::ExecConsequence { detail, .. } => {
+                assert!(!detail.contains("secret-token-xyz"))
+            }
+            other => panic!("wrong kind: {other:?}"),
+        }
     }
 }
