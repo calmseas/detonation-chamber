@@ -134,7 +134,7 @@ static json_value_t *parse_array(struct parser *ps) {
         if (v->u.array.len == cap) {
             cap *= 2;
             json_value_t **tmp = realloc(v->u.array.items, cap * sizeof(json_value_t *));
-            if (!tmp) { ps->failed = 1; json_free(v); ps->depth--; return NULL; }
+            if (!tmp) { ps->failed = 1; json_free(item); json_free(v); ps->depth--; return NULL; }
             v->u.array.items = tmp;
         }
         v->u.array.items[v->u.array.len++] = item;
@@ -266,8 +266,11 @@ const char *json_as_string(json_value_t *v) {
 int json_as_int64(json_value_t *v, int64_t *out) {
     if (!v || v->type != JSON_NUMBER) return -1;
     double d = v->u.number;
-    /* Check that d is in the representable range for int64_t before casting. */
-    if (d < (double)INT64_MIN || d > (double)INT64_MAX) return -1;
+    /* Check that d is in the representable range for int64_t before casting.
+     * Must use literal doubles: (double)INT64_MAX rounds UP to 2^63,
+     * so we use the exact boundary values instead.
+     * Note: upper bound is >= 2^63 because 2^63 itself is out of range. */
+    if (d < -9223372036854775808.0 || d >= 9223372036854775808.0) return -1;
     int64_t truncated = (int64_t)d;
     if ((double)truncated != d) return -1;
     *out = truncated;

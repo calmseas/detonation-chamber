@@ -92,6 +92,20 @@ static void test_rejects_out_of_range_numbers(void) {
     }
 }
 
+static void test_rejects_2_63_boundary(void) {
+    /* Critical boundary test: 2^63 = 9223372036854775808 is exactly
+     * representable as a double but out of range for int64_t (which maxes at 2^63-1).
+     * This tests the fix for the boundary bug where (double)INT64_MAX
+     * rounds UP to 2^63, making the cast undefined behavior. */
+    const char *text = "{\"x\":9223372036854775808}";
+    json_value_t *v = json_parse(text, strlen(text));
+    assert(v != NULL);
+    int64_t result;
+    /* Must return -1, not success with a garbage value */
+    assert(json_as_int64(json_object_get(v, "x"), &result) == -1);
+    json_free(v);
+}
+
 int main(void) {
     test_parses_flat_object();
     test_parses_nested_array_of_objects();
@@ -101,6 +115,7 @@ int main(void) {
     test_rejects_deeply_nested_arrays();
     test_rejects_truncated_nested_object();
     test_rejects_out_of_range_numbers();
+    test_rejects_2_63_boundary();
     printf("test_json: all tests passed\n");
     return 0;
 }
