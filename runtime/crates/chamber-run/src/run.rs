@@ -417,26 +417,30 @@ pub async fn run_detonation(
             })
     };
 
-    // The exec-relay's disclosure log, read here for the same reason as the
-    // closing snapshot just above: this is the last point the cell is
-    // guaranteed to still be RUNNING, not just Rust-owned. AgentHalt
-    // (wind_down's first stage) calls `docker stop` on the cell — a stopped
-    // container refuses `docker exec`, so reading this any later (even
-    // inside BoundarySeal, the *second* stage) would always hit an
-    // already-stopped container. A read failure here is logged, not fatal —
-    // this secondary channel does not bear a verdict, so the run's own
-    // evidence emission is never blocked on it.
+    // The exec-relay's disclosure log: `execrelayd`'s own captured stdout,
+    // fetched from the ENGINE rather than out of the cell.
+    //
+    // It used to be `docker exec cat /work/.exec-relay/disclosure.log`, and its
+    // position here used to be load-bearing — this is the last point the cell
+    // is guaranteed to still be RUNNING, and `docker exec` refuses a stopped
+    // container, so reading any later than AgentHalt (wind_down's first stage)
+    // would always have hit an already-stopped cell. That constraint is gone:
+    // captured logs are readable until the container is REMOVED, which happens
+    // two stages later in ChamberTeardown. The call is left where it was
+    // because the borrow of `arming.cell` is simplest here, not because it has
+    // to be — nothing downstream may re-introduce an ordering requirement
+    // around it.
+    //
+    // A read failure is logged, not fatal — this secondary channel does not
+    // bear a verdict, so the run's own evidence emission is never blocked on
+    // it. Note the *absence* of an exit-status branch: the old `cat` could
+    // report success over an empty read, which is exactly how a non-UTF-8 byte
+    // used to erase a run's whole exec-consequence evidence while still
+    // marking the channel watched.
     let exec_consequence_log: Option<String> = if plan.exec_consequence.is_some() {
         let cell = arming.cell.as_ref().expect("armed");
-        match cell.exec(&["cat", "/work/.exec-relay/disclosure.log"], OP_WINDOW) {
-            Ok(outcome) if outcome.ok() => Some(outcome.stdout),
-            Ok(outcome) => {
-                eprintln!(
-                    "chamber: exec-consequence disclosure log read failed: {}",
-                    outcome.stderr
-                );
-                None
-            }
+        match cell.captured_stdout() {
+            Ok(text) => Some(text),
             Err(e) => {
                 eprintln!("chamber: could not read exec-consequence disclosure log: {e}");
                 None

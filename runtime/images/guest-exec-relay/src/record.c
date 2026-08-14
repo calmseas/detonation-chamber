@@ -76,14 +76,30 @@ _Static_assert(STRUCTURAL_RESERVE >= REC_STRUCTURAL_TAIL_MAX,
  * sources — turn_id 255, argv0 1023, rule name 127, detail 1199 — could in
  * the pathological limit want more than the whole buffer between them; these
  * budgets are what makes that bounded and per-field instead of first-come.
- * They sum to 7424, leaving room for the structure inside an 8 KiB buffer
- * (which relayd.c keeps small deliberately: the record is written with a
- * single write() so concurrent handlers' records cannot interleave). */
-#define BUDGET_TURN_ID   1024
-#define BUDGET_ARGV0     2048
-#define BUDGET_RULE      1024
-#define BUDGET_VERB       256
-#define BUDGET_DETAIL    3072
+ *
+ * Every budget still exceeds its source's RAW length, so an ordinary value
+ * (ASCII, where escaping costs nothing) is never truncated; only a value made
+ * mostly of control characters or quotes can reach its cap.
+ *
+ * They were twice this size until the transport moved from an O_APPEND file to
+ * `execrelayd`'s stdout: a pipe write is only atomic up to PIPE_BUF, so the
+ * whole record now has to fit in DISCLOSURE_RECORD_BUF (see record.h) or
+ * concurrent handlers could interleave a torn line. The static assert below is
+ * that constraint, not a comment about it. */
+#define BUDGET_TURN_ID    512
+#define BUDGET_ARGV0     1024
+#define BUDGET_RULE       512
+#define BUDGET_VERB       128
+#define BUDGET_DETAIL    1536
+
+_Static_assert(BUDGET_TURN_ID + BUDGET_ARGV0 + BUDGET_RULE + BUDGET_VERB + BUDGET_DETAIL
+                   + (sizeof(REC_HEAD) - 1) + REC_STRUCTURAL_TAIL_MAX
+                   <= DISCLOSURE_RECORD_BUF,
+               "the per-field budgets plus the record's own structure no longer fit in "
+               "DISCLOSURE_RECORD_BUF (= PIPE_BUF). A record that can exceed PIPE_BUF can be "
+               "split mid-line by the kernel and interleaved with a concurrent handler's, "
+               "which is the torn-line corruption the single-write discipline exists to "
+               "prevent. Shrink a budget rather than raising the buffer.");
 
 static size_t append_value(char *buf, size_t off, size_t bufcap, size_t budget, const char *s) {
     size_t hard = bufcap - STRUCTURAL_RESERVE;

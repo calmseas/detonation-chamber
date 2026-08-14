@@ -68,9 +68,12 @@ pub enum ExecInterception {
     /// was meant to be.
     NotConfigured,
     /// The relay was armed. `disclosure_log_read` is whether its log actually
-    /// came back out of the cell — the read happens over `docker exec` while
-    /// the cell is still up, and a failure there means the channel was armed
-    /// and then lost, which is a different thing from never arming it.
+    /// came back — the read fetches the cell's captured stdout from the engine
+    /// (`AgentCell::captured_stdout`), and a failure there means the channel
+    /// was armed and then lost, which is a different thing from never arming
+    /// it. Since the capture lives engine-side rather than in the cell's own
+    /// filesystem, "lost" now means the engine would not answer, not that
+    /// something inside the cell removed the evidence.
     Armed { disclosure_log_read: bool },
 }
 
@@ -207,8 +210,8 @@ pub fn coverage_for(observed: &Observed) -> CoverageMap {
             } => ChannelCoverage::Absent {
                 cause: GapCause::ObserverFailed,
                 detail: "the exec-interception relay was armed but its disclosure \
-                         log could not be read out of the cell, so what it \
-                         intercepted is unknown"
+                         log could not be read back from the engine's capture of \
+                         the cell's stdout, so what it intercepted is unknown"
                     .into(),
             },
             ExecInterception::Armed { .. } if observed.turns_driven > 0 => ChannelCoverage::Watched,

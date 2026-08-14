@@ -132,6 +132,27 @@ impl ExecOutcome {
     }
 }
 
+/// What a finished command produced, before any text decoding.
+///
+/// The undecoded form exists because for one caller — reading the exec-relay's
+/// captured disclosure stream — deciding how to survive a non-UTF-8 byte is the
+/// caller's call and not something this module may make silently. See
+/// [`Container::logs_bytes`].
+#[derive(Debug, Clone)]
+pub struct RawOutcome {
+    pub status: Option<i32>,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+}
+
+impl RawOutcome {
+    /// True when the command exited zero.
+    #[must_use]
+    pub fn ok(&self) -> bool {
+        self.status == Some(0)
+    }
+}
+
 /// Runs `docker <argv>`, killing it if it outlives `within`.
 ///
 /// Returns the outcome whatever the exit status: callers that need a non-zero
@@ -139,6 +160,16 @@ impl ExecOutcome {
 /// deliberately do not — a probe technique that is *supposed* to fail exits
 /// non-zero, and that is the measurement, not an error.
 fn run_within(argv: &[&str], within: Duration) -> Result<ExecOutcome, EngineError> {
+    let raw = run_within_raw(argv, within)?;
+    Ok(ExecOutcome {
+        status: raw.status,
+        stdout: decode_lossy(raw.stdout),
+        stderr: decode_lossy(raw.stderr),
+    })
+}
+
+/// [`run_within`], stopping short of turning the output into text.
+fn run_within_raw(argv: &[&str], within: Duration) -> Result<RawOutcome, EngineError> {
     let (out_path, err_path) = (scratch_path("out"), scratch_path("err"));
     let mut child = Command::new("docker")
         .args(argv)
@@ -160,11 +191,11 @@ fn run_within(argv: &[&str], within: Duration) -> Result<ExecOutcome, EngineErro
         }
     };
 
-    let stdout = read_and_remove(&out_path);
-    let stderr = read_and_remove(&err_path);
+    let stdout = read_bytes_and_remove(&out_path);
+    let stderr = read_bytes_and_remove(&err_path);
 
     match status {
-        Some(status) => Ok(ExecOutcome {
+        Some(status) => Ok(RawOutcome {
             status: status.code(),
             stdout,
             stderr,
@@ -202,10 +233,39 @@ fn scratch_path(kind: &str) -> PathBuf {
     ))
 }
 
-fn read_and_remove(path: &PathBuf) -> String {
-    let text = std::fs::read_to_string(path).unwrap_or_default();
+fn read_bytes_and_remove(path: &PathBuf) -> Vec<u8> {
+    let bytes = std::fs::read(path).unwrap_or_default();
     let _ = std::fs::remove_file(path);
-    text
+    bytes
+}
+
+fn read_and_remove(path: &PathBuf) -> String {
+    decode_lossy(read_bytes_and_remove(path))
+}
+
+/// Bytes to text, keeping everything that was not invalid.
+///
+/// **Never `read_to_string`, never strict `String::from_utf8`, and never
+/// `.unwrap_or_default()` over either.** That combination was round 2's
+/// Critical: `std::fs::read_to_string` fails the WHOLE read with
+/// `InvalidData` on a single malformed byte, and `.unwrap_or_default()` then
+/// turns "some of these bytes were not UTF-8" into "there was no output" — with
+/// the command's exit status still 0, so every caller takes its success branch
+/// over an empty string. For the exec-relay's disclosure log that meant one bad
+/// byte anywhere in a run erased every exec-consequence observation in the
+/// sealed bundle, while the bundle still reported the channel as watched.
+///
+/// Lossy decoding is the opposite failure mode and the right one here: an
+/// invalid sequence becomes U+FFFD and costs only its own line's readability,
+/// while every other byte arrives. Nothing in this crate's output handling is
+/// UTF-8-critical — it is all evidence and diagnostics, where a partly
+/// unreadable record beats a silently absent one.
+fn decode_lossy(bytes: Vec<u8>) -> String {
+    match String::from_utf8(bytes) {
+        // The overwhelmingly common case, and it costs no copy.
+        Ok(text) => text,
+        Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
+    }
 }
 
 /// A reachable Linux container engine.
@@ -703,6 +763,31 @@ impl Container {
         run_within(&["logs", &self.id], Duration::from_secs(30))
     }
 
+    /// [`Container::logs`], undecoded.
+    ///
+    /// `docker logs` demultiplexes a non-TTY container's two streams onto its
+    /// own stdout and stderr, so [`RawOutcome::stdout`] here is exactly what
+    /// the container's PID 1 wrote to fd 1 — which for the exec-relay guest is
+    /// the disclosure log and nothing else (`execrelayd`'s own operator output
+    /// goes to stderr precisely so this holds).
+    ///
+    /// Bytes rather than text because the disclosure stream can carry a
+    /// sequence that is not valid UTF-8: `requested_argv0` is a path read raw
+    /// out of tracee memory and is under no encoding obligation. How to survive
+    /// that is the caller's decision — see [`decode_lossy`] for the one
+    /// decision that is never acceptable.
+    ///
+    /// This reads from the engine's own log storage, not from inside the
+    /// container, which is what makes it both readable after the container has
+    /// STOPPED (so sealing no longer has to be sequenced ahead of the
+    /// wind-down's halt) and unreachable by anything running in the container.
+    ///
+    /// # Errors
+    /// [`EngineError`] if the engine refuses.
+    pub fn logs_bytes(&self) -> Result<RawOutcome, EngineError> {
+        run_within_raw(&["logs", &self.id], Duration::from_secs(30))
+    }
+
     /// Runs a command inside the container, feeding `input` to its stdin.
     ///
     /// This is how a file gets *into* a container. The alternatives are worse:
@@ -819,5 +904,64 @@ impl Container {
     pub fn destroy(self, within: Duration) -> Result<(), EngineError> {
         must_run(&["rm", "--force", &self.id], within)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Round 2's Critical, at the exact line it was reported against.
+    ///
+    /// The old helper was `std::fs::read_to_string(path).unwrap_or_default()`.
+    /// Both halves are needed for the bug and both are pinned here: strict
+    /// decoding FAILS on a single malformed byte rather than returning what it
+    /// could, and the `unwrap_or_default` behind it turns that failure into an
+    /// empty string that is indistinguishable from a command which produced no
+    /// output. Applied to the exec-relay's disclosure log — where the failing
+    /// command was `cat`, which exits 0 either way — one bad byte anywhere in a
+    /// run erased every exec-consequence observation from the sealed bundle.
+    #[test]
+    fn one_invalid_byte_costs_its_own_character_and_nothing_else() {
+        // A realistic disclosure log: a header, a record whose argv0 carries a
+        // raw 0xFF the way a path read out of tracee memory can, and a record
+        // after it.
+        let mut log = Vec::new();
+        log.extend_from_slice(b"{\"known_residual_tells\":[\"TracerPid nonzero\"]}\n");
+        log.extend_from_slice(b"{\"turn_id\":\"turn-0\",\"requested_argv0\":\"/bin/no");
+        log.push(0xff);
+        log.extend_from_slice(b"such\"}\n");
+        log.extend_from_slice(b"{\"turn_id\":\"turn-1\",\"requested_argv0\":\"/bin/echo\"}\n");
+
+        // What the old read did, spelled out so the regression is legible: it
+        // is not that the bad line was dropped, it is that there was no output
+        // at all.
+        assert!(
+            String::from_utf8(log.clone()).is_err(),
+            "this fixture is supposed to be invalid UTF-8"
+        );
+
+        let decoded = decode_lossy(log);
+        assert_eq!(
+            decoded.lines().count(),
+            3,
+            "every line must survive, not just the clean ones: {decoded:?}"
+        );
+        assert!(decoded.contains("known_residual_tells"));
+        assert!(decoded.contains("turn-1"));
+        // The bad byte's own line is still there and still parseable JSON —
+        // the byte cost one character's readability and nothing more.
+        let bad = decoded.lines().nth(1).expect("the middle line");
+        assert!(bad.contains('\u{FFFD}'), "{bad:?}");
+        assert!(bad.starts_with("{\"turn_id\":\"turn-0\""), "{bad:?}");
+        assert!(bad.ends_with("such\"}"), "{bad:?}");
+    }
+
+    /// Valid input must come back byte-identical, so "survives invalid UTF-8"
+    /// has not been bought by mangling the ordinary case.
+    #[test]
+    fn valid_utf8_is_unchanged() {
+        let text = "caf\u{e9} \u{20ac}5 \u{1f4a5}\nsecond line\n";
+        assert_eq!(decode_lossy(text.as_bytes().to_vec()), text);
     }
 }

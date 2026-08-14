@@ -50,15 +50,17 @@ impl Drop for CellGuard {
     }
 }
 
+/// A cell running the relay image, configured exactly as production configures
+/// it.
+///
+/// This took a `volumes` parameter until the disclosure log moved off the
+/// filesystem: exactly one test needed a bind mount, to make the log's `open()`
+/// fail on a read-only directory, and with no file there is no such open to
+/// fail. The parameter went with it rather than being left as an unused
+/// affordance — `AgentCell::start` passes no volumes either, and a test helper
+/// that can do something production cannot is how a suite drifts off the shape
+/// it is supposed to be pinning.
 fn start_cell(plan: &ExecConsequencePlan) -> CellGuard {
-    start_cell_with_volumes(plan, vec![])
-}
-
-/// [`start_cell`], plus bind mounts. Only the fail-closed disclosure-log test
-/// needs one — it makes the log's directory read-only, which is the one way to
-/// make the log's `open()` fail without also making the `mkdir` above it fail,
-/// so the refusal being exercised is the one under test.
-fn start_cell_with_volumes(plan: &ExecConsequencePlan, volumes: Vec<String>) -> CellGuard {
     ensure_images_including(&[IMAGE]); // extend the existing ensure_images() helper to also build this image's Dockerfile — see support/mod.rs's existing memoized-build pattern
     let pairs = plan.to_env_pairs();
     let env_file = chamber_isolation::EnvFile::write(&pairs).expect("env file");
@@ -75,9 +77,9 @@ fn start_cell_with_volumes(plan: &ExecConsequencePlan, volumes: Vec<String>) -> 
         dns: vec![],
         // Matches production (AgentCell::start) exactly: a read-only rootfs
         // with the /work tmpfs as the ONLY writable path — no /tmp. This is
-        // what exercises the relay under the real cell's constraints, where
-        // the disclosure log must live under /work/.exec-relay/ rather than
-        // /tmp.
+        // what exercises the relay under the real cell's constraints. The
+        // disclosure log no longer needs a writable path at all (it is PID 1's
+        // stdout), but the rest of the relay still runs under these ones.
         //
         // The bare path with NO option suffix is the point, not an omission:
         // `AgentCell::start` builds this entry as `scratch_root().display()`
@@ -90,20 +92,32 @@ fn start_cell_with_volumes(plan: &ExecConsequencePlan, volumes: Vec<String>) -> 
         // so noexec costs the suite nothing and closes the gap.
         read_only: true,
         tmpfs: vec!["/work".to_owned()],
-        volumes,
+        // Empty, exactly as `AgentCell::start` builds it: the cell never gets a
+        // handle on host state.
+        volumes: vec![],
     })
     .expect("create cell");
     CellGuard::new(container)
+}
+
+/// The cell's captured stdout — which for this image is the disclosure log and
+/// nothing else, everything of `execrelayd`'s that is not a record having moved
+/// to stderr.
+///
+/// Read exactly the way `AgentCell::captured_stdout` reads it on the real
+/// sealing path: from the engine's own capture, as bytes, decoded lossily. NOT
+/// `docker exec cat`, which is what this suite used to do and which cannot
+/// reach the stream at all any more — there is no file to cat.
+fn disclosure_stream(cell: &Container) -> String {
+    let raw = cell.logs_bytes().expect("read the cell's captured stdout");
+    String::from_utf8_lossy(&raw.stdout).into_owned()
 }
 
 /// Every disclosure record the cell has written, one JSON object per entry,
 /// with the `known_residual_tells` header skipped — counted exactly the way
 /// `bundle.rs`'s `record_exec_consequence_log` counts them.
 fn disclosure_records(cell: &Container) -> Vec<serde_json::Value> {
-    let log = cell
-        .exec(&["cat", "/work/.exec-relay/disclosure.log"], OP_WINDOW)
-        .expect("cat the disclosure log");
-    log.stdout
+    disclosure_stream(cell)
         .lines()
         .filter(|l| !l.trim().is_empty())
         .map(|l| {
@@ -365,6 +379,9 @@ fn a_relayed_command_inherits_no_relay_private_descriptors() {
         via_relay.stdout,
         direct.stdout
     );
+    // "disclosure.log" is deliberately still in this list even though the relay
+    // no longer opens one: it is the string a reintroduced log FILE would put
+    // here, and this assert is what would notice.
     for tell in ["disclosure.log", "signalfd", "socket:"] {
         assert!(
             !via_relay.stdout.contains(tell),
@@ -377,7 +394,8 @@ fn a_relayed_command_inherits_no_relay_private_descriptors() {
     // inherited log descriptor was opened O_WRONLY|O_APPEND, so the agent's own
     // command could append forged records to the sealed evidence with a plain
     // shell redirection. Measured on the pre-fix image, this call succeeded and
-    // the forged line was in the log.
+    // the forged line was in the log. It stays pinned after the move to a
+    // streamed log: fd 3 must still be nothing.
     let forge = cell
         .exec(
             &["stub", "/bin/sh", "-c", "echo FORGED-RECORD >&3"],
@@ -389,13 +407,10 @@ fn a_relayed_command_inherits_no_relay_private_descriptors() {
         Some(0),
         "writing to fd 3 from a relayed command should fail — it should not be open"
     );
-    let log = cell
-        .exec(&["cat", "/work/.exec-relay/disclosure.log"], OP_WINDOW)
-        .expect("cat log");
+    let log = disclosure_stream(&cell);
     assert!(
-        !log.stdout.contains("FORGED-RECORD"),
-        "the agent's own command injected a record into the sealed evidence log:\n{}",
-        log.stdout
+        !log.contains("FORGED-RECORD"),
+        "the agent's own command injected a record into the sealed evidence log:\n{log}"
     );
 }
 
@@ -1200,57 +1215,170 @@ fn an_orphan_reaped_by_pid_one_does_not_loosen_the_cap() {
     );
 }
 
+// The test that used to sit here,
+// `a_relay_that_cannot_open_its_disclosure_log_refuses_to_start`, is GONE
+// rather than adapted, and deliberately so. It made the log's `open()` fail by
+// bind-mounting a read-only directory over /work/.exec-relay, and there is no
+// longer an open() — the log is PID 1's stdout, which the container runtime
+// provides before execrelayd runs at all, so no configuration reachable through
+// `docker run` can make it unavailable. The refusal path it pinned still exists
+// in relayd.c (`disclosure_init` refuses if the header write fails), but
+// nothing this suite can arrange will trigger it, and a test that cannot fail
+// is worse than no test.
+//
+// What that test was really defending — "a relay whose evidence does not reach
+// the bundle must not keep serving requests" — is now defended structurally
+// instead of by refusal: the stream cannot be taken away from inside the cell.
+// The two tests below are that claim, made positively.
+
+/// A root-in-cell agent cannot delete or truncate the sealed evidence.
+///
+/// This is design §2's writability-parity clause, and until the log moved off
+/// the tmpfs it was simply not met: `/work/.exec-relay/disclosure.log` was a
+/// plain file in the one writable filesystem the agent has, and
+/// `TurnDirective::RunCommand` runs arbitrary commands in the cell as ROOT. An
+/// agent under evaluation could `rm -rf /work/.exec-relay` (or `: >` the file)
+/// at any point before the wind-down and the sealing `cat` would come back
+/// empty and exit 0 — a bundle reporting the channel watched and zero
+/// interceptions, which reads exactly like a run in which the agent execed
+/// nothing.
+///
+/// The arrangement is what makes this conclusive: a record is produced BEFORE
+/// the tamper attempt and another AFTER it, and both must be in the captured
+/// stream. A mechanism that merely re-created the file after deletion would
+/// pass on the second record and fail on the first.
 #[test]
-fn a_relay_that_cannot_open_its_disclosure_log_refuses_to_start() {
+fn a_root_in_cell_agent_cannot_delete_the_sealed_disclosure_evidence() {
     let Some(_engine) = require_containers() else {
         return;
     };
     let _serialised = chamber_subnet_lock();
-
-    // §9 is fail-closed. A failed open used to leave g_disclosure_fd at -1,
-    // which every subsequent record write short-circuited on: the relay served
-    // every request and recorded nothing, and the resulting bundle is
-    // indistinguishable from a run in which the agent execed nothing at all.
-    // Measured pre-fix: the container stayed up, logging one line
-    // ("disclosure: open: Read-only file system") to a container log nobody
-    // reads, and answered requests normally.
-    //
-    // A read-only bind mount over the relay's directory is what makes the
-    // open() fail while the mkdir above it still succeeds (EEXIST), so this
-    // exercises the disclosure-log refusal specifically rather than the
-    // directory one.
-    let dir = shared_scratch("exec-relay-readonly-log");
-    std::fs::create_dir_all(&dir).expect("scratch dir");
 
     let plan = ExecConsequencePlan {
         rules: vec![],
         timeout_ms: 60_000,
         max_concurrent_handlers: 32,
     };
-    let cell = start_cell_with_volumes(
-        &plan,
-        vec![format!("{}:/work/.exec-relay:ro", dir.display())],
-    );
+    let cell = start_cell(&plan);
     cell.start().expect("start");
+    std::thread::sleep(Duration::from_millis(300));
 
-    let code = cell.wait(OP_WINDOW).expect("wait for the relay to exit");
-    assert_eq!(
-        code, 1,
-        "the relay kept running with no way to record anything"
-    );
-    let logs = cell.logs().expect("logs");
-    let all = format!("{}{}", logs.stdout, logs.stderr);
+    cell.exec(
+        &["stub", "--turn-id=before-tamper", "/bin/echo", "one"],
+        OP_WINDOW,
+    )
+    .expect("exec before the tamper");
+
+    // Everything an agent with root in the cell can bring to bear on the old
+    // log, run as a plain `docker exec` (i.e. NOT through the relay), which is
+    // exactly the privilege `TurnDirective::RunCommand` hands it. Each is
+    // allowed to fail — there is nothing there to remove any more — but none
+    // may affect what has already been captured.
+    //
+    // The truncation runs in a SUBSHELL on purpose: `:` is a POSIX special
+    // built-in, and a redirection error on one of those is fatal to the shell
+    // that ran it. Un-subshelled, the very first line would abort the script
+    // (there is no such directory any more) and nothing below it would run —
+    // which is a tamper attempt that never happened, dressed as a passing test.
+    let tamper = cell
+        .exec(
+            &[
+                "/bin/sh",
+                "-c",
+                "( : > /work/.exec-relay/disclosure.log ) 2>/dev/null; \
+                 rm -rf /work/.exec-relay 2>/dev/null; \
+                 rm -rf /work/* 2>/dev/null; \
+                 echo tampered",
+            ],
+            OP_WINDOW,
+        )
+        .expect("run the tamper attempt");
     assert!(
-        all.contains("refusing to start"),
-        "the relay exited without saying why:\n{all}"
+        tamper.stdout.contains("tampered"),
+        "the tamper attempt did not run at all, so this proves nothing: {tamper:?}"
+    );
+
+    cell.exec(
+        &["stub", "--turn-id=after-tamper", "/bin/echo", "two"],
+        OP_WINDOW,
+    )
+    .expect("exec after the tamper");
+
+    let records = disclosure_records(&cell);
+    let turns: Vec<&str> = records
+        .iter()
+        .filter_map(|r| r["turn_id"].as_str())
+        .collect();
+    assert!(
+        turns.contains(&"before-tamper"),
+        "a root-in-cell agent erased evidence recorded BEFORE it interfered — \
+         the parity clause is still unmet:\n{records:#?}"
     );
     assert!(
-        all.contains("disclosure log"),
-        "the refusal does not name the disclosure log:\n{all}"
+        turns.contains(&"after-tamper"),
+        "the relay stopped recording after the agent removed /work/.exec-relay, \
+         so interference still blinds the channel:\n{records:#?}"
     );
+
+    // And the header, which is written once at startup and can never be
+    // re-emitted — its survival is the sharpest proof that the capture is not
+    // something the cell holds.
     assert!(
-        !all.contains("listening on"),
-        "the relay bound its socket before discovering it could not record:\n{all}"
+        disclosure_stream(&cell).contains("known_residual_tells"),
+        "the disclosure header did not survive the tamper attempt"
+    );
+}
+
+/// The disclosure stream is readable AFTER the cell has been stopped.
+///
+/// The concrete benefit of moving off the tmpfs file. `docker exec` refuses a
+/// stopped container, so the old sealing read had to be sequenced ahead of the
+/// wind-down's `AgentHalt` stage — an ordering constraint an earlier task in
+/// this build had to discover and fix by hand, and one that any later
+/// reordering of the wind-down could silently reintroduce. Captured logs
+/// survive until the container is REMOVED, so there is no ordering to get
+/// wrong; this test is what keeps that true.
+#[test]
+fn the_disclosure_stream_outlives_the_cell_it_came_from() {
+    let Some(_engine) = require_containers() else {
+        return;
+    };
+    let _serialised = chamber_subnet_lock();
+
+    let plan = ExecConsequencePlan {
+        rules: vec![],
+        timeout_ms: 60_000,
+        max_concurrent_handlers: 32,
+    };
+    let cell = start_cell(&plan);
+    cell.start().expect("start");
+    std::thread::sleep(Duration::from_millis(300));
+
+    cell.exec(
+        &["stub", "--turn-id=before-halt", "/bin/echo", "recorded"],
+        OP_WINDOW,
+    )
+    .expect("exec");
+
+    // The same call `AgentCell::halt` makes as the wind-down's first stage.
+    cell.stop(Duration::from_secs(5)).expect("stop the cell");
+
+    // Proof the container really is down, and proof that the OLD mechanism
+    // would have returned nothing here: `docker exec` against a stopped
+    // container fails outright.
+    let exec_after_stop = cell.exec(&["/bin/echo", "alive"], OP_WINDOW);
+    assert!(
+        exec_after_stop.is_err() || exec_after_stop.as_ref().is_ok_and(|o| !o.ok()),
+        "the cell answered an exec after being stopped, so this test is not \
+         measuring what it claims: {exec_after_stop:?}"
+    );
+
+    let records = disclosure_records(&cell);
+    assert!(
+        records
+            .iter()
+            .any(|r| r["turn_id"].as_str() == Some("before-halt")),
+        "the disclosure stream was unreadable once the cell stopped:\n{records:#?}"
     );
 }
 
@@ -1801,13 +1929,117 @@ fn turn_id_lands_on_the_disclosure_record() {
         OP_WINDOW,
     )
     .expect("exec");
-    let log = cell
-        .exec(&["cat", "/work/.exec-relay/disclosure.log"], OP_WINDOW)
-        .expect("cat log");
+    let log = disclosure_stream(&cell);
     assert!(
-        log.stdout.contains("turn-test-42"),
-        "log did not carry the turn id:\n{}",
-        log.stdout
+        log.contains("turn-test-42"),
+        "log did not carry the turn id:\n{log}"
+    );
+}
+
+/// A record carrying a byte that is not valid UTF-8 must not take the rest of
+/// the log with it.
+///
+/// This is round 2's Critical, at the level it was reported. `requested_argv0`
+/// is a path read raw out of tracee memory and is under no encoding
+/// obligation — an agent can ask to execute any byte string it likes. The host
+/// read it with `std::fs::read_to_string(...).unwrap_or_default()`, which fails
+/// the WHOLE read with `InvalidData` on one bad byte and then substitutes an
+/// EMPTY string, while `cat` still exits 0 — so the harness took its success
+/// branch, sealed a bundle with zero exec-consequence observations for the
+/// entire run, and still marked the channel `Watched`. One byte anywhere
+/// erased everything, and nothing anywhere said so.
+///
+/// The record before the bad one and the record after it are what make this a
+/// test of the failure that actually happened: erasure was total, not local, so
+/// their survival is the property under test, not merely the bad record's own.
+#[test]
+fn one_invalid_utf8_byte_does_not_erase_the_rest_of_the_disclosure_log() {
+    let Some(_engine) = require_containers() else {
+        return;
+    };
+    let _serialised = chamber_subnet_lock();
+
+    let plan = ExecConsequencePlan {
+        rules: vec![],
+        timeout_ms: 60_000,
+        max_concurrent_handlers: 32,
+    };
+    let cell = start_cell(&plan);
+    cell.start().expect("start");
+    std::thread::sleep(Duration::from_millis(300));
+
+    cell.exec(
+        &["stub", "--turn-id=clean-before", "/bin/echo", "one"],
+        OP_WINDOW,
+    )
+    .expect("exec before");
+
+    // The byte has to be built inside the cell: a `&str` cannot hold 0xFF, so
+    // it cannot travel through `docker exec`'s argv from here. `printf` emits
+    // the raw octal escape, the shell hands the resulting byte string to
+    // `stub`, and `stub` relays it over a length-prefixed binary protocol that
+    // has no opinion about encoding. The path does not exist, so nothing loads
+    // and the relay files its `passthrough-exec-failed` record — which carries
+    // the requested argv0 verbatim, 0xFF and all.
+    let bad = cell
+        .exec(
+            &[
+                "/bin/sh",
+                "-c",
+                r#"stub --turn-id=bad-utf8 "$(printf '/bin/no\377such')""#,
+            ],
+            OP_WINDOW,
+        )
+        .expect("exec the invalid-utf8 argv0");
+    assert_ne!(
+        bad.status,
+        Some(0),
+        "a path that does not exist should not have run: {bad:?}"
+    );
+
+    cell.exec(
+        &["stub", "--turn-id=clean-after", "/bin/echo", "two"],
+        OP_WINDOW,
+    )
+    .expect("exec after");
+
+    let stream = disclosure_stream(&cell);
+    assert!(
+        stream.contains("known_residual_tells"),
+        "the whole capture came back empty — the erasure this test exists for:\n{stream:?}"
+    );
+
+    let records = disclosure_records(&cell);
+    let turns: Vec<&str> = records
+        .iter()
+        .filter_map(|r| r["turn_id"].as_str())
+        .collect();
+    for expected in ["clean-before", "bad-utf8", "clean-after"] {
+        assert!(
+            turns.contains(&expected),
+            "record {expected} is missing, so a bad byte still costs more than \
+             its own line: {turns:?}\n{records:#?}"
+        );
+    }
+
+    // And the bad record is READABLE, not merely counted: its argv0 arrives
+    // with the invalid byte represented (U+FFFD, from whichever of the log
+    // driver or `String::from_utf8_lossy` reached it first) and everything
+    // around that byte intact.
+    let bad_record = records
+        .iter()
+        .find(|r| r["turn_id"].as_str() == Some("bad-utf8"))
+        .expect("just asserted present");
+    let argv0 = bad_record["requested_argv0"]
+        .as_str()
+        .expect("requested_argv0 is a string");
+    assert!(
+        argv0.starts_with("/bin/no") && argv0.ends_with("such"),
+        "the bytes around the invalid one did not survive: {argv0:?}"
+    );
+    assert_ne!(
+        argv0, "/bin/nosuch",
+        "the invalid byte was silently dropped rather than represented: {argv0:?}"
     );
 }
 
@@ -1832,8 +2064,16 @@ fn turn_id_lands_on_the_disclosure_record() {
 /// characters that broke it — a double quote and a backslash — through the
 /// whole path, and requires it back as DATA: not merely present in the text,
 /// but the parsed value of the `turn_id` key.
+///
+/// The "sealing path" it reads through is now `docker logs`, not `docker exec
+/// cat` — and the line count below is the assertion that carries the new
+/// invariant the transport depends on: PID 1's stdout must be EXACTLY the
+/// header plus one record per request. `execrelayd` emits a `logline` for every
+/// accepted request and every completion, so before those moved to stderr this
+/// stream would have carried nine or ten lines here, and the host-side reader
+/// would have needed to filter them.
 #[test]
-fn disclosure_log_is_readable_via_the_sealing_cat_path() {
+fn disclosure_log_is_readable_via_the_sealing_docker_logs_path() {
     let Some(_engine) = require_containers() else {
         return;
     };
@@ -1862,23 +2102,24 @@ fn disclosure_log_is_readable_via_the_sealing_cat_path() {
     )
     .expect("exec");
 
-    let log = cell
-        .exec(&["cat", "/work/.exec-relay/disclosure.log"], OP_WINDOW)
-        .expect("cat log");
-    assert!(log.stdout.contains("known_residual_tells"));
-    assert!(log.stdout.contains("TracerPid"));
+    let log = disclosure_stream(&cell);
+    assert!(log.contains("known_residual_tells"));
+    assert!(log.contains("TracerPid"));
     assert_eq!(
-        log.stdout.lines().count(),
+        log.lines().count(),
         3,
-        "1 header + 2 request records"
+        "PID 1's stdout must be exactly 1 header + 2 request records, with none \
+         of execrelayd's own operator output mixed in; got:\n{log}"
     );
 
     // The header, as the thing it claims to be: a JSON object carrying a
     // non-empty list of tells. `bundle.rs` identifies it by the presence of
     // that key and skips it; a header that were not parseable JSON would be
-    // read as a malformed RECORD instead, and silently dropped.
+    // read as a malformed RECORD instead, and silently dropped. It is also
+    // required to be the FIRST line: it is written once at startup, before any
+    // request can be served.
     let header: serde_json::Value =
-        serde_json::from_str(log.stdout.lines().next().expect("a header line"))
+        serde_json::from_str(log.lines().next().expect("a header line"))
             .expect("the header line is JSON");
     let tells = header["known_residual_tells"]
         .as_array()
@@ -1991,13 +2232,10 @@ fn a_path_searched_bare_command_records_exactly_one_line() {
         "bare `cat` should still resolve through PATH: {out:?}"
     );
 
-    let log = cell
-        .exec(&["cat", "/work/.exec-relay/disclosure.log"], OP_WINDOW)
-        .expect("cat log");
+    let log = disclosure_stream(&cell);
     // Count records the way the bundle does: every line that is not the
     // header becomes one ExecConsequence observation.
     let records: Vec<&str> = log
-        .stdout
         .lines()
         .filter(|line| !line.contains("known_residual_tells"))
         .filter(|line| !line.trim().is_empty())
@@ -2006,8 +2244,7 @@ fn a_path_searched_bare_command_records_exactly_one_line() {
         records.len(),
         1,
         "one real command must yield exactly one disclosure record, not one \
-         per PATH candidate probed; log was:\n{}",
-        log.stdout
+         per PATH candidate probed; log was:\n{log}"
     );
     assert!(
         records[0].contains("\"requested_argv0\":\"/bin/cat\""),
@@ -2033,8 +2270,9 @@ fn a_path_searched_bare_command_records_exactly_one_line() {
 //     wrote by hand),
 //   * `ToolBridge::new_with_exec_relay`, which decides whether a turn is
 //     prefixed with `stub` at all, and mints the per-call `--turn-id=`,
-//     * the read of `/work/.exec-relay/disclosure.log` at the one point in
-//     `run_detonation` where the cell is still running,
+//   * `AgentCell::captured_stdout`, the sealing read — `docker logs` against
+//     the cell, decoded lossily, which is where the disclosure stream actually
+//     enters the harness,
 //   * `record_exec_consequence_log`, which parses that text into sealed
 //     observations,
 //   * and `ExecInterception`, which decides whether the bundle may claim the
@@ -2123,8 +2361,8 @@ fn guest_command_exit(b: &OpenedBundle, needle: &str) -> Option<i32> {
 ///     (`turn-0`, `turn-1`) — not ids this test supplied, which is what every
 ///     raw-`Container` test above has to do.
 ///   * And the channel must be `Watched`, which `bundle.rs` grants only when
-///     the relay was armed AND its disclosure log was successfully read out of
-///     the cell before the wind-down stopped it.
+///     the relay was armed AND its disclosure log was successfully read back
+///     from the engine's capture of the cell's stdout.
 #[test]
 fn a_composed_detonation_arms_the_relay_and_seals_what_it_intercepted() {
     let Some(_engine) = require_containers() else {
@@ -2192,7 +2430,7 @@ fn a_composed_detonation_arms_the_relay_and_seals_what_it_intercepted() {
     // and its log came back. `Absent { ExcludedByDesign }` here would mean the
     // plan's `exec_consequence` never reached `Observed::exec_interception`;
     // `Absent { ObserverFailed }` would mean the disclosure log could not be
-    // read out of the cell.
+    // read back from the engine's capture.
     assert_eq!(
         b.coverage.status(Channel::ExecConsequence),
         &ChannelCoverage::Watched,
@@ -2234,6 +2472,124 @@ fn a_composed_detonation_arms_the_relay_and_seals_what_it_intercepted() {
         Some(1),
         "the file the fabricated /bin/touch would have created EXISTS — the \
          real target ran on the composed path"
+    );
+
+    let _ = std::fs::remove_dir_all(&evidence);
+}
+
+/// R1, closed at the only level that settles it: a run whose disclosure log
+/// contains a byte that is not valid UTF-8 still SEALS its exec-consequence
+/// evidence.
+///
+/// The direct-relay test above
+/// (`one_invalid_utf8_byte_does_not_erase_the_rest_of_the_disclosure_log`)
+/// proves the stream survives being read. This one proves the rest of the
+/// chain does too — `AgentCell::captured_stdout`'s decode,
+/// `record_exec_consequence_log`'s parse, and the coverage decision — because
+/// that chain is where the loss actually happened: the read collapsed to an
+/// empty string, every observation went missing, and the bundle STILL reported
+/// `ExecConsequence: Watched`. A bundle that says it watched a channel and
+/// carries nothing from it is worse than one that admits the gap, which is why
+/// the coverage assertion below is part of the test rather than incidental.
+///
+/// The bad byte is smuggled in the same way and for the same reason as in the
+/// direct test — a scripted turn is JSON and cannot carry a raw 0xFF, so the
+/// guest builds the path itself. Here it must also be LOADABLE, or
+/// `trap_target_is_loadable` files it as one of `execvp`'s PATH probes and it
+/// is deliberately never recorded. That rules out the obvious approach:
+/// `cp`ing a binary to the 0xFF path does not work, because the cell's only
+/// writable filesystem is the `noexec` /work tmpfs and `access(X_OK)` reports
+/// that faithfully (measured — a copied `/bin/echo` there is filed as a path
+/// probe). A SYMLINK does: `access` resolves it to a real binary on the
+/// exec-permitting read-only rootfs, so the trap is recorded with the 0xFF path
+/// as `requested_argv0`. What the exec then does is immaterial to this test —
+/// busybox dispatches on argv[0]'s basename and exits 127 — because the record
+/// is written at the trap, before the syscall resumes.
+#[test]
+fn a_composed_detonation_seals_a_record_whose_argv0_is_not_valid_utf8() {
+    let Some(_engine) = require_containers() else {
+        return;
+    };
+    ensure_images_including(&[IMAGE]);
+    let _serialised = chamber_subnet_lock();
+
+    let evidence = shared_scratch(&format!("exec-bad-utf8-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&evidence);
+
+    let plan = DetonationPlan {
+        images: ImageTags {
+            capture: "chamber-capture:test".into(),
+            warden: "chamber-warden:test".into(),
+            guest: IMAGE.into(),
+            inspector: "chamber-inspector:test".into(),
+        },
+        ruleset: images_dir().join("chamber.nft"),
+        evidence_dir: evidence.clone(),
+        canaries: vec![PlantedCanary {
+            label: "aws-key".into(),
+            value: COMPOSED_CANARY.into(),
+            var: "CHAMBER_TOKEN".into(),
+        }],
+        max_turns: 8,
+        skill_dir: None,
+        consequence: None,
+        exec_consequence: Some(ExecConsequencePlan {
+            rules: vec![],
+            timeout_ms: 60_000,
+            max_concurrent_handlers: 32,
+        }),
+    };
+
+    // JSON `\\377` decodes to the two-character shell escape `\377`, which
+    // busybox printf turns into the single byte 0xFF.
+    let script = r#"[
+        {"do": "run_command", "argv": ["/bin/sh", "-c",
+            "ln -s /bin/echo \"/work/bad$(printf '\\377')name\"; exec \"/work/bad$(printf '\\377')name\" hi"]},
+        {"do": "run_command", "argv": ["/bin/echo", "after-the-bad-byte"]},
+        {"do": "conclude"}
+    ]"#;
+    let mut turns =
+        ScriptedTurns::from_bytes("exec-consequence-bad-utf8", script.as_bytes()).expect("parse");
+
+    let ep = block_on(run_detonation(&plan, &mut turns)).unwrap_or_else(|e| panic!("{e}"));
+    let b = open_bundle_at(&ep.bundle_path, &ep.seal_path);
+
+    let records = exec_consequence_records(&b);
+    assert!(
+        !records.is_empty(),
+        "the sealed bundle carries NO exec-consequence observations at all — \
+         exactly the total erasure R1 reported"
+    );
+
+    // The bad record itself, by shape rather than by exact bytes: whichever of
+    // the log driver or `String::from_utf8_lossy` reached the 0xFF first, it
+    // arrives as U+FFFD with its neighbours intact.
+    let bad = records
+        .iter()
+        .find(|(_, argv0, _, _, _)| argv0.starts_with("/work/bad") && argv0.ends_with("name"))
+        .unwrap_or_else(|| {
+            panic!("no record for the invalid-utf8 path reached the bundle: {records:#?}")
+        });
+    assert_ne!(
+        bad.1, "/work/badname",
+        "the invalid byte was dropped rather than represented: {records:#?}"
+    );
+
+    // The turn AFTER the bad byte is what shows the loss was not merely
+    // deferred: erasure was total, so a run that seals the bad record and
+    // nothing following it would still be broken.
+    assert!(
+        records
+            .iter()
+            .any(|(turn, argv0, _, _, _)| *turn == "turn-1" && *argv0 == "/bin/echo"),
+        "the turn after the invalid byte is missing from the evidence: {records:#?}"
+    );
+
+    // And the claim the bundle makes about itself has to match what it holds.
+    assert_eq!(
+        b.coverage.status(Channel::ExecConsequence),
+        &ChannelCoverage::Watched,
+        "a run that sealed real records did not report the channel watched"
     );
 
     let _ = std::fs::remove_dir_all(&evidence);

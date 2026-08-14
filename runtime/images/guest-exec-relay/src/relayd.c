@@ -61,27 +61,36 @@ struct arm64_regs {
     unsigned long long pstate;
 };
 
-/* The disclosure log is a regular file under a hidden subdirectory of the
- * /work tmpfs. The real cell (chamber-isolation's AgentCell::start) runs
- * read-only with a tmpfs ONLY at /work — /tmp does not exist as a writable
- * path there, so nothing of ours can live under /tmp. /work/.exec-relay/ keeps
- * the log inside the one writable filesystem that always exists, and folds it
- * out of the agent's bare working directory so a casual `ls /work` does not
- * surface it (coherent-per-tool, not forensic-proof — that is this project's
- * stated bar). RELAY_DIR is created in main() before the log is opened.
+/* execrelayd has NO filesystem footprint of its own, deliberately — neither
+ * for its control channel nor for its evidence.
  *
- * The CONTROL SOCKET deliberately does NOT live there. /work is writable by
- * the sandboxed agent under evaluation, and TurnDirective::RunCommand runs
- * arbitrary commands in the cell as root, so a socket at a filesystem path
- * under /work could be `rm`ed and re-bound by the very agent this relay exists
- * to observe — disabling or spoofing the entire interception and disclosure
- * mechanism. Linux's ABSTRACT socket namespace has no filesystem entry at all:
- * the name is owned by the network namespace, not by any directory, so
- * filesystem write access to /work grants no purchase on it, and the name
- * cannot be pre-empted while execrelayd holds it (a second bind() gets
- * EADDRINUSE) nor unlinked. It also vanishes with the socket, so there is no
- * stale entry to clean up on restart. */
-#define RELAY_DIR "/work/.exec-relay"
+ * The CONTROL SOCKET is in Linux's ABSTRACT socket namespace, which has no
+ * filesystem entry at all: the name is owned by the network namespace, not by
+ * any directory. /work is writable by the sandboxed agent under evaluation,
+ * and TurnDirective::RunCommand runs arbitrary commands in the cell as root,
+ * so a socket at a path under /work could be `rm`ed and re-bound by the very
+ * agent this relay exists to observe — disabling or spoofing the entire
+ * interception mechanism. Abstract-namespace means filesystem write access to
+ * /work grants no purchase on it, the name cannot be pre-empted while
+ * execrelayd holds it (a second bind() gets EADDRINUSE) nor unlinked, and it
+ * vanishes with the socket, so there is no stale entry to clean up on restart.
+ *
+ * The DISCLOSURE LOG used to be a plain file, /work/.exec-relay/disclosure.log,
+ * and that was the one part of this mechanism the paragraph above did not
+ * cover. Design §2 requires the log to be "no more writable (or more
+ * deletable) by the agent than the mechanism's own control channel is", and a
+ * file in the agent-writable /work tmpfs plainly was: a root-in-cell agent
+ * could `rm` or truncate the sealed evidence before the host ever read it, and
+ * the host's read (a `docker exec cat`) would report success on the empty
+ * result. Records now stream out over THIS PROCESS'S OWN STDOUT — see
+ * disclosure_init below — which the container runtime captures to host-side
+ * storage as each line is produced, outside the container's filesystem
+ * entirely. Deleting a file the agent can reach no longer affects what has
+ * already been captured, because there is no file. (Design §6;
+ * agenticpractices:decision:jbtd8mbc85dauq7628rx.)
+ *
+ * Nothing else needed /work/.exec-relay/, so the directory is not created at
+ * all any more. */
 
 /* The abstract name, WITHOUT its leading NUL — that byte is prepended when the
  * address is filled in. stub.c must define this to the identical string; the
@@ -110,15 +119,40 @@ static socklen_t fill_abstract_addr(struct sockaddr_un *addr) {
 
 #define SCRATCH_SIZE 16384
 
+/* Operator/debug output — NOT evidence. Goes to stderr, and everything else in
+ * this file that is not a disclosure record must do the same: stdout is
+ * reserved exclusively for disclosure-record JSONL, one record per line, so
+ * the host-side reader can parse `docker logs`' stdout stream directly without
+ * having to filter this process's chatter out of it first (design §6).
+ *
+ * Composed into a local buffer and issued as ONE write(), rather than through
+ * stdio, for two reasons that both come from run_server forking a handler
+ * process per connection. A stdio buffer is DUPLICATED by fork(), so any
+ * partial line sitting in it would be emitted twice — and the worker child
+ * dup2()s its output pipe over fd 2, so its copy would be flushed into the
+ * agent's own command output. And concurrent handlers sharing fd 2 can
+ * interleave a line assembled from several small writes. One write of a whole
+ * line has neither problem. */
 static void logline(const char *fmt, ...) {
     va_list ap;
     struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
-    fprintf(stdout, "[relayd %ld.%03ld] ", (long)ts.tv_sec, ts.tv_nsec/1000000);
+    char line[2048];
+    int n = snprintf(line, sizeof(line), "[relayd %ld.%03ld] ",
+                     (long)ts.tv_sec, ts.tv_nsec/1000000);
+    if (n < 0) return;
+    size_t off = (size_t)n < sizeof(line) ? (size_t)n : sizeof(line) - 1;
     va_start(ap, fmt);
-    vfprintf(stdout, fmt, ap);
+    n = vsnprintf(line + off, sizeof(line) - off, fmt, ap);
     va_end(ap);
-    fputc('\n', stdout);
-    fflush(stdout);
+    if (n > 0) {
+        /* vsnprintf returns what it WANTED to write; clamp to what it could,
+         * leaving one byte for the newline. */
+        size_t want = (size_t)n;
+        size_t room = sizeof(line) - off - 1;
+        off += want < room ? want : room;
+    }
+    line[off++] = '\n';
+    (void)!write(STDERR_FILENO, line, off);
 }
 
 /* read_full/write_full, the request reader and its two parsing primitives all
@@ -225,40 +259,45 @@ static int read_tracee_argv(int pid, unsigned long long argv_addr, char out[][25
     return n;
 }
 
-/* ---------------------------- disclosure log ---------------------------- */
-#define DISCLOSURE_LOG_PATH RELAY_DIR "/disclosure.log"
-static int g_disclosure_fd = -1;
+/* ------------------------- disclosure stream ---------------------------- */
 
-/* Opens the log, or fails. Returns 0 on success and -1 if the log could not be
- * opened — and the caller MUST refuse to start on -1.
+/* The disclosure log IS this process's stdout. Not a file, and not a
+ * descriptor this code opens: fd 1 is handed to PID 1 by the container runtime
+ * and is the read end of the runtime's own log capture (verified in this
+ * environment: /proc/1/fd/1 is a `pipe:[...]` and everything written to it
+ * appears in `docker logs`, including after the container has stopped).
  *
- * This used to return void and simply leave g_disclosure_fd at -1, which every
- * later disclosure_record() short-circuited on. The relay then served every
- * request while recording nothing, with no indication anywhere that its entire
- * reason for existing was switched off: the run produced a bundle whose
- * exec-consequence channel was empty, which reads exactly like a run in which
- * the agent execed nothing. §9 is fail-closed for the same reason
- * config_load_from_env is — a relay that cannot record is not a weaker relay,
- * it is a relay whose output is a lie by omission. */
+ * That is the whole point of the change — see the "no filesystem footprint"
+ * note at the top of this file. Capture happens outside the container, so
+ * there is no path a root-in-cell agent can unlink, truncate or chmod to make
+ * already-emitted records disappear. Two consequences worth naming here:
+ *
+ *   - The fd needs no O_CLOEXEC treatment and must NOT be closed before the
+ *     worker's execve. The worker dup2()s its own output pipe over fd 1 long
+ *     before then, so the agent's command inherits its pipe, not this stream —
+ *     which is strictly better than the old O_CLOEXEC file descriptor, since
+ *     there is no extra descriptor in the worker's fd table to notice at all.
+ *   - A root-in-cell agent CAN still append forged lines by writing to
+ *     /proc/1/fd/1. That is unchanged from the old file (which it could
+ *     `echo >>` just as easily) and is not what this transport claims to fix:
+ *     §2's parity clause is about deleting and truncating evidence, which is
+ *     now genuinely out of reach. Forgery resistance would need a separate
+ *     mechanism (a private descriptor the agent cannot name) and is not in
+ *     scope here. */
+#define DISCLOSURE_FD STDOUT_FILENO
+
+/* Emits the header line, or fails. Returns 0 on success and -1 if the stream
+ * could not be written — and the caller MUST refuse to start on -1.
+ *
+ * §9 is fail-closed for the same reason config_load_from_env is: a relay that
+ * cannot record is not a weaker relay, it is a relay whose output is a lie by
+ * omission. The failure this originally guarded (the log file's open() failing
+ * on a read-only filesystem) no longer exists, because nothing is opened; what
+ * remains is the header write, which is also the first proof that fd 1 is
+ * actually writable. A relay whose stdout is closed or broken would otherwise
+ * serve every request while recording nothing, and the resulting bundle reads
+ * exactly like a run in which the agent execed nothing. */
 static int disclosure_init(void) {
-    /* O_CLOEXEC is load-bearing, not hygiene. Without it this WRITABLE,
-     * O_APPEND descriptor to the sealed evidence log survives the worker
-     * child's execve into the agent's own command, which can then append
-     * whatever records it likes with a plain shell redirection to the
-     * inherited fd number (`echo '{...}' >&3`) — forging or corrupting the
-     * very evidence it is the subject of. Verified before the fix: fd 3 in a
-     * relayed command's /proc/self/fd read
-     * `l-wx------ 3 -> /work/.exec-relay/disclosure.log`, and a forged record
-     * written through it landed in the log. */
-    g_disclosure_fd = open(DISCLOSURE_LOG_PATH, O_CREAT | O_WRONLY | O_APPEND | O_CLOEXEC, 0600);
-    if (g_disclosure_fd < 0) {
-        fprintf(stderr, "execrelayd: refusing to start — the disclosure log %s could not "
-                        "be opened: %s. A relay that cannot record is not a degraded "
-                        "relay; every request it then served would be absent from the "
-                        "evidence with nothing saying so.\n",
-                DISCLOSURE_LOG_PATH, strerror(errno));
-        return -1;
-    }
     /* The tells this relay knows it leaves and does not mask, declared up front
      * so a reader of the sealed evidence is not left to discover them. The
      * substitute entry is new with full-argv replacement: repointing only
@@ -273,26 +312,29 @@ static int disclosure_init(void) {
         "\"a substituted process shows the replacement argv in "
         "/proc/self/cmdline and ps, not the argv that was requested "
         "\\u2014 the requested one appears only in this log\"]}\n";
-    if (proto_write_full(g_disclosure_fd, header, sizeof(header) - 1) < 0) {
-        fprintf(stderr, "execrelayd: refusing to start — the disclosure log %s could not "
-                        "be written: %s\n", DISCLOSURE_LOG_PATH, strerror(errno));
-        close(g_disclosure_fd);
-        g_disclosure_fd = -1;
+    if (proto_write_full(DISCLOSURE_FD, header, sizeof(header) - 1) < 0) {
+        fprintf(stderr, "execrelayd: refusing to start — the disclosure log could not be "
+                        "written to this process's stdout: %s. A relay that cannot record "
+                        "is not a degraded relay; every request it then served would be "
+                        "absent from the evidence with nothing saying so.\n",
+                strerror(errno));
         return -1;
     }
     return 0;
 }
 
 /* Builds one complete JSON record in a local buffer and writes it with a
- * SINGLE proto_write_full() call. This matters because g_disclosure_fd is opened
- * once in main() before run_server() forks any handlers, so every
- * concurrent handler process (Step 5) inherits and shares the same fd:
- * O_APPEND makes each individual write() atomic, but a record built from
- * several separate write() calls is not — two handlers racing here could
- * interleave their writes into one corrupted, unparseable line. Composing
- * the whole line first and issuing one write() (comfortably under any
- * filesystem's atomic-write block size at this record's bounded size)
- * keeps concurrent records from ever interleaving.
+ * SINGLE proto_write_full() call. This matters because run_server() forks a
+ * handler process per connection and every one of them shares fd 1: a record
+ * built from several separate write() calls is not atomic, so two handlers
+ * racing here could interleave their writes into one corrupted, unparseable
+ * line.
+ *
+ * The size discipline that backs the single write changed with the transport.
+ * O_APPEND made a write to the old log FILE atomic at any size; a write to a
+ * PIPE — which is what the runtime hands PID 1 as stdout — is atomic only up
+ * to PIPE_BUF. DISCLOSURE_RECORD_BUF is PIPE_BUF for exactly that reason, and
+ * record.c has a _Static_assert tying its per-field budgets to it.
  *
  * The composition itself is record.c's, not this file's, so that it can be
  * unit-tested: nothing in relayd.c compiles anywhere but aarch64 Linux, and
@@ -301,19 +343,13 @@ static int disclosure_init(void) {
 static void disclosure_record(const char *turn_id, const char *requested_argv0,
                                const char *matched_rule, const char *verb_applied,
                                const char *detail) {
-    /* Unreachable by construction now: main() refuses to start if
-     * disclosure_init() could not open the log, so this fd is always valid
-     * here. Kept as a belt-and-braces guard rather than removed, but it is no
-     * longer a DEGRADED MODE — it used to be the thing that quietly turned the
-     * whole disclosure log into a no-op for the life of a run. */
-    if (g_disclosure_fd < 0) return;
     struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
-    char buf[8192];
+    char buf[DISCLOSURE_RECORD_BUF];
     size_t off = disclosure_format_record(buf, sizeof(buf),
                                           (long)ts.tv_sec, (long)(ts.tv_nsec / 1000000),
                                           turn_id, requested_argv0,
                                           matched_rule, verb_applied, detail);
-    proto_write_full(g_disclosure_fd, buf, off);
+    proto_write_full(DISCLOSURE_FD, buf, off);
 }
 
 /* Will this trap's target actually load, or is it one of execvpe()'s PATH
@@ -522,13 +558,20 @@ static int run_traced(char *const argv[],
          * execvpe itself). Closing explicitly also covers the case that has no
          * atomic-CLOEXEC form at creation: `cfd`, which arrives here as out_fd/
          * err_fd. What must NOT be closed is stdin/stdout/stderr — in the
-         * --self-test path out_fd/err_fd ARE fds 1 and 2, which by now name the
-         * output pipes via dup2, so the guard is on the fd number, not on the
-         * variable. */
+         * --self-test path err_fd IS fd 2, which by now names the output pipe
+         * via dup2, so the guard is on the fd number, not on the variable.
+         *
+         * The disclosure stream is NOT in this list any more, and its absence
+         * is the fix rather than an omission: it is fd 1, which the dup2 above
+         * has already replaced with this worker's own stdout pipe. There is no
+         * relay-private descriptor left for the agent's command to find — where
+         * the old log file appeared in a relayed command's /proc/self/fd as a
+         * writable `l-wx------ 3 -> /work/.exec-relay/disclosure.log` it could
+         * forge records through, there is now nothing to close and nothing to
+         * see. */
         close(syncr[1]);
         close(syncg[0]);
         close(sfd);                                     /* the tracer's signalfd */
-        if (g_disclosure_fd >= 0) close(g_disclosure_fd);  /* the sealed evidence log */
         if (out_fd > STDERR_FILENO) close(out_fd);         /* the stub's connection */
         if (err_fd > STDERR_FILENO && err_fd != out_fd) close(err_fd);
 
@@ -621,8 +664,8 @@ static int run_traced(char *const argv[],
         if (remaining_ms <= 0) {
             logline("req=%s pid=%d TIMEOUT after %llu ms, killing", req_id?req_id:"-", pid,
                     (unsigned long long)timeout_ms);
-            /* The container log is execrelayd's own stdout — NOT the sealed
-             * evidence. A watchdog kill that only ever appeared there was
+            /* logline goes to execrelayd's stderr — NOT the sealed evidence,
+             * which is its stdout. A watchdog kill that only ever appeared there was
              * invisible to every reader of the bundle: the exec's record (if it
              * got one) says the command was let through and nothing anywhere
              * says it was then killed at the deadline. §8 requires the record;
@@ -1283,7 +1326,12 @@ static void scrub_relay_private_env(void) {
 }
 
 int main(int argc, char **argv) {
-    setvbuf(stdout, NULL, _IOLBF, 0);
+    /* No setvbuf here, and nothing in this program writes to the `stdout`
+     * FILE* at all any more. fd 1 is the disclosure stream and is written only
+     * through raw write()s (proto_write_full), which is what keeps each record
+     * one atomic write; a stdio buffer layered over it would defeat that, and
+     * would additionally be duplicated into every forked handler. Operator
+     * output goes to stderr — see logline. */
 
     struct exec_plan plan;
     if (config_load_from_env(&plan) != 0) {
@@ -1292,19 +1340,11 @@ int main(int argc, char **argv) {
         return 1;
     }
     scrub_relay_private_env();
-    /* The disclosure log (disclosure_init) lives under RELAY_DIR; create it
-     * before the log is opened. The control socket no longer needs this
-     * directory — it is abstract-namespace now — but the log genuinely does,
-     * and the log is not optional: without it a run produces no exec-
-     * consequence evidence at all. /work is a fresh tmpfs each run, so this
-     * normally does not exist yet — EEXIST is fine, anything else means the
-     * log cannot be created and the relay cannot do its job, so refuse to
-     * start. */
-    if (mkdir(RELAY_DIR, 0700) != 0 && errno != EEXIST) {
-        fprintf(stderr, "execrelayd: refusing to start — could not create %s: %s\n",
-                RELAY_DIR, strerror(errno));
-        return 1;
-    }
+    /* No directory to create any more. /work/.exec-relay/ existed solely to
+     * hold the disclosure log file; the control socket never needed it (it is
+     * abstract-namespace) and nothing else in this image used it. The log is
+     * now this process's stdout, which the runtime provides — so the relay
+     * leaves nothing on the filesystem for the agent to find or remove. */
     if (ptrace_self_check() != 0) {
         fprintf(stderr, "execrelayd: refusing to start — the interception mechanism this "
                          "whole relay depends on is not usable in this environment\n");
@@ -1320,7 +1360,14 @@ int main(int argc, char **argv) {
 
     if (argc >= 2 && strcmp(argv[1], "--self-test") == 0) {
         int ecode = -1;
-        run_traced(argv + 2, "self-test", STDOUT_FILENO, STDERR_FILENO,
+        /* Both streams to fd 2, not fd 1. This path emits the same tagged
+         * protocol FRAMES the socket path does (proto_send_stream), and fd 1
+         * is now the disclosure stream: a frame written there would be
+         * interleaved binary in the middle of the record JSONL, which is
+         * precisely the ambiguity moving operator output to stderr exists to
+         * remove. Only this hand-run diagnostic entry point is affected —
+         * nothing in the harness invokes --self-test. */
+        run_traced(argv + 2, "self-test", STDERR_FILENO, STDERR_FILENO,
                    &ecode, &plan, plan.timeout_ms);
         return ecode;
     }

@@ -20,7 +20,11 @@
  * because "it parses" is the property that actually matters. */
 static json_value_t *record_of(const char *turn_id, const char *argv0,
                                const char *rule, const char *verb, const char *detail) {
-    static char buf[8192];
+    /* DISCLOSURE_RECORD_BUF, not a size of this test's own choosing: the
+     * per-field budgets are proportioned against it, so a roomier buffer here
+     * would mean the truncation tests below never reached a boundary the
+     * relay actually reaches. */
+    static char buf[DISCLOSURE_RECORD_BUF];
     size_t off = disclosure_format_record(buf, sizeof(buf), 1786720195L, 613L,
                                           turn_id, argv0, rule, verb, detail);
     assert(off > 0);
@@ -126,7 +130,7 @@ static void test_an_overlong_value_costs_only_its_own_field(void) {
     memset(huge, 'A', sizeof(huge) - 1);
     huge[sizeof(huge) - 1] = 0;
 
-    static char buf[8192];
+    static char buf[DISCLOSURE_RECORD_BUF];
     size_t off = disclosure_format_record(buf, sizeof(buf), 1L, 2L,
                                           "turn-1", huge, "rule-name", "fabricate", huge);
     assert(off > 0);
@@ -139,6 +143,120 @@ static void test_an_overlong_value_costs_only_its_own_field(void) {
     /* The oversized fields are present and truncated, not absent. */
     assert(strlen(json_as_string(json_object_get(v, "requested_argv0"))) > 0);
     assert(strlen(json_as_string(json_object_get(v, "detail"))) > 0);
+    json_free(v);
+}
+
+/* Is `s` well-formed UTF-8 to its NUL? Written out rather than assumed,
+ * because "the truncated field is still valid UTF-8" is the entire claim of
+ * the two tests below and an eyeball check of a 500-byte string is not one. */
+static int is_valid_utf8(const char *s) {
+    const unsigned char *p = (const unsigned char *)s;
+    while (*p) {
+        size_t want;
+        if (*p < 0x80) { p++; continue; }
+        else if (*p >= 0xc2 && *p <= 0xdf) want = 2;
+        else if (*p >= 0xe0 && *p <= 0xef) want = 3;
+        else if (*p >= 0xf0 && *p <= 0xf4) want = 4;
+        else return 0; /* a bare continuation byte, or an invalid lead */
+        for (size_t i = 1; i < want; i++) {
+            if ((p[i] & 0xc0) != 0x80) return 0; /* NUL lands here too */
+        }
+        p += want;
+    }
+    return 1;
+}
+
+/* Fills `out` with `count` copies of the `len`-byte sequence `seq`, NUL
+ * terminated. */
+static void fill_repeated(char *out, const char *seq, size_t len, size_t count) {
+    for (size_t i = 0; i < count; i++) memcpy(out + i * len, seq, len);
+    out[count * len] = 0;
+}
+
+static void test_truncation_never_splits_a_multibyte_character(void) {
+    /* R1's other producer, on the WRITE side. A field's bytes are cut at a
+     * byte-count budget; before this fix the cut landed wherever it landed,
+     * so a 2-, 3- or 4-byte UTF-8 character straddling the budget left its
+     * first byte (or two, or three) in the record and dropped the rest. That
+     * is invalid UTF-8 emitted by execrelayd itself, before any reader is
+     * involved — and it is what then made the host's strict `read_to_string`
+     * collapse an ENTIRE run's evidence to an empty string.
+     *
+     * Each field is fed a value made ENTIRELY of one repeated multi-byte
+     * character and far longer than any budget, so truncation is guaranteed
+     * and lands mid-character unless the escaper refuses to split. The output
+     * must be valid UTF-8 and its length an exact multiple of the character
+     * width — the second check is what a "cut one byte short" bug would fail
+     * even if the leftover bytes happened to re-validate.
+     *
+     * Deliberately not written against BUDGET_* directly: those are record.c's
+     * private numbers, and a test that hard-codes them stops testing the
+     * property the moment they are retuned (as they were when the transport
+     * moved to a PIPE_BUF-bounded stream). */
+    static const struct { const char *seq; size_t len; const char *what; } CHARS[] = {
+        { "\xc3\xa9",         2, "U+00E9 e-acute" },
+        { "\xe2\x82\xac",     3, "U+20AC euro sign" },
+        { "\xf0\x9f\x92\xa5", 4, "U+1F4A5 collision symbol" },
+    };
+    static const char *const FIELDS[] = { "turn_id", "requested_argv0", "matched_rule",
+                                          "verb_applied", "detail" };
+
+    for (size_t c = 0; c < sizeof(CHARS) / sizeof(CHARS[0]); c++) {
+        char huge[4096];
+        fill_repeated(huge, CHARS[c].seq, CHARS[c].len,
+                      (sizeof(huge) - 1) / CHARS[c].len);
+
+        for (size_t f = 0; f < sizeof(FIELDS) / sizeof(FIELDS[0]); f++) {
+            const char *v[5] = { "t", "/bin/x", "r", "passthrough", "d" };
+            v[f] = huge;
+            json_value_t *rec = record_of(v[0], v[1], v[2], v[3], v[4]);
+            const char *got = json_as_string(json_object_get(rec, FIELDS[f]));
+            assert(got != NULL);
+            size_t n = strlen(got);
+            /* It truncated at all (otherwise this proves nothing) ... */
+            assert(n > 0 && n < strlen(huge));
+            /* ... and it truncated on a character boundary. */
+            if (!is_valid_utf8(got) || n % CHARS[c].len != 0) {
+                fprintf(stderr,
+                        "field %s truncated mid-character on %s: %zu bytes, "
+                        "valid_utf8=%d, tail bytes:",
+                        FIELDS[f], CHARS[c].what, n, is_valid_utf8(got));
+                for (size_t i = n > 6 ? n - 6 : 0; i < n; i++) {
+                    fprintf(stderr, " %02x", (unsigned char)got[i]);
+                }
+                fprintf(stderr, "\n");
+            }
+            assert(is_valid_utf8(got));
+            assert(n % CHARS[c].len == 0);
+            json_free(rec);
+        }
+    }
+}
+
+static void test_multibyte_characters_that_fit_are_preserved_whole(void) {
+    /* The other half of the claim above: refusing to split must not have
+     * become refusing to emit. A short value with characters of every width
+     * comes back byte-for-byte. */
+    /* Split literals, not decoration: a hex escape absorbs every following hex
+     * digit, so "\xe2\x82\xac5" is one out-of-range escape rather than a euro
+     * sign and a five. */
+    const char *mixed = "caf\xc3\xa9 " "\xe2\x82\xac" "5 " "\xf0\x9f\x92\xa5" " /bin/echo";
+    json_value_t *v = record_of("t", mixed, "r", "passthrough", mixed);
+    assert_field(v, "requested_argv0", mixed);
+    assert_field(v, "detail", mixed);
+    json_free(v);
+}
+
+static void test_an_invalid_byte_is_preserved_rather_than_repaired(void) {
+    /* Design §6: "a byte sequence that is not valid UTF-8 is preserved rather
+     * than repaired or dropped — escaping is not this layer's job to validate
+     * UTF-8, only to keep the JSON structure sound". A raw 0xFF, which is what
+     * an argv0 read out of tracee memory can genuinely contain, must arrive on
+     * the far side as itself, with the record still parseable around it. The
+     * host is what survives it (String::from_utf8_lossy), not this layer. */
+    const char *raw = "/bin/no\xffsuch";
+    json_value_t *v = record_of("t", raw, "r", "passthrough", "d");
+    assert_field(v, "requested_argv0", raw);
     json_free(v);
 }
 
@@ -155,6 +273,9 @@ int main(void) {
     test_a_crafted_turn_id_cannot_inject_keys();
     test_control_characters_survive_as_escapes();
     test_an_overlong_value_costs_only_its_own_field();
+    test_truncation_never_splits_a_multibyte_character();
+    test_multibyte_characters_that_fit_are_preserved_whole();
+    test_an_invalid_byte_is_preserved_rather_than_repaired();
     test_a_null_turn_id_becomes_the_placeholder();
     printf("test_record: all tests passed\n");
     return 0;

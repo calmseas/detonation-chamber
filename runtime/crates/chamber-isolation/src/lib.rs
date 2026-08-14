@@ -72,7 +72,8 @@ pub mod warden;
 pub use cell::{AgentCell, EMPTY_BOUNDING_SET, GuestImage};
 pub use docker::{
     Attach, Container, ContainerSpec, Docker, DockerUnavailable, EngineError, EnvFile, ExecOutcome,
-    Network, NetworkSpec, build_image, build_image_for_platform, build_image_with_dockerfile,
+    Network, NetworkSpec, RawOutcome, build_image, build_image_for_platform,
+    build_image_with_dockerfile,
 };
 pub use env::{
     AdoptError, AnchorPlacement, BindError, CanaryPlacements, EnvDraft, EnvSealError, GuestRoot,

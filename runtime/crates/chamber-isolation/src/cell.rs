@@ -141,6 +141,41 @@ impl AgentCell {
         Ok(self.container.exec(argv, within)?)
     }
 
+    /// Everything the cell's PID 1 has written to stdout, as captured by the
+    /// container engine.
+    ///
+    /// For the exec-relay guest that stream is the disclosure log — one JSONL
+    /// record per intercepted exec, and nothing else, because `execrelayd`
+    /// sends its own operator output to stderr. For any other guest it is
+    /// whatever that image's entrypoint printed, which for the plain guest
+    /// (`sleep infinity`) is nothing.
+    ///
+    /// Two properties make this the sealing path rather than reading a file out
+    /// of the cell with `exec`:
+    ///
+    /// - **The agent cannot reach it.** The engine captures the stream outside
+    ///   the container as it is produced. A root-in-cell agent that deletes or
+    ///   truncates anything inside `/work` does not touch what is already
+    ///   captured — which the disclosure log, as a plain file in the
+    ///   agent-writable tmpfs, was not protected against.
+    /// - **A stopped container still has it.** `docker exec` refuses a stopped
+    ///   container, so the old file read had to be sequenced ahead of
+    ///   [`AgentCell::halt`]; captured logs survive until the container is
+    ///   REMOVED, so that ordering constraint is gone.
+    ///
+    /// Decoded with [`String::from_utf8_lossy`], deliberately: a disclosure
+    /// record's `requested_argv0` is a path read raw out of tracee memory and
+    /// carries no encoding guarantee, so an invalid byte must cost its own
+    /// line's readability and nothing more. A strict decode that fell back to
+    /// an empty string would erase a whole run's evidence over one byte.
+    ///
+    /// # Errors
+    /// [`CellError`] if the engine refuses.
+    pub fn captured_stdout(&self) -> Result<String, CellError> {
+        let raw = self.container.logs_bytes()?;
+        Ok(String::from_utf8_lossy(&raw.stdout).into_owned())
+    }
+
     /// Places a file in the cell, over stdin.
     ///
     /// Not via argv: the contents would land in the host process table, which

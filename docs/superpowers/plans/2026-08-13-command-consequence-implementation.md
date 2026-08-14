@@ -3341,3 +3341,75 @@ git commit -m "test: add chamber-e2e integration suite for the exec-consequence 
 - Migrating `pip-shim.sh`/H-supplychain onto this mechanism (design §7 — deliberately separate follow-up).
 - Stdin relaying through the relay protocol (design §10 — flagged, not built).
 - Any `/proc`-overlay discoverability mitigation (design §2/§8 — out of scope per the user's discoverability decision).
+
+## Post-plan: OLR revise cycle (two rounds, both superseded, tracked here rather than in this file's numbered tasks)
+
+An out-of-line review rejected the first merge attempt (SHA 17dc0a9) with 2 Critical + 7 Important
+findings; a revise cycle (10 commits, SHAs 3686c00..bdb9bc8) closed all of them, with each of its
+own three internal fix waves catching further issues in its own fixes before resubmitting. A second
+OLR round on the resubmission (SHA bdb9bc8) confirmed all 4 Critical + 13/14 Important findings
+from round one genuinely closed, found one new Critical (a non-UTF-8 byte in the disclosure log
+silently erasing the entire captured evidence for a run) plus several Important findings — one of
+which, `active_rewrite` being cleared by any nested exec, was a round-one finding Wave 2 had only
+partially closed — and flagged two director-level questions this file's task structure was never
+scoped to decide on its own. Full findings live in the Traverse graph (space `agenticpractices`,
+tag `olr`) against gates `agenticpractices:observation:lqf0mujxd2t7085ljz6d` (round 1) and
+`agenticpractices:observation:3xzg5a7hlbldicgwtryb` (round 2) — this section records only the
+scope decision this plan's own boundary required.
+
+**Preflight scope (round 2's director call (b)).** Wave 3's new composed-`DetonationPlan` test
+surfaced a genuine, pre-existing bug in `chamber-isolation/src/preflight.rs`: its network-egress
+and NAT-isolation safety checks were silently vacuous whenever the guest image's `ENTRYPOINT`
+refused to start without config — exactly `execrelayd`'s own behavior — so the isolation asserts
+reported `held` without ever having measured anything. This is a real fix to a shared safety gate
+used by every containment run, not just exec-consequence ones, and it traces to no task in this
+plan and no clause of the CCI design (which has no preflight text at all). The reviewer recommended
+splitting it onto its own branch with its own review; the user decided to keep it bundled with this
+gate instead, given nothing from this branch has been pushed anywhere and the bug was found by this
+feature's own test — with two further conditions: (1) this note, naming the fix as CCI-adjacent
+rather than CCI-scoped work, and (2) closing the two additional gaps the same review found in the
+same file (a route-parsing heuristic loose enough to accept a timestamp or version string as a
+route, and CIDR-form default routes like `0.0.0.0/0`/`::/0` not being detected at all — the assert
+could report `held` with a default route genuinely present). Both addressed in the round-2 fix
+commits; see the graph for specifics.
+
+## Post-plan: the disclosure log moved off the filesystem (round 2, wave A)
+
+Every task above that names `/work/.exec-relay/disclosure.log` — Task 3's `disclosure_init`, Task 8's
+record composition, Task 10's careful sequencing of the sealing read ahead of `AgentHalt`, and the
+e2e assertions that `cat` the file — describes a transport this branch no longer uses. The tasks are
+left as written, as historical record; this note is the correction.
+
+Round 2 of the OLR found a Critical in the host's read of that file
+(`std::fs::read_to_string(...).unwrap_or_default()`: one non-UTF-8 byte anywhere fails the whole read
+with `InvalidData` and silently substitutes an EMPTY string, while `cat` still exits 0 — so a run
+sealed zero exec-consequence observations and still reported the channel `Watched`). It also found
+that the file never met design §2's own writability-parity bar: the control socket is
+abstract-namespace and unreachable from the filesystem, while the log was a plain file in the
+agent-writable /work tmpfs, deletable and truncatable by the root-in-cell agent it exists to observe.
+
+The user decided to close both for real rather than patch the read. Design §2 and §6 were amended and
+`agenticpractices:decision:jbtd8mbc85dauq7628rx` logged. As built:
+
+- `execrelayd` writes each disclosure record as one JSONL line to its own PID-1 **stdout**; every
+  non-evidence operator message (`logline`) moved to **stderr**, so stdout is exclusively record
+  JSONL and the host needs no line filtering. `/work/.exec-relay/` is not created at all any more —
+  the control socket never needed it and nothing else used it.
+- The host reads the container runtime's own capture of that stream (`docker logs`, via the new
+  `Container::logs_bytes` → `AgentCell::captured_stdout`) as BYTES, decoded with
+  `String::from_utf8_lossy`. Capture happens outside the container, so deleting anything inside the
+  cell cannot reach evidence already captured, and captured logs outlive the container's stop —
+  which retires Task 10's ordering constraint (the call stays where Task 10 put it, but nothing
+  depends on that any more).
+- Two consequential details the transport forced, both with tests: a record must now fit `PIPE_BUF`
+  (the sink is a pipe, where only writes ≤ PIPE_BUF are atomic against concurrent handlers, unlike
+  the old `O_APPEND` file), so `record.c`'s per-field budgets were halved under a `_Static_assert`;
+  and `json_append_escaped` now truncates on a UTF-8 character boundary, since cutting a field at a
+  byte count could emit a split multi-byte sequence — invalid UTF-8 produced by the WRITE side,
+  independent of the host's read.
+
+The e2e test `a_relay_that_cannot_open_its_disclosure_log_refuses_to_start` was **removed**, not
+adapted: it made the log's `open()` fail with a read-only bind mount, and there is no open() any
+more. What it defended is now structural rather than a refusal, and is covered by
+`a_root_in_cell_agent_cannot_delete_the_sealed_disclosure_evidence` and
+`the_disclosure_stream_outlives_the_cell_it_came_from`.
