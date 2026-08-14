@@ -4,6 +4,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <limits.h>
 
 static int copy_str(char *dst, size_t dstsz, const char *src) {
     if (!src) return -1;
@@ -75,6 +76,7 @@ static int load_verb(json_value_t *verb, struct exec_rule *rule) {
         rule->verb = VERB_FABRICATE;
         int64_t code;
         if (json_as_int64(json_object_get(verb, "exit_code"), &code) != 0) return -1;
+        if (code < INT32_MIN || code > INT32_MAX) return -1;
         rule->fabricate_exit_code = (int32_t)code;
         const char *out = json_as_string(json_object_get(verb, "stdout"));
         const char *err = json_as_string(json_object_get(verb, "stderr"));
@@ -108,7 +110,7 @@ int config_load_from_json(const char *json_text, size_t len, struct exec_plan *o
     json_value_t *maxconc = json_object_get(root, "max_concurrent_handlers");
     if (maxconc) {
         int64_t v;
-        if (json_as_int64(maxconc, &v) != 0 || v <= 0) { json_free(root); return -1; }
+        if (json_as_int64(maxconc, &v) != 0 || v <= 0 || v > UINT32_MAX) { json_free(root); return -1; }
         out->max_concurrent_handlers = (uint32_t)v;
     }
 
@@ -139,18 +141,18 @@ int config_load_from_env(struct exec_plan *out) {
     /* Minimal base64 decode — standard alphabet, '=' padding. The Rust side
      * (Task 1) is the source of truth for what gets encoded; this decoder
      * only needs to invert it, not accept arbitrary base64 dialects. */
-    static const signed char T[256] = {
-        ['A']=0,['B']=1,['C']=2,['D']=3,['E']=4,['F']=5,['G']=6,['H']=7,['I']=8,['J']=9,
-        ['K']=10,['L']=11,['M']=12,['N']=13,['O']=14,['P']=15,['Q']=16,['R']=17,['S']=18,['T']=19,
-        ['U']=20,['V']=21,['W']=22,['X']=23,['Y']=24,['Z']=25,
-        ['a']=26,['b']=27,['c']=28,['d']=29,['e']=30,['f']=31,['g']=32,['h']=33,['i']=34,['j']=35,
-        ['k']=36,['l']=37,['m']=38,['n']=39,['o']=40,['p']=41,['q']=42,['r']=43,['s']=44,['t']=45,
-        ['u']=46,['v']=47,['w']=48,['x']=49,['y']=50,['z']=51,
-        ['0']=52,['1']=53,['2']=54,['3']=55,['4']=56,['5']=57,['6']=58,['7']=59,['8']=60,['9']=61,
-        ['+']=62,['/']=63,
-    };
+    /* Initialize all entries to -1 (invalid), then override valid base64 chars */
+    signed char T[256];
+    for (int i = 0; i < 256; i++) T[i] = -1;
+    /* Set valid base64 alphabet characters */
+    for (char c = 'A'; c <= 'Z'; c++) T[(unsigned char)c] = c - 'A';
+    for (char c = 'a'; c <= 'z'; c++) T[(unsigned char)c] = 26 + (c - 'a');
+    for (char c = '0'; c <= '9'; c++) T[(unsigned char)c] = 52 + (c - '0');
+    T[(unsigned char)'+'] = 62;
+    T[(unsigned char)'/'] = 63;
     size_t inlen = strlen(b64);
     char *decoded = malloc(inlen); /* decoded is always <= inlen bytes */
+    if (!decoded) return -1;
     size_t outlen = 0;
     int val = 0, valb = -8;
     for (size_t i = 0; i < inlen; i++) {
