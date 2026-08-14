@@ -61,12 +61,46 @@ static void test_negative_and_zero_numbers(void) {
     json_free(v);
 }
 
+static void test_rejects_deeply_nested_arrays(void) {
+    /* Depth limit is 32. Create input with 33 nested arrays to exceed it. */
+    char buf[256];
+    int pos = 0;
+    for (int i = 0; i < 33; i++) buf[pos++] = '[';
+    buf[pos++] = '1';
+    for (int i = 0; i < 33; i++) buf[pos++] = ']';
+    buf[pos] = 0;
+    json_value_t *v = json_parse(buf, pos);
+    assert(v == NULL); /* Should reject due to depth limit */
+}
+
+static void test_rejects_truncated_nested_object(void) {
+    /* This tests the memory leak fix: truncated nested object should fail cleanly. */
+    const char *text = "{\"a\":{";  /* Missing closing braces */
+    json_value_t *v = json_parse(text, strlen(text));
+    assert(v == NULL); /* Should reject malformed input */
+}
+
+static void test_rejects_out_of_range_numbers(void) {
+    /* Very large number that parses but exceeds int64_t range */
+    const char *text = "{\"x\":99999999999999999999}";
+    json_value_t *v = json_parse(text, strlen(text));
+    if (v != NULL) {
+        int64_t result;
+        /* json_as_int64 should return -1 for out-of-range numbers */
+        assert(json_as_int64(json_object_get(v, "x"), &result) == -1);
+        json_free(v);
+    }
+}
+
 int main(void) {
     test_parses_flat_object();
     test_parses_nested_array_of_objects();
     test_handles_escaped_strings();
     test_rejects_malformed_json();
     test_negative_and_zero_numbers();
+    test_rejects_deeply_nested_arrays();
+    test_rejects_truncated_nested_object();
+    test_rejects_out_of_range_numbers();
     printf("test_json: all tests passed\n");
     return 0;
 }

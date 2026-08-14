@@ -3,11 +3,15 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include <limits.h>
+
+#define MAX_PARSE_DEPTH 32
 
 struct parser {
     const char *p;
     const char *end;
     int failed;
+    int depth;
 };
 
 static void skip_ws(struct parser *ps) {
@@ -16,6 +20,7 @@ static void skip_ws(struct parser *ps) {
 
 static json_value_t *alloc_value(json_type_t t) {
     json_value_t *v = calloc(1, sizeof(json_value_t));
+    if (!v) return NULL;
     v->type = t;
     return v;
 }
@@ -27,6 +32,7 @@ static char *parse_raw_string(struct parser *ps) {
     ps->p++;
     size_t cap = 32, len = 0;
     char *buf = malloc(cap);
+    if (!buf) { ps->failed = 1; return NULL; }
     while (ps->p < ps->end && *ps->p != '"') {
         char c = *ps->p++;
         if (c == '\\') {
@@ -65,7 +71,7 @@ static char *parse_raw_string(struct parser *ps) {
                 default: ps->failed = 1; free(buf); return NULL;
             }
         }
-        if (len + 1 >= cap) { cap *= 2; buf = realloc(buf, cap); }
+        if (len + 1 >= cap) { cap *= 2; char *tmp = realloc(buf, cap); if (!tmp) { ps->failed = 1; free(buf); return NULL; } buf = tmp; }
         buf[len++] = c;
     }
     if (ps->p >= ps->end) { ps->failed = 1; free(buf); return NULL; }
@@ -78,6 +84,7 @@ static json_value_t *parse_string(struct parser *ps) {
     char *s = parse_raw_string(ps);
     if (!s) return NULL;
     json_value_t *v = alloc_value(JSON_STRING);
+    if (!v) { free(s); return NULL; }
     v->u.string = s;
     return v;
 }
@@ -97,6 +104,7 @@ static json_value_t *parse_number(struct parser *ps) {
     memcpy(buf, start, n);
     buf[n] = 0;
     json_value_t *v = alloc_value(JSON_NUMBER);
+    if (!v) { ps->failed = 1; return NULL; }
     v->u.number = strtod(buf, NULL);
     return v;
 }
@@ -109,59 +117,77 @@ static int literal_at(struct parser *ps, const char *lit) {
 
 static json_value_t *parse_array(struct parser *ps) {
     ps->p++; /* '[' */
+    if (ps->depth >= MAX_PARSE_DEPTH) { ps->failed = 1; return NULL; }
+    ps->depth++;
     json_value_t *v = alloc_value(JSON_ARRAY);
+    if (!v) { ps->failed = 1; ps->depth--; return NULL; }
     size_t cap = 4;
     v->u.array.items = malloc(cap * sizeof(json_value_t *));
+    if (!v->u.array.items) { ps->failed = 1; json_free(v); ps->depth--; return NULL; }
     v->u.array.len = 0;
     skip_ws(ps);
-    if (ps->p < ps->end && *ps->p == ']') { ps->p++; return v; }
+    if (ps->p < ps->end && *ps->p == ']') { ps->p++; ps->depth--; return v; }
     for (;;) {
         skip_ws(ps);
         json_value_t *item = parse_value(ps);
-        if (!item) { ps->failed = 1; return NULL; }
-        if (v->u.array.len == cap) { cap *= 2; v->u.array.items = realloc(v->u.array.items, cap * sizeof(json_value_t *)); }
+        if (!item) { ps->failed = 1; json_free(v); ps->depth--; return NULL; }
+        if (v->u.array.len == cap) {
+            cap *= 2;
+            json_value_t **tmp = realloc(v->u.array.items, cap * sizeof(json_value_t *));
+            if (!tmp) { ps->failed = 1; json_free(v); ps->depth--; return NULL; }
+            v->u.array.items = tmp;
+        }
         v->u.array.items[v->u.array.len++] = item;
         skip_ws(ps);
-        if (ps->p >= ps->end) { ps->failed = 1; return NULL; }
+        if (ps->p >= ps->end) { ps->failed = 1; json_free(v); ps->depth--; return NULL; }
         if (*ps->p == ',') { ps->p++; continue; }
-        if (*ps->p == ']') { ps->p++; break; }
-        ps->failed = 1; return NULL;
+        if (*ps->p == ']') { ps->p++; ps->depth--; break; }
+        ps->failed = 1; json_free(v); ps->depth--; return NULL;
     }
     return v;
 }
 
 static json_value_t *parse_object(struct parser *ps) {
     ps->p++; /* '{' */
+    if (ps->depth >= MAX_PARSE_DEPTH) { ps->failed = 1; return NULL; }
+    ps->depth++;
     json_value_t *v = alloc_value(JSON_OBJECT);
+    if (!v) { ps->failed = 1; ps->depth--; return NULL; }
     size_t cap = 4;
     v->u.object.keys = malloc(cap * sizeof(char *));
+    if (!v->u.object.keys) { ps->failed = 1; json_free(v); ps->depth--; return NULL; }
     v->u.object.values = malloc(cap * sizeof(json_value_t *));
+    if (!v->u.object.values) { ps->failed = 1; json_free(v); ps->depth--; return NULL; }
     v->u.object.len = 0;
     skip_ws(ps);
-    if (ps->p < ps->end && *ps->p == '}') { ps->p++; return v; }
+    if (ps->p < ps->end && *ps->p == '}') { ps->p++; ps->depth--; return v; }
     for (;;) {
         skip_ws(ps);
         char *key = parse_raw_string(ps);
-        if (!key) { ps->failed = 1; return NULL; }
+        if (!key) { ps->failed = 1; json_free(v); ps->depth--; return NULL; }
         skip_ws(ps);
-        if (ps->p >= ps->end || *ps->p != ':') { ps->failed = 1; free(key); return NULL; }
+        if (ps->p >= ps->end || *ps->p != ':') { ps->failed = 1; free(key); json_free(v); ps->depth--; return NULL; }
         ps->p++;
         skip_ws(ps);
         json_value_t *val = parse_value(ps);
-        if (!val) { ps->failed = 1; free(key); return NULL; }
+        if (!val) { ps->failed = 1; free(key); json_free(v); ps->depth--; return NULL; }
         if (v->u.object.len == cap) {
             cap *= 2;
-            v->u.object.keys = realloc(v->u.object.keys, cap * sizeof(char *));
-            v->u.object.values = realloc(v->u.object.values, cap * sizeof(json_value_t *));
+            char **tmp_keys = realloc(v->u.object.keys, cap * sizeof(char *));
+            if (!tmp_keys) { ps->failed = 1; free(key); json_free(val); json_free(v); ps->depth--; return NULL; }
+            v->u.object.keys = tmp_keys;
+            json_value_t **tmp_vals = realloc(v->u.object.values, cap * sizeof(json_value_t *));
+            if (!tmp_vals) { ps->failed = 1; free(key); json_free(val); json_free(v); ps->depth--; return NULL; }
+            v->u.object.values = tmp_vals;
         }
         v->u.object.keys[v->u.object.len] = key;
         v->u.object.values[v->u.object.len] = val;
         v->u.object.len++;
         skip_ws(ps);
-        if (ps->p >= ps->end) { ps->failed = 1; return NULL; }
+        if (ps->p >= ps->end) { ps->failed = 1; json_free(v); ps->depth--; return NULL; }
         if (*ps->p == ',') { ps->p++; continue; }
-        if (*ps->p == '}') { ps->p++; break; }
-        ps->failed = 1; return NULL;
+        if (*ps->p == '}') { ps->p++; ps->depth--; break; }
+        ps->failed = 1; json_free(v); ps->depth--; return NULL;
     }
     return v;
 }
@@ -174,15 +200,15 @@ static json_value_t *parse_value(struct parser *ps) {
     if (c == '[') return parse_array(ps);
     if (c == '"') return parse_string(ps);
     if (c == '-' || isdigit((unsigned char)c)) return parse_number(ps);
-    if (literal_at(ps, "true")) { ps->p += 4; json_value_t *v = alloc_value(JSON_BOOL); v->u.boolean = 1; return v; }
-    if (literal_at(ps, "false")) { ps->p += 5; json_value_t *v = alloc_value(JSON_BOOL); v->u.boolean = 0; return v; }
-    if (literal_at(ps, "null")) { ps->p += 4; return alloc_value(JSON_NULL); }
+    if (literal_at(ps, "true")) { ps->p += 4; json_value_t *v = alloc_value(JSON_BOOL); if (!v) { ps->failed = 1; return NULL; } v->u.boolean = 1; return v; }
+    if (literal_at(ps, "false")) { ps->p += 5; json_value_t *v = alloc_value(JSON_BOOL); if (!v) { ps->failed = 1; return NULL; } v->u.boolean = 0; return v; }
+    if (literal_at(ps, "null")) { ps->p += 4; json_value_t *v = alloc_value(JSON_NULL); if (!v) { ps->failed = 1; return NULL; } return v; }
     ps->failed = 1;
     return NULL;
 }
 
 json_value_t *json_parse(const char *text, size_t len) {
-    struct parser ps = { .p = text, .end = text + len, .failed = 0 };
+    struct parser ps = { .p = text, .end = text + len, .failed = 0, .depth = 0 };
     json_value_t *v = parse_value(&ps);
     if (!v || ps.failed) { if (v) json_free(v); return NULL; }
     skip_ws(&ps);
@@ -240,6 +266,8 @@ const char *json_as_string(json_value_t *v) {
 int json_as_int64(json_value_t *v, int64_t *out) {
     if (!v || v->type != JSON_NUMBER) return -1;
     double d = v->u.number;
+    /* Check that d is in the representable range for int64_t before casting. */
+    if (d < (double)INT64_MIN || d > (double)INT64_MAX) return -1;
     int64_t truncated = (int64_t)d;
     if ((double)truncated != d) return -1;
     *out = truncated;
