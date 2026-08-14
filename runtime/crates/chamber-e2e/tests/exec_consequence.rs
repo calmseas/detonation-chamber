@@ -3,7 +3,12 @@ mod support;
 use chamber_capture::exec_consequence::{
     ArgvMatcher, ExecConsequencePlan, ExecConsequenceRule, ExecVerb,
 };
+use chamber_evidence::{Channel, ChannelCoverage, ObservationKind, OpenedBundle};
 use chamber_isolation::{Attach, Container, ContainerSpec};
+use chamber_run::{
+    ArmingRefusal, DetonationPlan, ImageTags, PlantedCanary, ScriptedTurns, run_detonation,
+};
+use std::future::Future;
 use std::time::Duration;
 use support::*;
 
@@ -2005,5 +2010,300 @@ fn a_path_searched_bare_command_records_exactly_one_line() {
         records[0].contains("\"requested_argv0\":\"/bin/cat\""),
         "the single record must name the binary that actually ran:\n{}",
         records[0]
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The composed path: `DetonationPlan` -> `run_detonation` -> a sealed bundle.
+//
+// Everything above this line builds a raw `Container` from a `ContainerSpec`
+// and talks to it directly. That is the right shape for pinning the guest
+// relay's own behaviour — it isolates the C program from the rest of the
+// harness — but it means the suite drove the mechanism and never the FEATURE.
+// None of it touches the code a real caller reaches:
+//
+//   * `check_exec_relay_capability`, which refuses a plan that arms an
+//     exec_consequence against an image with no relay in it,
+//   * `apply_exec_consequence_env`, the only place on the real run path where
+//     `ExecConsequencePlan::validate` is called and the only place the spec is
+//     bound into the cell's SEALED environment (rather than an `EnvFile` a test
+//     wrote by hand),
+//   * `ToolBridge::new_with_exec_relay`, which decides whether a turn is
+//     prefixed with `stub` at all, and mints the per-call `--turn-id=`,
+//     * the read of `/work/.exec-relay/disclosure.log` at the one point in
+//     `run_detonation` where the cell is still running,
+//   * `record_exec_consequence_log`, which parses that text into sealed
+//     observations,
+//   * and `ExecInterception`, which decides whether the bundle may claim the
+//     `ExecConsequence` channel was watched.
+//
+// A break anywhere in that chain leaves every test above green and the feature
+// dead. These two tests close it: one drives a real detonation end to end, the
+// other pins the refusal that must happen before any of it starts.
+// ---------------------------------------------------------------------------
+
+/// A canary is not optional: the observer refuses to start without one, because
+/// a run with nothing to find can only report finding nothing.
+const COMPOSED_CANARY: &str = "AKIAIOSFODNN7EXAMPLE";
+
+/// Drives one async detonation on a throwaway runtime, so the test stays
+/// synchronous and the subnet lock never crosses an await.
+fn block_on<F: Future>(f: F) -> F::Output {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("build a tokio runtime")
+        .block_on(f)
+}
+
+fn open_bundle_at(bundle: &std::path::Path, seal: &std::path::Path) -> OpenedBundle {
+    let bytes = std::fs::read(bundle).expect("read bundle");
+    let seal: chamber_evidence::BundleSeal =
+        serde_json::from_slice(&std::fs::read(seal).expect("read seal")).expect("parse seal");
+    chamber_evidence::open(&bytes, &seal).expect("bundle opens")
+}
+
+/// Every `ExecConsequence` observation in a sealed bundle, in ledger order.
+#[allow(clippy::type_complexity)]
+fn exec_consequence_records(b: &OpenedBundle) -> Vec<(&str, &str, &str, &str, &str)> {
+    b.ledger
+        .entries()
+        .iter()
+        .filter_map(|o| match o.kind() {
+            ObservationKind::ExecConsequence {
+                turn_id,
+                requested_argv0,
+                matched_rule,
+                verb_applied,
+                detail,
+            } => Some((
+                turn_id.as_str(),
+                requested_argv0.as_str(),
+                matched_rule.as_str(),
+                verb_applied.as_str(),
+                detail.as_str(),
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
+/// What the bundle says a guest command was, and what it exited with.
+fn guest_command_exit(b: &OpenedBundle, needle: &str) -> Option<i32> {
+    b.ledger.entries().iter().find_map(|o| match o.kind() {
+        ObservationKind::GuestCommand {
+            argv_redacted,
+            exit,
+        } if argv_redacted.join(" ").contains(needle) => Some(*exit),
+        _ => None,
+    })
+}
+
+/// A real detonation with an `exec_consequence` armed, through
+/// `run_detonation`, ending in a sealed bundle that proves the interception
+/// happened.
+///
+/// The evidence is arranged so that no single assertion could be satisfied by a
+/// half-working path:
+///
+///   * Turn 0 asks for `/bin/touch /work/the-real-touch-ran`, which a rule
+///     fabricates. Turn 1 asks for `/bin/ls` of that same path, which matches
+///     no rule and passes through to the real `ls`.
+///   * If interception is armed and working, turn 1 exits 1 — the file is not
+///     there, because nothing ran to create it. If the plan never reached the
+///     guest, turn 0's touch really runs and turn 1 exits 0. The two turns
+///     therefore disagree about the same filesystem, and the disagreement is
+///     visible in the sealed bundle rather than through a side channel this
+///     test opened for itself.
+///   * The `ExecConsequence` observations must show the fabricate for turn-0
+///     and the passthrough for turn-1, with the turn ids the BRIDGE minted
+///     (`turn-0`, `turn-1`) — not ids this test supplied, which is what every
+///     raw-`Container` test above has to do.
+///   * And the channel must be `Watched`, which `bundle.rs` grants only when
+///     the relay was armed AND its disclosure log was successfully read out of
+///     the cell before the wind-down stopped it.
+#[test]
+fn a_composed_detonation_arms_the_relay_and_seals_what_it_intercepted() {
+    let Some(_engine) = require_containers() else {
+        return;
+    };
+    ensure_images_including(&[IMAGE]);
+    let _serialised = chamber_subnet_lock();
+
+    let evidence = shared_scratch(&format!("exec-composed-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&evidence);
+
+    const TOUCHED: &str = "/work/the-real-touch-ran";
+
+    let plan = DetonationPlan {
+        images: ImageTags {
+            capture: "chamber-capture:test".into(),
+            warden: "chamber-warden:test".into(),
+            // The relay-capable guest. `check_exec_relay_capability` refuses
+            // any other one when `exec_consequence` is set, which the test
+            // below pins.
+            guest: IMAGE.into(),
+            inspector: "chamber-inspector:test".into(),
+        },
+        ruleset: images_dir().join("chamber.nft"),
+        evidence_dir: evidence.clone(),
+        canaries: vec![PlantedCanary {
+            label: "aws-key".into(),
+            value: COMPOSED_CANARY.into(),
+            var: "CHAMBER_TOKEN".into(),
+        }],
+        max_turns: 8,
+        skill_dir: None,
+        consequence: None,
+        exec_consequence: Some(ExecConsequencePlan {
+            rules: vec![ExecConsequenceRule {
+                name: "fab-touch".to_owned(),
+                match_argv: ArgvMatcher::Argv0 {
+                    name: "/bin/touch".to_owned(),
+                },
+                verb: ExecVerb::Fabricate {
+                    exit_code: 0,
+                    stdout: "fabricated-ok".to_owned(),
+                    stderr: String::new(),
+                },
+            }],
+            timeout_ms: 60_000,
+            max_concurrent_handlers: 32,
+        }),
+    };
+
+    let script = format!(
+        r#"[
+            {{"do": "run_command", "argv": ["/bin/touch", "{TOUCHED}"]}},
+            {{"do": "run_command", "argv": ["/bin/ls", "{TOUCHED}"]}},
+            {{"do": "conclude"}}
+        ]"#
+    );
+    let mut turns =
+        ScriptedTurns::from_bytes("exec-consequence-composed", script.as_bytes()).expect("parse");
+
+    let ep = block_on(run_detonation(&plan, &mut turns)).unwrap_or_else(|e| panic!("{e}"));
+    let b = open_bundle_at(&ep.bundle_path, &ep.seal_path);
+
+    // The bundle may claim this channel at all only because the relay was armed
+    // and its log came back. `Absent { ExcludedByDesign }` here would mean the
+    // plan's `exec_consequence` never reached `Observed::exec_interception`;
+    // `Absent { ObserverFailed }` would mean the disclosure log could not be
+    // read out of the cell.
+    assert_eq!(
+        b.coverage.status(Channel::ExecConsequence),
+        &ChannelCoverage::Watched,
+        "the composed path did not arm and read back the exec-interception relay"
+    );
+
+    // What the bundle says the relay did, turn by turn.
+    let records = exec_consequence_records(&b);
+    assert_eq!(
+        records.len(),
+        2,
+        "expected one record per turn, got {records:#?}"
+    );
+    let (turn, argv0, rule, verb, detail) = records[0];
+    assert_eq!(
+        (turn, argv0, rule, verb),
+        ("turn-0", "/bin/touch", "fab-touch", "fabricate"),
+        "turn 0's fabricate is not in the sealed evidence as configured: \
+         {records:#?}"
+    );
+    assert!(detail.contains("exit=0"), "{records:#?}");
+    assert_eq!(
+        (records[1].0, records[1].1, records[1].2, records[1].3),
+        ("turn-1", "/bin/ls", "fallback", "passthrough"),
+        "turn 1 did not pass through to the real command: {records:#?}"
+    );
+
+    // And the proof that the fabricate really prevented the exec, taken from
+    // the bundle rather than from the cell (which the wind-down has destroyed
+    // by now): the following turn looked for the file the touch would have
+    // created, through the relay, and did not find it.
+    assert_eq!(
+        guest_command_exit(&b, "/bin/touch"),
+        Some(0),
+        "the fabricated touch did not report the canned exit code"
+    );
+    assert_eq!(
+        guest_command_exit(&b, "/bin/ls"),
+        Some(1),
+        "the file the fabricated /bin/touch would have created EXISTS — the \
+         real target ran on the composed path"
+    );
+
+    let _ = std::fs::remove_dir_all(&evidence);
+}
+
+/// An `exec_consequence` against a guest image with no relay in it must refuse
+/// to arm, on the real entry point.
+///
+/// `ToolBridge` prefixes every turn with `stub` the moment `exec_consequence`
+/// is `Some` — that is the only condition it consults. Pointed at the ordinary
+/// guest image, every turn of the run becomes `stub: not found`, exit 127,
+/// recorded against the artefact as though its own commands had failed: an
+/// entire run of fictitious evidence with nothing anywhere saying so.
+///
+/// Wave 2 added `check_exec_relay_capability` for exactly this, and
+/// `run_detonation` calls it first — before the engine is probed, before a
+/// network is raised. That ordering is what lets this test run anywhere,
+/// Docker or no Docker, and it is worth pinning: a refusal that had to raise a
+/// chamber first would leave wreckage behind and could only be tested on a host
+/// with a Linux guest.
+#[test]
+fn an_exec_consequence_against_a_relayless_guest_image_refuses_to_arm() {
+    // Named, and checked below: a refusal writes no bundle. `run_detonation`
+    // creates this directory (and clears any stale ledger in it) as its second
+    // act, immediately after probing the engine — so its absence afterwards is
+    // also how this test shows the refusal came before all of that.
+    let evidence = shared_scratch("exec-composed-refusal-never-written");
+    let _ = std::fs::remove_dir_all(&evidence);
+
+    let plan = DetonationPlan {
+        images: ImageTags {
+            capture: "chamber-capture:test".into(),
+            warden: "chamber-warden:test".into(),
+            // The ORDINARY guest: alpine with curl, no execrelayd, no stub.
+            guest: "chamber-guest:test".into(),
+            inspector: "chamber-inspector:test".into(),
+        },
+        ruleset: images_dir().join("chamber.nft"),
+        evidence_dir: evidence.clone(),
+        canaries: vec![PlantedCanary {
+            label: "aws-key".into(),
+            value: COMPOSED_CANARY.into(),
+            var: "CHAMBER_TOKEN".into(),
+        }],
+        max_turns: 8,
+        skill_dir: None,
+        consequence: None,
+        exec_consequence: Some(ExecConsequencePlan {
+            rules: vec![],
+            timeout_ms: 60_000,
+            max_concurrent_handlers: 32,
+        }),
+    };
+    let mut turns =
+        ScriptedTurns::from_bytes("refusal", br#"[{"do": "conclude"}]"#).expect("parse");
+
+    let refusal = block_on(run_detonation(&plan, &mut turns))
+        .expect_err("a plan arming exec_consequence against the plain guest must refuse");
+    assert!(
+        matches!(
+            refusal,
+            ArmingRefusal::ExecRelayImage { ref guest } if guest == "chamber-guest:test"
+        ),
+        "the wrong refusal: {refusal:?}"
+    );
+    // The refusal has to be legible to the operator who wrote the plan, not
+    // just a discriminant: it names the image it got and the one it needs.
+    let said = refusal.to_string();
+    assert!(said.contains("chamber-guest:test"), "{said}");
+    assert!(said.contains(chamber_run::EXEC_RELAY_GUEST_IMAGE), "{said}");
+    assert!(
+        !evidence.exists(),
+        "a refusal must write nothing, but {} was created",
+        evidence.display()
     );
 }
