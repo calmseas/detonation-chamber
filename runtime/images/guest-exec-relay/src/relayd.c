@@ -188,6 +188,70 @@ static int read_tracee_argv(int pid, unsigned long long argv_addr, char out[][25
     return n;
 }
 
+/* ---------------------------- disclosure log ---------------------------- */
+#define DISCLOSURE_LOG_PATH "/work/.execrelay.log"
+static int g_disclosure_fd = -1;
+
+static void disclosure_init(void) {
+    g_disclosure_fd = open(DISCLOSURE_LOG_PATH, O_CREAT | O_WRONLY | O_APPEND, 0600);
+    if (g_disclosure_fd < 0) { perror("disclosure: open"); return; }
+    static const char header[] =
+        "{\"known_residual_tells\":[\"TracerPid nonzero in /proc/self/status "
+        "\\u2014 structural to ptrace, not masked\"]}\n";
+    write_full(g_disclosure_fd, header, sizeof(header) - 1);
+}
+
+/* Minimal, allocation-free JSON string escaping for the handful of fields we
+ * emit here (argv entries, rule names, free-form `detail` text) — backslash
+ * and double-quote are the only bytes this schema's own values can contain
+ * that would break JSON (argv/name/detail never carry control characters in
+ * practice; this only needs to not corrupt the log, not be a general escaper). */
+static void write_json_escaped(int fd, const char *s) {
+    char buf[4096];
+    size_t o = 0;
+    for (; *s && o < sizeof(buf) - 2; s++) {
+        if (*s == '"' || *s == '\\') { buf[o++] = '\\'; }
+        buf[o++] = *s;
+    }
+    write_full(fd, buf, o);
+}
+
+static void disclosure_record(const char *turn_id, const char *requested_argv0,
+                               const char *matched_rule, const char *verb_applied,
+                               const char *detail) {
+    if (g_disclosure_fd < 0) return;
+    struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
+    char pre[256];
+    int n = snprintf(pre, sizeof(pre),
+        "{\"turn_id\":\"%s\",\"timestamp\":%ld.%03ld,\"requested_argv0\":\"",
+        turn_id ? turn_id : "-", (long)ts.tv_sec, ts.tv_nsec / 1000000);
+    write_full(g_disclosure_fd, pre, (size_t)n);
+    write_json_escaped(g_disclosure_fd, requested_argv0);
+    char mid[256];
+    n = snprintf(mid, sizeof(mid), "\",\"matched_rule\":\"%s\",\"verb_applied\":\"%s\",\"detail\":\"",
+                 matched_rule, verb_applied);
+    write_full(g_disclosure_fd, mid, (size_t)n);
+    write_json_escaped(g_disclosure_fd, detail);
+    static const char tail[] = "\"}\n";
+    write_full(g_disclosure_fd, tail, sizeof(tail) - 1);
+}
+
+static size_t apply_rewrite(char *buf, size_t len, const char *find, const char *replace, char *out, size_t outcap) {
+    if (!find || !find[0]) { size_t n = len < outcap ? len : outcap; memcpy(out, buf, n); return n; }
+    size_t findlen = strlen(find), replacelen = strlen(replace);
+    size_t oi = 0, i = 0;
+    while (i < len && oi < outcap) {
+        if (i + findlen <= len && memcmp(buf + i, find, findlen) == 0) {
+            size_t n = replacelen < (outcap - oi) ? replacelen : (outcap - oi);
+            memcpy(out + oi, replace, n);
+            oi += n; i += findlen;
+        } else {
+            out[oi++] = buf[i++];
+        }
+    }
+    return oi;
+}
+
 /* ---------------------------------------------------------------------
  * Core primitive shared by both the socket-relay path and the
  * --self-test path: fork a child, have it install the seccomp filter,
@@ -197,7 +261,9 @@ static int read_tracee_argv(int pid, unsigned long long argv_addr, char out[][25
  * req_id may be NULL.
  * --------------------------------------------------------------------- */
 static int run_traced(char *const argv[], char *const envp_extra[], int envp_extra_n,
-                       const char *req_id, int out_fd, int err_fd, int *exit_code_out) {
+                       const char *req_id, int out_fd, int err_fd, int *exit_code_out,
+                       const struct exec_plan *plan, uint64_t timeout_ms) {
+    const struct exec_rule *active_rewrite = NULL;
     int outp[2], errp[2], syncr[2], syncg[2];
     if (pipe(outp) || pipe(errp) || pipe(syncr) || pipe(syncg)) { perror("pipe"); return -1; }
 
@@ -276,6 +342,12 @@ static int run_traced(char *const argv[], char *const envp_extra[], int envp_ext
     struct pollfd pfds[3];
     int have_out = 1, have_err = 1, have_exit = 0, ecode = -1;
 
+    struct timespec deadline;
+    clock_gettime(CLOCK_MONOTONIC, &deadline);
+    deadline.tv_sec += (time_t)(timeout_ms / 1000);
+    deadline.tv_nsec += (long)(timeout_ms % 1000) * 1000000;
+    if (deadline.tv_nsec >= 1000000000) { deadline.tv_sec++; deadline.tv_nsec -= 1000000000; }
+
     for (;;) {
         int nfds = 0;
         int oi = -1, ei = -1, si;
@@ -285,19 +357,48 @@ static int run_traced(char *const argv[], char *const envp_extra[], int envp_ext
 
         if (!have_out && !have_err && have_exit) break; /* fully drained + exited */
 
-        int pr = poll(pfds, nfds, -1);
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        long remaining_ms = (long)(deadline.tv_sec - now.tv_sec) * 1000
+                           + (deadline.tv_nsec - now.tv_nsec) / 1000000;
+        if (remaining_ms <= 0) {
+            logline("req=%s pid=%d TIMEOUT after %llu ms, killing", req_id?req_id:"-", pid,
+                    (unsigned long long)timeout_ms);
+            kill(pid, SIGKILL);
+            { int st; waitpid(pid, &st, 0); }
+            close(sfd); close(outp[0]); close(errp[0]);
+            if (exit_code_out) *exit_code_out = 124; /* matches GNU `timeout`'s convention */
+            return -1;
+        }
+        int pr = poll(pfds, nfds, (int)remaining_ms);
         if (pr < 0) { if (errno == EINTR) continue; break; }
 
         if (oi >= 0 && (pfds[oi].revents & (POLLIN|POLLHUP))) {
-            char buf[8192];
+            char buf[8192], out[8192];
             ssize_t r = read(outp[0], buf, sizeof(buf));
-            if (r > 0) send_frame(out_fd, TAG_STDOUT, buf, (uint32_t)r);
+            if (r > 0) {
+                if (active_rewrite && active_rewrite->has_stdout_rewrite) {
+                    size_t n = apply_rewrite(buf, (size_t)r, active_rewrite->stdout_find,
+                                              active_rewrite->stdout_replace, out, sizeof(out));
+                    send_frame(out_fd, TAG_STDOUT, out, (uint32_t)n);
+                } else {
+                    send_frame(out_fd, TAG_STDOUT, buf, (uint32_t)r);
+                }
+            }
             else { have_out = 0; close(outp[0]); }
         }
         if (ei >= 0 && (pfds[ei].revents & (POLLIN|POLLHUP))) {
-            char buf[8192];
+            char buf[8192], out[8192];
             ssize_t r = read(errp[0], buf, sizeof(buf));
-            if (r > 0) send_frame(err_fd, TAG_STDERR, buf, (uint32_t)r);
+            if (r > 0) {
+                if (active_rewrite && active_rewrite->has_stderr_rewrite) {
+                    size_t n = apply_rewrite(buf, (size_t)r, active_rewrite->stderr_find,
+                                              active_rewrite->stderr_replace, out, sizeof(out));
+                    send_frame(err_fd, TAG_STDERR, out, (uint32_t)n);
+                } else {
+                    send_frame(err_fd, TAG_STDERR, buf, (uint32_t)r);
+                }
+            }
             else { have_err = 0; close(errp[0]); }
         }
         if (pfds[si].revents & POLLIN) {
@@ -452,12 +553,12 @@ reap_and_fail:
 
 /* ------------------------- socket-relay server path ------------------------- */
 
-static void handle_conn(int cfd) {
+static void handle_conn(int cfd, const struct exec_plan *plan) {
     char line[2048];
     char id[256] = "-";
     int argc = 0;
-    char *argv[64];
-    for (int i = 0; i < 64; i++) argv[i] = NULL;
+    char *argv[EXEC_RELAY_MAX_ARGV];
+    for (int i = 0; i < EXEC_RELAY_MAX_ARGV; i++) argv[i] = NULL;
 
     for (;;) {
         int n = read_line(cfd, line, sizeof(line));
@@ -466,12 +567,10 @@ static void handle_conn(int cfd) {
             strncpy(id, line + 3, sizeof(id) - 1);
         } else if (strncmp(line, "ARGC ", 5) == 0) {
             argc = atoi(line + 5);
-            if (argc < 1 || argc > 63) { close(cfd); return; }
+            if (argc < 1 || argc > EXEC_RELAY_MAX_ARGV - 1) { close(cfd); return; }
         } else if (strncmp(line, "ARG ", 4) == 0) {
-            if (argc > 0) {
-                for (int i = 0; i < 63; i++) {
-                    if (argv[i] == NULL) { argv[i] = strdup(line + 4); break; }
-                }
+            for (int i = 0; i < EXEC_RELAY_MAX_ARGV - 1; i++) {
+                if (argv[i] == NULL) { argv[i] = strdup(line + 4); break; }
             }
         } else if (strcmp(line, "END") == 0) {
             break;
@@ -486,7 +585,7 @@ static void handle_conn(int cfd) {
     char *extra[1] = { idenv };
 
     int ecode = -1;
-    run_traced(argv, extra, 1, id, cfd, cfd, &ecode);
+    run_traced(argv, extra, 1, id, cfd, cfd, &ecode, plan, plan->timeout_ms);
 
     uint32_t code_be = (uint32_t)ecode;
     uint8_t payload[4] = { (code_be>>24)&0xff, (code_be>>16)&0xff, (code_be>>8)&0xff, code_be&0xff };
@@ -495,38 +594,112 @@ static void handle_conn(int cfd) {
     close(cfd);
 }
 
-static int run_server(void) {
+static volatile sig_atomic_t g_active_handlers = 0;
+
+static void reap_finished_handlers(void) {
+    for (;;) {
+        int status;
+        pid_t w = waitpid(-1, &status, WNOHANG);
+        if (w <= 0) break;
+        if (g_active_handlers > 0) g_active_handlers--;
+    }
+}
+
+static int run_server(const struct exec_plan *plan) {
     unlink(SOCK_PATH);
     int sfd = socket(AF_UNIX, SOCK_STREAM, 0);
     struct sockaddr_un addr = { .sun_family = AF_UNIX };
     strncpy(addr.sun_path, SOCK_PATH, sizeof(addr.sun_path)-1);
     if (bind(sfd, (struct sockaddr*)&addr, sizeof(addr)) != 0) { perror("bind"); return 1; }
     chmod(SOCK_PATH, 0666);
-    if (listen(sfd, 16) != 0) { perror("listen"); return 1; }
+    if (listen(sfd, 64) != 0) { perror("listen"); return 1; }
     logline("relayd listening on %s pid=%d", SOCK_PATH, getpid());
 
     signal(SIGPIPE, SIG_IGN);
 
     for (;;) {
+        reap_finished_handlers();
+
         int cfd = accept(sfd, NULL, NULL);
         if (cfd < 0) { if (errno == EINTR) continue; perror("accept"); continue; }
-        handle_conn(cfd);
+
+        if ((uint32_t)g_active_handlers >= plan->max_concurrent_handlers) {
+            logline("rejecting connection: %d handlers already active (cap %u)",
+                    g_active_handlers, plan->max_concurrent_handlers);
+            static const char msg[] = "relay: too many concurrent requests\n";
+            write_full(cfd, msg, sizeof(msg) - 1);
+            close(cfd);
+            continue;
+        }
+
+        pid_t hpid = fork();
+        if (hpid < 0) { perror("fork(handler)"); close(cfd); continue; }
+        if (hpid == 0) {
+            /* handler child: owns this one connection end to end, then exits.
+             * Runs completely independently of the accept loop and any other
+             * handler — this is the fix for the head-of-line-blocking bug: a
+             * hung command here can never block accept() from servicing the
+             * next connection, because accept() isn't running in this
+             * process at all. */
+            close(sfd);
+            handle_conn(cfd, plan);
+            _exit(0);
+        }
+        close(cfd);
+        g_active_handlers++;
     }
 }
 
-/* ------------------------- --self-test path (no socket) ------------------------- */
-/* Runs the identical fork+SEIZE+seccomp+exec+wait pipeline directly, driven by our
- * own argv, bypassing docker-exec/stub/socket entirely. Used as the perf baseline. */
-static int run_self_test(int argc, char **argv) {
-    int ecode = -1;
-    run_traced(argv, NULL, 0, "self-test", STDOUT_FILENO, STDERR_FILENO, &ecode);
-    return ecode;
+/* Startup self-check: fork a disposable canary child and confirm
+ * PTRACE_SEIZE actually works in this environment before ever accepting a
+ * real request. Per the design's error-handling requirement, a ptrace
+ * failure must refuse cell startup outright, not be discovered silently
+ * partway through a run — even though a per-request SEIZE failure (handled
+ * in run_traced's reap_and_fail path) already fails that one request safely
+ * rather than running it unsupervised, this check catches an
+ * environment-level problem immediately instead of on the first real turn. */
+static int ptrace_self_check(void) {
+    pid_t pid = fork();
+    if (pid < 0) { perror("ptrace_self_check: fork"); return -1; }
+    if (pid == 0) {
+        raise(SIGSTOP);
+        _exit(0);
+    }
+    int status;
+    waitpid(pid, &status, WUNTRACED);
+    int rc = ptrace(PTRACE_SEIZE, pid, 0, (void*)(long)PTRACE_O_EXITKILL);
+    if (rc != 0) {
+        fprintf(stderr, "execrelayd: PTRACE_SEIZE self-check failed: %s\n", strerror(errno));
+        kill(pid, SIGKILL);
+        waitpid(pid, &status, 0);
+        return -1;
+    }
+    ptrace(PTRACE_CONT, pid, 0, 0);
+    waitpid(pid, &status, 0);
+    return 0;
 }
 
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IOLBF, 0);
-    if (argc >= 2 && strcmp(argv[1], "--self-test") == 0) {
-        return run_self_test(argc - 2, argv + 2);
+
+    struct exec_plan plan;
+    if (config_load_from_env(&plan) != 0) {
+        fprintf(stderr, "execrelayd: refusing to start — CHAMBER_EXEC_CONSEQUENCE_SPEC_B64 "
+                         "is absent, malformed, or invalid\n");
+        return 1;
     }
-    return run_server();
+    if (ptrace_self_check() != 0) {
+        fprintf(stderr, "execrelayd: refusing to start — the interception mechanism this "
+                         "whole relay depends on is not usable in this environment\n");
+        return 1;
+    }
+    disclosure_init();
+
+    if (argc >= 2 && strcmp(argv[1], "--self-test") == 0) {
+        int ecode = -1;
+        run_traced(argv + 2, NULL, 0, "self-test", STDOUT_FILENO, STDERR_FILENO,
+                   &ecode, &plan, plan.timeout_ms);
+        return ecode;
+    }
+    return run_server(&plan);
 }
