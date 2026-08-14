@@ -160,6 +160,23 @@ pub fn coverage_for(observed: &Observed) -> CoverageMap {
             }
         }
 
+        // Recorded truthfully, and deliberately NOT load-bearing on the
+        // verdict: this channel does not bear one. The exec-consequence relay's
+        // activity is disclosed to reviewers but does not itself constitute a
+        // boundary departure.
+        Channel::ExecConsequence => {
+            if observed.turns_driven > 0 {
+                ChannelCoverage::Watched
+            } else {
+                ChannelCoverage::Absent {
+                    cause: GapCause::ObserverFailed,
+                    detail: "no turn was carried out, so the exec interception \
+                             relay never activated"
+                        .into(),
+                }
+            }
+        }
+
         // Absent either way, and deliberately so: the transport from the
         // driver to the provider is never claimed watched-whole, which is what
         // `gap.inference-channel` declares. What the detail distinguishes is a

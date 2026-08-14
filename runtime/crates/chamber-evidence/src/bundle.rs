@@ -718,7 +718,7 @@ mod tests {
         assert_eq!(
             open(&bytes, &seal),
             Err(DecodeRefusal::CoverageIncomplete {
-                missing: vec![Channel::GuestCommand]
+                missing: vec![Channel::ExecConsequence]
             })
         );
     }

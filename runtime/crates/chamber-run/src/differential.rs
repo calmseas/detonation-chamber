@@ -336,6 +336,7 @@ fn shape_of(observation: &Observation) -> Option<RequestShape> {
         // Excluded by design — see `gap.shape-volume-blind`.
         ObservationKind::PacketDrop { .. }
         | ObservationKind::GuestCommand { .. }
+        | ObservationKind::ExecConsequence { .. }
         | ObservationKind::InferenceCall { .. } => None,
         // Not excluded — *unreadable*. Counted by `is_uncompared` so the axis
         // cannot report as total when a newer capture layer wrote something this
@@ -685,7 +686,7 @@ pub fn activity_of(opened: &chamber_evidence::OpenedBundle) -> ArmActivity {
         match entry.channel() {
             Channel::GuestCommand => guest_commands += 1,
             Channel::NetworkEgress | Channel::DnsResolution => crossings += 1,
-            Channel::DroppedPackets | Channel::InferenceTransport => {}
+            Channel::DroppedPackets | Channel::InferenceTransport | Channel::ExecConsequence => {}
         }
     }
     ArmActivity {
@@ -766,6 +767,13 @@ mod activity_tests {
                 model: "test-model".to_owned(),
                 request_digest: chamber_evidence::Digest32([0u8; 32]),
                 response_digest: chamber_evidence::Digest32([0u8; 32]),
+            },
+            Channel::ExecConsequence => ObservationKind::ExecConsequence {
+                turn_id: "turn-0".to_owned(),
+                requested_argv0: "bash".to_owned(),
+                matched_rule: "rule-1".to_owned(),
+                verb_applied: "allowed".to_owned(),
+                detail: "executed as specified".to_owned(),
             },
         };
         Observation::new(Ordinal(id), 0, channel, kind, vec![])

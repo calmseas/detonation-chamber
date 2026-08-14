@@ -129,6 +129,13 @@ pub enum ObservationKind {
         argv_redacted: Vec<String>,
         exit: i32,
     },
+    ExecConsequence {
+        turn_id: String,
+        requested_argv0: String,
+        matched_rule: String,
+        verb_applied: String,
+        detail: String,
+    },
     InferenceCall {
         model: String,
         request_digest: Digest32,

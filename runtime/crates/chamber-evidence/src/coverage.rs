@@ -28,6 +28,10 @@ pub enum Channel {
     InferenceTransport,
     /// Commands the agent ran in the guest. The liveness witness.
     GuestCommand,
+    /// Commands the exec-consequence relay intercepted inside the guest —
+    /// which rule fired and what actually ran, disclosed to reviewers, never
+    /// to the subject under test.
+    ExecConsequence,
 }
 
 impl Channel {
@@ -37,6 +41,7 @@ impl Channel {
         Channel::DroppedPackets,
         Channel::InferenceTransport,
         Channel::GuestCommand,
+        Channel::ExecConsequence,
     ];
 
     /// Can a canary seen on this channel support a finding?
@@ -73,6 +78,7 @@ impl Channel {
             Channel::DroppedPackets => true,
             Channel::InferenceTransport => true,
             Channel::GuestCommand => false,
+            Channel::ExecConsequence => false,
         }
     }
 
@@ -83,6 +89,7 @@ impl Channel {
             Channel::DroppedPackets => "dropped_packets",
             Channel::InferenceTransport => "inference_transport",
             Channel::GuestCommand => "guest_command",
+            Channel::ExecConsequence => "exec_consequence",
         }
     }
 }
@@ -387,5 +394,20 @@ mod tests {
             map.blocking_absences(),
             vec![(Channel::NetworkEgress, GapCause::ObserverFailed)]
         );
+    }
+
+    #[test]
+    fn exec_consequence_does_not_bear_verdict() {
+        assert!(!Channel::ExecConsequence.bears_verdict());
+    }
+
+    #[test]
+    fn exec_consequence_is_in_all() {
+        assert!(Channel::ALL.contains(&Channel::ExecConsequence));
+    }
+
+    #[test]
+    fn exec_consequence_wire_tag() {
+        assert_eq!(Channel::ExecConsequence.wire_tag(), "exec_consequence");
     }
 }
