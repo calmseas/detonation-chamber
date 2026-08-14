@@ -112,6 +112,17 @@ pub enum ExecConsequenceConfigError {
     /// checked here so an oversized payload is a startup refusal, not a
     /// runtime truncation discovered mid-run.
     FabricatePayloadTooLarge { rule_index: usize, len: usize },
+    /// A `Rewrite` rule with exactly one of a `_find`/`_replace` pair set —
+    /// the other half `None`. The guest-side C parser (`config.c`'s
+    /// `load_verb`) only turns rewriting on for a given stream when BOTH its
+    /// `_find` and `_replace` keys are present (`if (sf && sr) { ... }`); a
+    /// lone `_find` with no `_replace` (or vice versa) loads without error
+    /// and simply never sets `has_stdout_rewrite`/`has_stderr_rewrite` —
+    /// the rule matches, and silently does nothing to that stream. Refused
+    /// here so that shape is a loud startup error instead of a rule that
+    /// looks configured but is quietly inert. `pair` names which pair
+    /// ("stdout" or "stderr").
+    AsymmetricRewritePair { rule_index: usize, pair: &'static str },
     TimeoutZero,
     MaxConcurrentHandlersZero,
 }
@@ -127,6 +138,10 @@ impl std::fmt::Display for ExecConsequenceConfigError {
             Self::FabricatePayloadTooLarge { rule_index, len } => write!(
                 f,
                 "rule {rule_index}'s fabricate stdout+stderr is {len} bytes, exceeds the 4000-byte guest scratch budget"
+            ),
+            Self::AsymmetricRewritePair { rule_index, pair } => write!(
+                f,
+                "rule {rule_index}'s rewrite.{pair}_find/{pair}_replace must both be set or both be absent, not just one"
             ),
             Self::TimeoutZero => write!(f, "timeout_ms must be nonzero"),
             Self::MaxConcurrentHandlersZero => write!(f, "max_concurrent_handlers must be nonzero"),
@@ -165,6 +180,20 @@ impl ExecConsequencePlan {
             match &rule.verb {
                 ExecVerb::Substitute { replacement_argv } if replacement_argv.is_empty() => {
                     return Err(ExecConsequenceConfigError::EmptyReplacementArgv(i));
+                }
+                ExecVerb::Rewrite { stdout_find, stdout_replace, stderr_find, stderr_replace } => {
+                    if stdout_find.is_some() != stdout_replace.is_some() {
+                        return Err(ExecConsequenceConfigError::AsymmetricRewritePair {
+                            rule_index: i,
+                            pair: "stdout",
+                        });
+                    }
+                    if stderr_find.is_some() != stderr_replace.is_some() {
+                        return Err(ExecConsequenceConfigError::AsymmetricRewritePair {
+                            rule_index: i,
+                            pair: "stderr",
+                        });
+                    }
                 }
                 ExecVerb::Fabricate { stdout, stderr, .. } => {
                     let len = stdout.len() + stderr.len();
@@ -390,6 +419,80 @@ mod tests {
         // None via #[serde(default)], same as an explicit null used to.
         let back: ExecConsequencePlan = serde_json::from_str(&json).unwrap();
         assert_eq!(back, plan);
+    }
+
+    #[test]
+    fn asymmetric_stdout_rewrite_pair_refuses() {
+        // Regression test for a gap the skip_serializing_if fix above
+        // (see one_sided_rewrite_omits_the_unset_pair_from_the_wire_json)
+        // opened: that fix closes the SYMMETRIC case (a whole side entirely
+        // absent, e.g. both stderr fields None), but a genuinely-invalid
+        // ASYMMETRIC pair — stdout_find set with stdout_replace left None —
+        // now serializes with stdout_replace simply omitted rather than
+        // nulled. Before the fix this shape also happened to make
+        // execrelayd refuse to start (loud, if for the wrong reason: the
+        // parser choked on ANY unpaired null, not specifically on this
+        // invalid pairing). After the fix, config.c's load_verb sees
+        // stdout_find present but stdout_replace absent, `if (sf && sr)` is
+        // false, has_stdout_rewrite stays 0 — the rule loads fine, matches,
+        // and silently does nothing to stdout. No error anywhere on the
+        // guest side. This test constructs exactly that shape and drives it
+        // through the real entry point (to_env_pairs -> from_env_value, the
+        // same path start_cell() uses in chamber-e2e) to assert the plan is
+        // refused at the host with a specific, diagnosable error — not just
+        // that the wire text looks a certain way.
+        let plan = ExecConsequencePlan {
+            rules: vec![ExecConsequenceRule {
+                name: "half".to_owned(),
+                match_argv: ArgvMatcher::Argv0 {
+                    name: "/bin/echo".to_owned(),
+                },
+                verb: ExecVerb::Rewrite {
+                    stdout_find: Some("secret".to_owned()),
+                    stdout_replace: None,
+                    stderr_find: None,
+                    stderr_replace: None,
+                },
+            }],
+            timeout_ms: 60_000,
+            max_concurrent_handlers: 32,
+        };
+        let spec = plan.to_env_pairs().remove(0).1;
+        let err = ExecConsequencePlan::from_env_value(Some(&spec)).unwrap_err();
+        assert_eq!(
+            err,
+            ExecConsequenceConfigError::AsymmetricRewritePair { rule_index: 0, pair: "stdout" }
+        );
+    }
+
+    #[test]
+    fn asymmetric_stderr_rewrite_pair_refuses() {
+        // Same shape as asymmetric_stdout_rewrite_pair_refuses, but for the
+        // stderr pair and with the stdout pair fully absent (both None) —
+        // exercising the second, independent half of the validation check
+        // and confirming a fully-unset stdout pair does not itself trip it.
+        let plan = ExecConsequencePlan {
+            rules: vec![ExecConsequenceRule {
+                name: "half".to_owned(),
+                match_argv: ArgvMatcher::Argv0 {
+                    name: "/bin/echo".to_owned(),
+                },
+                verb: ExecVerb::Rewrite {
+                    stdout_find: None,
+                    stdout_replace: None,
+                    stderr_find: None,
+                    stderr_replace: Some("REDACTED".to_owned()),
+                },
+            }],
+            timeout_ms: 60_000,
+            max_concurrent_handlers: 32,
+        };
+        let spec = plan.to_env_pairs().remove(0).1;
+        let err = ExecConsequencePlan::from_env_value(Some(&spec)).unwrap_err();
+        assert_eq!(
+            err,
+            ExecConsequenceConfigError::AsymmetricRewritePair { rule_index: 0, pair: "stderr" }
+        );
     }
 
     #[test]
