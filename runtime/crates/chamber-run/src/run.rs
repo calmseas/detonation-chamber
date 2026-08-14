@@ -433,13 +433,25 @@ pub async fn run_detonation(
     //
     // A read failure is logged, not fatal — this secondary channel does not
     // bear a verdict, so the run's own evidence emission is never blocked on
-    // it. Note the *absence* of an exit-status branch: the old `cat` could
-    // report success over an empty read, which is exactly how a non-UTF-8 byte
-    // used to erase a run's whole exec-consequence evidence while still
-    // marking the channel watched.
+    // it. But it is a `None`, never a `Some("")`: `None` is what makes
+    // `ExecInterception::Armed` carry `disclosure_log_read: false`, which
+    // `bundle::coverage_for` turns into `Absent { ObserverFailed }` — the
+    // channel armed and then lost, said out loud.
+    //
+    // That distinction is the entire lesson of round 2's Critical and it does
+    // not belong to the old transport. The `cat` read had an exit-status branch
+    // and `docker logs` needs the same one for the same reason and then some:
+    // `logs` fails outright when the engine's log driver cannot be read back
+    // (`none`, `syslog`, `fluentd`, `gelf`), and every such failure exits
+    // non-zero with an empty stdout. Read as success that is a bundle sealing
+    // zero observations while claiming the channel was watched — the original
+    // bug, rebuilt out of new parts. `captured_disclosure_log` holds both
+    // halves of the guard (the exit status, and the relay's startup header
+    // actually being there), so there is no shape of failed read that reaches
+    // this match as an `Ok`.
     let exec_consequence_log: Option<String> = if plan.exec_consequence.is_some() {
         let cell = arming.cell.as_ref().expect("armed");
-        match cell.captured_stdout() {
+        match cell.captured_disclosure_log() {
             Ok(text) => Some(text),
             Err(e) => {
                 eprintln!("chamber: could not read exec-consequence disclosure log: {e}");

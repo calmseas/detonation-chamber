@@ -20,6 +20,46 @@
  */
 #define DISCLOSURE_RECORD_BUF 4096
 
+/* And that relationship, enforced rather than described. "4096 is PIPE_BUF" was
+ * a claim in a comment, which is the same class of thing STRUCTURAL_RESERVE's
+ * arithmetic used to be before it became an assert in record.c: true when
+ * written, unchecked afterwards, and failing silently. Raise this buffer past
+ * PIPE_BUF and nothing breaks at build time — the damage is a torn line under
+ * concurrency, which the Rust consumer skips without a word, so the symptom is
+ * an exec missing from the sealed bundle on a busy run and present on a quiet
+ * one.
+ *
+ * Guarded to Linux because PIPE_BUF is not a portable constant and this is a
+ * claim about the platform the relay RUNS on: relayd.c carries an `#error` for
+ * any architecture but aarch64 Linux, and the container is Alpine, where
+ * PIPE_BUF is 4096. record.c is also built by the host C unit tests
+ * (tests/run_c_tests.sh) so its composition is testable off-target, and on
+ * macOS PIPE_BUF is 512 — a limit that constrains nothing here, because no
+ * record is ever written to a pipe on that host. Asserting against it there
+ * would fail the build over a platform the code does not target. The check that
+ * matters runs in the image build, which is Linux.
+ *
+ * Two headers because one is not enough on the build that counts. <limits.h>
+ * carries PIPE_BUF only when the translation unit's feature set asks for POSIX,
+ * and musl under `-std=c11` — which is exactly what the Dockerfile compiles
+ * with — does not, so PIPE_BUF is simply undeclared there and the assert fails
+ * to BUILD rather than failing to hold. <linux/limits.h> (from the builder
+ * stage's linux-headers) defines it unconditionally. Do not "simplify" this to
+ * the one include: the symptom is a broken image build, not a silent one, but
+ * it is a confusing one.
+ */
+#ifdef __linux__
+#include <limits.h>
+#ifndef PIPE_BUF
+#include <linux/limits.h>
+#endif
+_Static_assert(DISCLOSURE_RECORD_BUF <= PIPE_BUF,
+               "a record write must stay atomic on a pipe: DISCLOSURE_RECORD_BUF now exceeds "
+               "PIPE_BUF, so a single record can be split by the kernel and interleaved with a "
+               "concurrent handler's write into one unparseable line, which the host consumer "
+               "silently skips. Shrink the record, do not raise the buffer.");
+#endif
+
 /* Formats ONE disclosure-log record — the line `execrelayd` appends for each
  * intercepted exec, and the line `chamber-run`'s `record_exec_consequence_log`
  * parses back out of the sealed bundle. Writes into `buf` (bounded by

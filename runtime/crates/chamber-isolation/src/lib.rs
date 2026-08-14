@@ -69,7 +69,7 @@ pub mod preflight;
 pub mod probe;
 pub mod warden;
 
-pub use cell::{AgentCell, EMPTY_BOUNDING_SET, GuestImage};
+pub use cell::{AgentCell, DISCLOSURE_HEADER_KEY, EMPTY_BOUNDING_SET, GuestImage};
 pub use docker::{
     Attach, Container, ContainerSpec, Docker, DockerUnavailable, EngineError, EnvFile, ExecOutcome,
     Network, NetworkSpec, RawOutcome, build_image, build_image_for_platform,

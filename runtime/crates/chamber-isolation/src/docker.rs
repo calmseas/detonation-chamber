@@ -222,6 +222,35 @@ fn must_run(argv: &[&str], within: Duration) -> Result<String, EngineError> {
     }
 }
 
+/// [`must_run`] without the decode: a non-zero exit is an error, and the bytes
+/// come back undecoded.
+///
+/// For the one caller that needs both — reading the cell's captured disclosure
+/// stream, which must survive a non-UTF-8 byte (hence raw) and must never
+/// mistake a refused `docker logs` for an empty log (hence this).
+fn must_run_raw(argv: &[&str], within: Duration) -> Result<RawOutcome, EngineError> {
+    raw_or_failed(argv, run_within_raw(argv, within)?)
+}
+
+/// The exit-status half of [`must_run_raw`], split out so it is reachable from
+/// a test without an engine.
+///
+/// The condition it guards — the command exited non-zero having written NO
+/// stdout — is trivial to construct as a value and impossible to arrange
+/// reliably against a live daemon, and it is exactly the shape that must never
+/// reach a caller as a successful empty read.
+fn raw_or_failed(argv: &[&str], outcome: RawOutcome) -> Result<RawOutcome, EngineError> {
+    if outcome.ok() {
+        Ok(outcome)
+    } else {
+        Err(EngineError::Failed {
+            argv: argv.iter().map(|a| (*a).to_owned()).collect(),
+            status: outcome.status,
+            stderr: decode_lossy(outcome.stderr),
+        })
+    }
+}
+
 fn scratch_path(kind: &str) -> PathBuf {
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let n = SEQ.fetch_add(1, Ordering::Relaxed);
@@ -782,10 +811,27 @@ impl Container {
     /// STOPPED (so sealing no longer has to be sequenced ahead of the
     /// wind-down's halt) and unreachable by anything running in the container.
     ///
+    /// **A non-zero exit is an error here, not a measurement** — the one place
+    /// in this type where reading logs differs from [`Container::exec`]. The
+    /// engine can refuse this command for reasons that have nothing to do with
+    /// the container's behaviour: a log driver it cannot read back (`none`,
+    /// `syslog`, `fluentd`, `gelf`), a daemon hiccup, a container reaped by
+    /// something outside this process. Every one of those exits non-zero with
+    /// an EMPTY stdout, and an empty stdout is indistinguishable from a
+    /// container that wrote nothing. For the disclosure stream that difference
+    /// is the whole evidentiary claim: "the relay recorded no exec" and "the
+    /// engine would not tell us what the relay recorded" must not arrive at the
+    /// caller as the same value. This is the guard the old `docker exec cat`
+    /// read carried (`Ok(outcome) if outcome.ok()`) and which the move to
+    /// `docker logs` must not drop — losing it reinstates round 2's Critical
+    /// through the new transport: a sealed bundle claiming the channel was
+    /// watched over evidence nobody ever managed to read.
+    ///
     /// # Errors
-    /// [`EngineError`] if the engine refuses.
+    /// [`EngineError::Failed`] if `docker logs` exits non-zero, and the other
+    /// variants if it could not be run or outlived its window.
     pub fn logs_bytes(&self) -> Result<RawOutcome, EngineError> {
-        run_within_raw(&["logs", &self.id], Duration::from_secs(30))
+        must_run_raw(&["logs", &self.id], Duration::from_secs(30))
     }
 
     /// Runs a command inside the container, feeding `input` to its stdin.
@@ -963,5 +1009,60 @@ mod tests {
     fn valid_utf8_is_unchanged() {
         let text = "caf\u{e9} \u{20ac}5 \u{1f4a5}\nsecond line\n";
         assert_eq!(decode_lossy(text.as_bytes().to_vec()), text);
+    }
+
+    /// The same Critical in its second costume: a `docker logs` that FAILED,
+    /// read as a log that was empty.
+    ///
+    /// This is what the shape looks like on the wire — non-zero status, nothing
+    /// on stdout, the reason on stderr — when the engine's log driver cannot be
+    /// read back (`none`, `syslog`, `fluentd`, `gelf`), when the daemon
+    /// hiccups, or when something outside this process reaped the container.
+    /// Before the guard, [`Container::logs_bytes`] handed exactly this to
+    /// `AgentCell::captured_stdout` as `Ok`, which decoded it to `Some("")`,
+    /// which recorded zero exec-consequence observations and STILL set
+    /// `disclosure_log_read: true` — a sealed bundle claiming the channel was
+    /// `Watched` over evidence nobody ever read.
+    #[test]
+    fn a_docker_logs_that_failed_is_never_an_empty_log() {
+        let refused = RawOutcome {
+            status: Some(1),
+            stdout: Vec::new(),
+            stderr: b"Error response from daemon: configured logging driver does \
+                      not support reading\n"
+                .to_vec(),
+        };
+
+        let err = raw_or_failed(&["logs", "deadbeef"], refused)
+            .expect_err("a non-zero `docker logs` must not read as a successful empty log");
+
+        match err {
+            EngineError::Failed {
+                argv,
+                status,
+                stderr,
+            } => {
+                assert_eq!(argv, vec!["logs".to_owned(), "deadbeef".to_owned()]);
+                assert_eq!(status, Some(1));
+                // The daemon's reason survives to the operator: the failure is
+                // reported as itself, not as an absence.
+                assert!(stderr.contains("does not support reading"), "{stderr:?}");
+            }
+            other => panic!("expected EngineError::Failed, got {other:?}"),
+        }
+    }
+
+    /// The guard must not be bought by turning ordinary reads into failures: a
+    /// container that genuinely wrote nothing exits zero, and an empty log IS
+    /// the answer there.
+    #[test]
+    fn a_docker_logs_that_succeeded_empty_is_still_an_empty_log() {
+        let quiet = RawOutcome {
+            status: Some(0),
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        };
+        let outcome = raw_or_failed(&["logs", "deadbeef"], quiet).expect("exit 0 is not a failure");
+        assert!(outcome.stdout.is_empty());
     }
 }

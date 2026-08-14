@@ -85,6 +85,19 @@ pub enum CellError {
         raw: String,
         detail: String,
     },
+    /// The cell's captured stdout came back, and it is not a disclosure stream:
+    /// `execrelayd`'s startup header is not on its first line.
+    ///
+    /// Distinct from [`CellError::Engine`] because the read SUCCEEDED — there
+    /// is nothing for the engine to report. What is wrong is upstream of it:
+    /// either no relay ever ran in this cell, or the stream reached here is not
+    /// the one the relay writes. Both are "we tried to observe this channel and
+    /// could not", which is the coverage claim the caller has to make, and
+    /// neither is "the relay ran and intercepted nothing".
+    NotADisclosureStream {
+        captured_bytes: usize,
+        first_line: String,
+    },
 }
 
 impl std::fmt::Display for CellError {
@@ -106,6 +119,18 @@ impl std::fmt::Display for CellError {
                     "could not read the counters ({detail}); nft said:\n{raw}"
                 )
             }
+            Self::NotADisclosureStream {
+                captured_bytes,
+                first_line,
+            } => write!(
+                f,
+                "the cell's captured stdout ({captured_bytes} bytes) does not open with \
+                 execrelayd's disclosure header, so it is not a disclosure stream and \
+                 what was intercepted is unknown. The header is written once at startup, \
+                 before any request can be served, and a relay that could not write it \
+                 refuses to start -- so its absence means no relay ran in this cell, or \
+                 this is not its stream. Its first line was: {first_line:?}"
+            ),
         }
     }
 }

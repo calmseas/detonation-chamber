@@ -104,10 +104,15 @@ fn start_cell(plan: &ExecConsequencePlan) -> CellGuard {
 /// nothing else, everything of `execrelayd`'s that is not a record having moved
 /// to stderr.
 ///
-/// Read exactly the way `AgentCell::captured_stdout` reads it on the real
+/// Read the way `AgentCell::captured_disclosure_log` reads it on the real
 /// sealing path: from the engine's own capture, as bytes, decoded lossily. NOT
 /// `docker exec cat`, which is what this suite used to do and which cannot
 /// reach the stream at all any more — there is no file to cat.
+///
+/// One deliberate difference: the sealing read also REQUIRES the header before
+/// it will call the result a disclosure log, and this helper does not. Tests
+/// below assert on the header themselves, and want the stream's actual contents
+/// in the failure message rather than a refusal.
 fn disclosure_stream(cell: &Container) -> String {
     let raw = cell.logs_bytes().expect("read the cell's captured stdout");
     String::from_utf8_lossy(&raw.stdout).into_owned()
@@ -2270,9 +2275,9 @@ fn a_path_searched_bare_command_records_exactly_one_line() {
 //     wrote by hand),
 //   * `ToolBridge::new_with_exec_relay`, which decides whether a turn is
 //     prefixed with `stub` at all, and mints the per-call `--turn-id=`,
-//   * `AgentCell::captured_stdout`, the sealing read — `docker logs` against
-//     the cell, decoded lossily, which is where the disclosure stream actually
-//     enters the harness,
+//   * `AgentCell::captured_disclosure_log`, the sealing read — `docker logs`
+//     against the cell, decoded lossily and refused unless it is a disclosure
+//     stream, which is where that stream actually enters the harness,
 //   * `record_exec_consequence_log`, which parses that text into sealed
 //     observations,
 //   * and `ExecInterception`, which decides whether the bundle may claim the
@@ -2484,7 +2489,7 @@ fn a_composed_detonation_arms_the_relay_and_seals_what_it_intercepted() {
 /// The direct-relay test above
 /// (`one_invalid_utf8_byte_does_not_erase_the_rest_of_the_disclosure_log`)
 /// proves the stream survives being read. This one proves the rest of the
-/// chain does too — `AgentCell::captured_stdout`'s decode,
+/// chain does too — `AgentCell::captured_disclosure_log`'s decode,
 /// `record_exec_consequence_log`'s parse, and the coverage decision — because
 /// that chain is where the loss actually happened: the read collapsed to an
 /// empty string, every observation went missing, and the bundle STILL reported

@@ -277,13 +277,43 @@ static int read_tracee_argv(int pid, unsigned long long argv_addr, char out[][25
  *     before then, so the agent's command inherits its pipe, not this stream —
  *     which is strictly better than the old O_CLOEXEC file descriptor, since
  *     there is no extra descriptor in the worker's fd table to notice at all.
- *   - A root-in-cell agent CAN still append forged lines by writing to
- *     /proc/1/fd/1. That is unchanged from the old file (which it could
- *     `echo >>` just as easily) and is not what this transport claims to fix:
- *     §2's parity clause is about deleting and truncating evidence, which is
- *     now genuinely out of reach. Forgery resistance would need a separate
- *     mechanism (a private descriptor the agent cannot name) and is not in
- *     scope here. */
+ *   - A process in the cell CAN still write to this stream, by opening
+ *     /proc/1/fd/1. This is reachable, not theoretical: the agent's commands
+ *     run as the same uid as PID 1, and opening another process's /proc/PID/fd
+ *     entry needs only PTRACE_MODE_READ_FSCREDS, which same-uid satisfies — it
+ *     is NOT the PTRACE_MODE_ATTACH that Yama's ptrace_scope gates, so no
+ *     hardening in this environment stands in the way. Say it plainly: this
+ *     transport is not injection-proof, and nothing below makes it so.
+ *
+ *     What it IS: (a) not a regression. The old tmpfs log was writable by the
+ *     same root — `echo >> disclosure.log` — and additionally deletable and
+ *     truncatable, which this is not. §2's parity clause is about destroying
+ *     evidence, and that is what moved out of reach. (b) Bounded, but not
+ *     cleanly. Two residual limits are worth naming rather than leaving for
+ *     someone to rediscover:
+ *
+ *       * A hostile writer can DELETE a record it does not control, indirectly.
+ *         A write larger than PIPE_BUF is not atomic on a pipe, so one issued
+ *         while a handler is emitting a genuine record can be interleaved with
+ *         it; the torn line is not JSON, and the host parser skips unparseable
+ *         lines silently (bundle.rs, record_exec_consequence_log). That is a
+ *         probabilistic single-record deletion primitive with no analogue on
+ *         the old O_APPEND file, where any single write was atomic at any size.
+ *         It needs a race against a concurrent genuine record, so it is not
+ *         reliable — but "unreliable" is the only thing bounding it.
+ *       * Flooding this descriptor can EVICT earlier records, on an engine
+ *         configured differently from this one. Capture is the engine's, and so
+ *         is its retention: this environment's json-file driver runs with no
+ *         max-size and no max-file, so nothing rotates and the whole stream
+ *         survives — but a driver that rotates by default would drop the oldest
+ *         captured output first, and the oldest line is the startup header. The
+ *         host's read requires that header (AgentCell::captured_disclosure_log),
+ *         so on such an engine the flood presents as a lost read rather than as
+ *         a quietly shortened log, which is the failure this system prefers.
+ *
+ *     Full injection resistance would need a descriptor the agent cannot name
+ *     at all — not fd 1, not anything reachable through /proc — and that is a
+ *     different transport, out of scope here. */
 #define DISCLOSURE_FD STDOUT_FILENO
 
 /* Emits the header line, or fails. Returns 0 on success and -1 if the stream

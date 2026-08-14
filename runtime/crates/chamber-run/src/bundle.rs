@@ -39,6 +39,7 @@ use chamber_evidence::{
     Channel, ChannelCoverage, CoverageGap, CoverageMap, GapCause, ObservationKind, RunEnding,
     RunLog, RunSecret, Verdict, seal_run,
 };
+use chamber_isolation::DISCLOSURE_HEADER_KEY;
 
 use crate::turns::{Transcript, TurnDirective, TurnProvenance};
 
@@ -432,8 +433,16 @@ pub fn record_guest_commands(log: &mut RunLog, transcript: &Transcript, secrets:
 /// Parses the exec-relay's disclosure log (one JSON object per line, per
 /// `runtime/images/guest-exec-relay/src/relayd.c`'s `disclosure_record`) into
 /// `Channel::ExecConsequence` observations. The first line (the
-/// `known_residual_tells` header) carries no turn data and is skipped, not
+/// [`DISCLOSURE_HEADER_KEY`] header) carries no turn data and is skipped, not
 /// treated as malformed.
+///
+/// This skip is NOT where a missing header is caught, and must never become
+/// that: skipping is what a parser does with a line it has nothing to do with,
+/// and it produces the same zero observations whether the header was absent or
+/// merely uninteresting. Whether the text is a disclosure stream at all is
+/// settled at the read, by `AgentCell::captured_disclosure_log`, which refuses
+/// a capture that does not open with the header. The constant is shared with
+/// that check so the two cannot drift onto different keys.
 ///
 /// `verb_applied` is passed through verbatim and deliberately not interpreted
 /// here. Besides the three verbs and their `*-failed-*` variants it also
@@ -463,7 +472,7 @@ pub fn record_exec_consequence_log(
         let Some(obj) = value.as_object() else {
             continue;
         };
-        if obj.contains_key("known_residual_tells") {
+        if obj.contains_key(DISCLOSURE_HEADER_KEY) {
             continue;
         }
         let (Some(turn_id), Some(argv0), Some(rule), Some(verb), Some(detail)) = (

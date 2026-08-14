@@ -169,11 +169,43 @@ impl AgentCell {
     /// line's readability and nothing more. A strict decode that fell back to
     /// an empty string would erase a whole run's evidence over one byte.
     ///
+    /// An empty string here means the cell's PID 1 wrote nothing, and only
+    /// that: [`Container::logs_bytes`] raises a refused `docker logs` rather
+    /// than returning its empty stdout, so "nothing was written" and "the
+    /// engine would not say" cannot arrive here as the same value.
+    ///
     /// # Errors
     /// [`CellError`] if the engine refuses.
     pub fn captured_stdout(&self) -> Result<String, CellError> {
         let raw = self.container.logs_bytes()?;
         Ok(String::from_utf8_lossy(&raw.stdout).into_owned())
+    }
+
+    /// [`AgentCell::captured_stdout`], required to actually BE a disclosure
+    /// stream. This is the sealing read for an exec-consequence run.
+    ///
+    /// The extra requirement is [`DISCLOSURE_HEADER_KEY`] on the first line.
+    /// `execrelayd`'s `disclosure_init` writes that header before it serves
+    /// anything, and refuses to start if the write fails — so its presence is
+    /// the one thing a relay that got as far as running cannot fail to have
+    /// emitted, and a capture without it is not a thin disclosure log, it is
+    /// not a disclosure log. Either the relay never started (a plain guest
+    /// image, an entrypoint that died before `disclosure_init`) or the read did
+    /// not reach the stream it was aiming at.
+    ///
+    /// Checked here rather than left to the parser downstream, which skips the
+    /// header as a line carrying no turn data. That skip cannot tell an absent
+    /// header from an absent log: both parse to zero observations, which is
+    /// also what a genuine run with no intercepted exec produces. The
+    /// difference between "the relay saw nothing" and "there was no relay
+    /// stream" has to be made where the read happens, because that is the last
+    /// place both facts are still present.
+    ///
+    /// # Errors
+    /// [`CellError::Engine`] if the engine refuses the read, and
+    /// [`CellError::NotADisclosureStream`] if what came back has no header.
+    pub fn captured_disclosure_log(&self) -> Result<String, CellError> {
+        require_disclosure_header(self.captured_stdout()?)
     }
 
     /// Places a file in the cell, over stdin.
@@ -239,6 +271,32 @@ impl AgentCell {
 /// What `/proc/self/status` reports for a cell that holds nothing.
 pub const EMPTY_BOUNDING_SET: &str = "0000000000000000";
 
+/// The key in the disclosure stream's header line, which `execrelayd` emits
+/// once at startup (`disclosure_init`) before it can serve any request.
+///
+/// Matched as a substring of the first line rather than parsed: this is a
+/// liveness check on the stream, not a schema check on the header, and it must
+/// stay decoupled from whatever tells that header currently lists.
+pub const DISCLOSURE_HEADER_KEY: &str = "known_residual_tells";
+
+/// Accepts `text` as a disclosure stream only if it opens with the header.
+///
+/// Split out of [`AgentCell::captured_disclosure_log`] so the decision is
+/// reachable from a test without an engine, a guest image or a relay — the
+/// captures worth pinning (empty, and plausible-but-headerless) are values, not
+/// situations that can be arranged against a live daemon.
+fn require_disclosure_header(text: String) -> Result<String, CellError> {
+    let first = text.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
+    if first.contains(DISCLOSURE_HEADER_KEY) {
+        Ok(text)
+    } else {
+        Err(CellError::NotADisclosureStream {
+            captured_bytes: text.len(),
+            first_line: first.chars().take(200).collect(),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -255,5 +313,80 @@ mod tests {
     fn the_empty_bounding_set_is_sixteen_zeroes() {
         assert_eq!(EMPTY_BOUNDING_SET.len(), 16);
         assert!(EMPTY_BOUNDING_SET.chars().all(|c| c == '0'));
+    }
+
+    /// An empty capture is the shape every lost read collapses to, and it is
+    /// the one shape that must never be accepted as a disclosure log.
+    ///
+    /// A relay that ran wrote the header before it could serve anything, so
+    /// there is no such thing as a disclosure stream with nothing in it. Read
+    /// as `Ok("")` this seals a bundle with zero exec-consequence observations
+    /// and `disclosure_log_read: true` — the channel claimed `Watched` over
+    /// evidence that was never read, which is round 2's Critical exactly.
+    #[test]
+    fn an_empty_capture_is_not_an_empty_disclosure_log() {
+        let err = require_disclosure_header(String::new())
+            .expect_err("an empty capture cannot be a disclosure stream");
+        match err {
+            CellError::NotADisclosureStream {
+                captured_bytes,
+                first_line,
+            } => {
+                assert_eq!(captured_bytes, 0);
+                assert_eq!(first_line, "");
+            }
+            other => panic!("expected NotADisclosureStream, got {other:?}"),
+        }
+    }
+
+    /// A capture with plausible content but no header is the subtler half: the
+    /// downstream parser skips every line it cannot read as a record, so this
+    /// too arrives as zero observations — indistinguishable from a relay that
+    /// intercepted nothing unless the read itself refuses it.
+    #[test]
+    fn a_capture_without_the_header_is_not_a_disclosure_log() {
+        let not_ours = "execrelayd: starting\nsome other guest's chatter\n".to_owned();
+        let err = require_disclosure_header(not_ours)
+            .expect_err("a headerless capture cannot be a disclosure stream");
+        let CellError::NotADisclosureStream { first_line, .. } = err else {
+            panic!("expected NotADisclosureStream");
+        };
+        // The operator gets the first line back verbatim: what arrived instead
+        // is the only clue to why.
+        assert_eq!(first_line, "execrelayd: starting");
+    }
+
+    /// The guard must not be bought by rejecting the real thing. A genuine
+    /// stream is accepted verbatim, records and all — including one whose
+    /// header is the ONLY line, which is a relay that started and legitimately
+    /// intercepted nothing, and is a different claim from a lost read.
+    #[test]
+    fn a_real_disclosure_stream_passes_through_unchanged() {
+        let header = "{\"known_residual_tells\":[\"TracerPid nonzero\"]}\n";
+        let header_only = require_disclosure_header(header.to_owned())
+            .expect("a relay that intercepted nothing still wrote its header");
+        assert_eq!(header_only, header);
+
+        let with_records = format!(
+            "{header}{}{}",
+            "{\"turn_id\":\"turn-0\",\"requested_argv0\":\"/bin/echo\"}\n",
+            "{\"turn_id\":\"turn-1\",\"requested_argv0\":\"/bin/ls\"}\n"
+        );
+        assert_eq!(
+            require_disclosure_header(with_records.clone()).expect("a real stream"),
+            with_records
+        );
+    }
+
+    /// The header is required on the FIRST line, which is where `execrelayd`
+    /// guarantees it. Anywhere else and the stream's opening records are
+    /// missing, whatever else arrived.
+    #[test]
+    fn the_header_must_be_first_not_merely_present() {
+        let late = "{\"turn_id\":\"turn-0\"}\n{\"known_residual_tells\":[\"x\"]}\n".to_owned();
+        assert!(
+            require_disclosure_header(late).is_err(),
+            "a header after a record is not the startup header"
+        );
     }
 }
