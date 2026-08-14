@@ -279,16 +279,16 @@ pub fn shape_gaps() -> Vec<CoverageGap> {
         CoverageGap {
             id: "gap.shape-volume-blind".into(),
             cause: GapCause::ExcludedByDesign,
-            scope: "Dropped packets, inference calls, and guest commands contribute no shape. \
-                    Repetition and timing are not compared."
+            scope: "Dropped packets, inference calls, guest commands, and exec consequences \
+                    contribute no shape. Repetition and timing are not compared."
                 .into(),
             justification: "A dropped packet's five-tuple carries an ephemeral port, so every drop \
                             would be unique and every run would appear to diverge. Inference \
                             request and response digests differ every run by construction. A guest \
-                            command is inside the sealed cell rather than at the boundary, which is \
-                            the same reasoning that keeps it out of Channel::bears_verdict. \
-                            Comparing counts instead of sets would make this axis the \
-                            threshold-laden thing it was designed not to be."
+                            command and exec consequence are inside the sealed cell rather than at \
+                            the boundary, which is the same reasoning that keeps them out of \
+                            Channel::bears_verdict. Comparing counts instead of sets would make \
+                            this axis the threshold-laden thing it was designed not to be."
                 .into(),
         },
     ]
@@ -821,6 +821,25 @@ mod activity_tests {
             activity.crossings, 2,
             "network egress + dns should both count"
         );
+        assert_eq!(activity.ending, RunEnding::Completed);
+    }
+
+    /// ExecConsequence observations do not contribute to either counter, like
+    /// DroppedPackets and InferenceTransport.
+    #[test]
+    fn exec_consequence_does_not_affect_activity_tallies() {
+        let opened = opened_bundle(
+            &[
+                Channel::GuestCommand,
+                Channel::ExecConsequence,
+                Channel::NetworkEgress,
+            ],
+            RunEnding::Completed,
+        );
+
+        let activity = activity_of(&opened);
+        assert_eq!(activity.guest_commands, 1, "ExecConsequence should not count as guest command");
+        assert_eq!(activity.crossings, 1, "ExecConsequence should not count as crossing");
         assert_eq!(activity.ending, RunEnding::Completed);
     }
 
@@ -2161,8 +2180,19 @@ mod shape_tests {
             },
             vec![],
         );
+        let exec_consequence = observation(
+            Channel::ExecConsequence,
+            ObservationKind::ExecConsequence {
+                turn_id: "turn-0".to_owned(),
+                requested_argv0: "bash".to_owned(),
+                matched_rule: "rule-1".to_owned(),
+                verb_applied: "allowed".to_owned(),
+                detail: "executed as specified".to_owned(),
+            },
+            vec![],
+        );
 
-        for o in [&drop, &command, &inference] {
+        for o in [&drop, &command, &inference, &exec_consequence] {
             assert!(shape_of(o).is_none(), "{:?} produced a shape", o.kind());
             assert!(!is_uncompared(o), "a designed exclusion counted as a gap");
         }

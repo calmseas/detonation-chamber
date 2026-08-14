@@ -545,6 +545,33 @@ mod tests {
         assert!(coverage.blocking_absences().is_empty());
     }
 
+    /// ExecConsequence is watched when turns are driven, absent otherwise.
+    /// Like GuestCommand, it is not verdict-bearing.
+    #[test]
+    fn exec_consequence_is_watched_when_turns_driven() {
+        let with_turns = healthy();
+        let coverage = coverage_for(&with_turns);
+        assert_eq!(coverage.status(Channel::ExecConsequence), &ChannelCoverage::Watched);
+
+        let without_turns = Observed {
+            turns_driven: 0,
+            ..healthy()
+        };
+        let coverage = coverage_for(&without_turns);
+        assert!(matches!(
+            coverage.status(Channel::ExecConsequence),
+            ChannelCoverage::Absent {
+                cause: GapCause::ObserverFailed,
+                ..
+            }
+        ));
+        assert!(
+            coverage.blocking_absences().is_empty(),
+            "ExecConsequence must not block despite being absent, \
+             as it does not bear a verdict"
+        );
+    }
+
     #[test]
     fn a_scripted_run_declares_that_its_actions_were_replayed() {
         let scripted = TurnProvenance::Scripted {
