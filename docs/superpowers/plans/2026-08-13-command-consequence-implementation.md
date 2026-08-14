@@ -28,13 +28,15 @@ runtime/crates/chamber-capture/src/
 
 runtime/images/guest-exec-relay/     [NEW crate-adjacent directory, not a Cargo crate — C sources + Dockerfile]
   src/json.h, src/json.c       [NEW] minimal JSON value parser
-  src/config.h, src/config.c   [NEW] maps parsed JSON -> C rule structs, argv matching
-  src/relayd.c                 [NEW] PID-1 supervisor: ptrace+seccomp, verbs, concurrency, watchdog, disclosure log
+  src/base64.h, src/base64.c   [NEW, added by Task 4's revision — see below] shared base64 encode/decode
+  src/config.h, src/config.c   [NEW] maps parsed JSON -> C rule structs, argv matching; [MODIFY, Task 4 revision] use shared base64.c instead of an inline decoder
+  src/relayd.c                 [NEW] PID-1 supervisor: ptrace+seccomp, verbs, concurrency, watchdog, disclosure log; [MODIFY, Task 4 revision] per-process scratch addressing, per-pid wait-loop dispatch, fabricate redesigned as a substitute-to-helper
+  src/fabricate-emit.c         [NEW, added by Task 4's revision — see below] tiny helper baked into the guest image; substituted in for `fabricate`, decodes its argv and emits the canned result
   src/stub.c                   [NEW] docker-exec-targeted relay client
   tests/test_json.c            [NEW] standalone C unit tests for json.c
   tests/test_config.c          [NEW] standalone C unit tests for config.c
   tests/run_c_tests.sh         [NEW] compiles + runs the two test binaries
-  Dockerfile                   [NEW] multi-stage build -> guest image
+  Dockerfile                   [NEW] multi-stage build -> guest image; [MODIFY, Task 4 revision] also builds/copies base64.c and fabricate-emit.c
 
 runtime/crates/chamber-run/src/
   run.rs                       [MODIFY] DetonationPlan.exec_consequence field, seal_cell_environment env injection, wind_down disclosure-log sealing
@@ -1492,6 +1494,371 @@ git commit -m "feat: port proven ptrace+seccomp exec interception into productio
 
 ---
 
+### Task 4 — Revision: per-process scratch addressing, per-pid wait-loop dispatch, fabricate redesigned as substitute-to-helper
+
+**Why this revision exists.** Task 4's original code (above) was a faithful, verified transcription of the mechanism-research relay spike — but that spike only ever tested a single *top-level* exec via `docker exec`, never a nested subprocess. Discovered during planning for Task 5: the relay spike's own mechanism does not actually generalize past the top-level command, for two compounding reasons, both inherited verbatim from the spike:
+
+1. **The wait loop only processes the top-level pid.** `if (w != pid) continue;` silently discards every ptrace event from a forked grandchild — even though `PTRACE_O_TRACEFORK` makes those grandchildren tracees of the same supervisor. A grandchild's own seccomp trap never gets `PTRACE_CONT`'d — it hangs forever, and so does anything waiting on it (e.g. a shell running a subshell).
+2. **The scratch-buffer address only means anything for the top-level worker.** The spike writes substitute/fabricate payloads into a `static char scratch[SCRATCH_SIZE]` array whose address is communicated once, via a sync-pipe handshake, before the worker's *own* first exec. That address is meaningless for a grandchild — by the time a grandchild forks (e.g. from an already-exec'd `/bin/sh`), it's running a completely different program's memory layout, not the worker's.
+
+The fix for both: compute the scratch address fresh, per trap, from whichever process actually trapped (`regs.sp - SCRATCH_SIZE`, read via that process's own live registers) — the technique the *original*, non-relay ptrace mechanism spike (`supervisor.c`) actually used and validated, including on a genuinely forked grandchild. This works cleanly for `substitute` and `rewrite` (both are transparent to which process they apply to) and for coverage/observation generally.
+
+**`fabricate` needs one more change on top of that.** Denying a syscall and having the *same* process's own code detect the denial and emit canned output (Task 4's original approach) only works when that process is our own cooperative `worker` binary. For a grandchild, whatever process trapped is running someone else's program image (e.g. `/bin/sh`) — there is no cooperative code there to detect anything. And scratch memory doesn't survive a *real* exec's stack re-randomization (ASLR gives the new image a fresh stack base), so "substitute to a helper that reads scratch" doesn't work either. The reliable fix: redirect (substitute-style) to a small baked-in helper binary, `fabricate-emit`, and pass the canned result via **argv** — argv content is copied into the new process by the kernel itself as part of `execve()`, so it survives a real exec regardless of ASLR. Byte-for-byte payload content (which may not be printable-safe) travels as base64, which is why this revision also extracts a shared `base64.c`/`base64.h` (Task 3's `config.c` already has an inline base64 decoder for the *host-supplied config*; this revision factors it out so `relayd.c`'s encoder and `fabricate-emit`'s decoder share the same code rather than duplicating it a third time).
+
+**Files:**
+- Create: `runtime/images/guest-exec-relay/src/base64.h`
+- Create: `runtime/images/guest-exec-relay/src/base64.c`
+- Create: `runtime/images/guest-exec-relay/src/fabricate-emit.c`
+- Modify: `runtime/images/guest-exec-relay/src/config.c` (Task 3) — use the shared decoder instead of its own inline one
+- Modify: `runtime/images/guest-exec-relay/src/relayd.c` (Task 4) — wait-loop dispatch, scratch addressing, fabricate verb, worker post-execve code
+
+**Interfaces:**
+- Produces: `base64_decode(const char *in, char **out, size_t *out_len) -> int` (0 success, -1 malformed; caller frees `*out` on success), `base64_encode(const void *in, size_t in_len) -> char *` (malloc'd NUL-terminated base64 string, NULL on allocation failure, caller frees). Used by `config.c` (decode), `relayd.c` (encode), `fabricate-emit.c` (decode).
+- `fabricate-emit` binary: invoked as `fabricate-emit <exit_code> <base64_stdout> <base64_stderr>`, decodes and writes the two payloads to stdout/stderr, exits with `<exit_code>`.
+
+- [ ] **Step 1: `base64.h`**
+
+```c
+#ifndef EXEC_RELAY_BASE64_H
+#define EXEC_RELAY_BASE64_H
+
+#include <stddef.h>
+
+/* Decodes standard-alphabet base64 (with '=' padding) from `in`
+ * (NUL-terminated) into a freshly malloc'd buffer, written to *out with
+ * length *out_len. Returns 0 on success, -1 on malformed input (including
+ * any byte outside the base64 alphabet) — caller frees *out on success. */
+int base64_decode(const char *in, char **out, size_t *out_len);
+
+/* Encodes `in` (in_len bytes, may contain any byte value including NUL)
+ * into a freshly malloc'd, NUL-terminated standard-alphabet base64 string
+ * with '=' padding. Returns NULL on allocation failure. Caller frees. */
+char *base64_encode(const void *in, size_t in_len);
+
+#endif
+```
+
+- [ ] **Step 2: `base64.c`**
+
+```c
+#include "base64.h"
+#include <stdlib.h>
+#include <string.h>
+
+static void build_decode_table(signed char T[256]) {
+    for (int i = 0; i < 256; i++) T[i] = -1;
+    static const char alphabet[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    for (int i = 0; i < 64; i++) T[(unsigned char)alphabet[i]] = (signed char)i;
+}
+
+int base64_decode(const char *in, char **out, size_t *out_len) {
+    signed char T[256];
+    build_decode_table(T);
+    size_t inlen = strlen(in);
+    char *decoded = malloc(inlen ? inlen : 1);
+    if (!decoded) return -1;
+    size_t outlen = 0;
+    int val = 0, valb = -8;
+    for (size_t i = 0; i < inlen; i++) {
+        unsigned char c = (unsigned char)in[i];
+        if (c == '=' || c == '\n' || c == '\r') continue;
+        signed char d = T[c];
+        if (d < 0) { free(decoded); return -1; }
+        val = (val << 6) | d;
+        valb += 6;
+        if (valb >= 0) {
+            decoded[outlen++] = (char)((val >> valb) & 0xFF);
+            valb -= 8;
+        }
+    }
+    *out = decoded;
+    *out_len = outlen;
+    return 0;
+}
+
+char *base64_encode(const void *in, size_t in_len) {
+    static const char alphabet[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const unsigned char *bytes = (const unsigned char *)in;
+    size_t out_len = 4 * ((in_len + 2) / 3);
+    char *out = malloc(out_len + 1);
+    if (!out) return NULL;
+    size_t oi = 0, i = 0;
+    for (; i + 3 <= in_len; i += 3) {
+        unsigned int n = ((unsigned int)bytes[i] << 16) | ((unsigned int)bytes[i+1] << 8) | bytes[i+2];
+        out[oi++] = alphabet[(n >> 18) & 0x3F];
+        out[oi++] = alphabet[(n >> 12) & 0x3F];
+        out[oi++] = alphabet[(n >> 6) & 0x3F];
+        out[oi++] = alphabet[n & 0x3F];
+    }
+    size_t rem = in_len - i;
+    if (rem == 1) {
+        unsigned int n = (unsigned int)bytes[i] << 16;
+        out[oi++] = alphabet[(n >> 18) & 0x3F];
+        out[oi++] = alphabet[(n >> 12) & 0x3F];
+        out[oi++] = '=';
+        out[oi++] = '=';
+    } else if (rem == 2) {
+        unsigned int n = ((unsigned int)bytes[i] << 16) | ((unsigned int)bytes[i+1] << 8);
+        out[oi++] = alphabet[(n >> 18) & 0x3F];
+        out[oi++] = alphabet[(n >> 12) & 0x3F];
+        out[oi++] = alphabet[(n >> 6) & 0x3F];
+        out[oi++] = '=';
+    }
+    out[oi] = '\0';
+    return out;
+}
+```
+
+- [ ] **Step 3: Refactor `config.c` (Task 3) to use the shared decoder**
+
+In `config_load_from_env`, replace the entire inline `T[256]` table + manual decode loop with:
+
+```c
+int config_load_from_env(struct exec_plan *out) {
+    const char *b64 = getenv("CHAMBER_EXEC_CONSEQUENCE_SPEC_B64");
+    if (!b64) return -1;
+
+    char *decoded = NULL;
+    size_t outlen = 0;
+    if (base64_decode(b64, &decoded, &outlen) != 0) return -1;
+
+    int rc = config_load_from_json(decoded, outlen, out);
+    free(decoded);
+    return rc;
+}
+```
+
+Add `#include "base64.h"` to `config.c`'s includes. Remove the now-unused inline `T[256]`/decode-loop code entirely.
+
+Run `cd runtime/images/guest-exec-relay && cc -Wall -Wextra -std=c11 -g -o /tmp/test_config src/json.c src/config.c src/base64.c tests/test_config.c && /tmp/test_config` (note the added `src/base64.c` on the compile line) — expected: all existing tests still pass unchanged, since this is a pure refactor with identical behavior. Update `tests/run_c_tests.sh` to add `src/base64.c` to both compile lines (the `test_json`/`test_config` builds don't need it, but `test_config`'s does now).
+
+- [ ] **Step 4: `fabricate-emit.c`**
+
+```c
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include "base64.h"
+
+int main(int argc, char **argv) {
+    if (argc < 4) {
+        fprintf(stderr, "usage: fabricate-emit <exit_code> <base64_stdout> <base64_stderr>\n");
+        return 2;
+    }
+    int exit_code = atoi(argv[1]);
+
+    char *out = NULL; size_t out_len = 0;
+    if (base64_decode(argv[2], &out, &out_len) != 0) {
+        fprintf(stderr, "fabricate-emit: malformed stdout payload\n");
+        return 2;
+    }
+    char *err = NULL; size_t err_len = 0;
+    if (base64_decode(argv[3], &err, &err_len) != 0) {
+        fprintf(stderr, "fabricate-emit: malformed stderr payload\n");
+        free(out);
+        return 2;
+    }
+
+    if (out_len) write(STDOUT_FILENO, out, out_len);
+    if (err_len) write(STDERR_FILENO, err, err_len);
+    free(out);
+    free(err);
+    return exit_code;
+}
+```
+
+Verify standalone: `cc -O2 -Wall -Wextra -std=c11 -o /tmp/fabricate-emit src/fabricate-emit.c src/base64.c && /tmp/fabricate-emit 42 aGVsbG8= d29ybGQ=` — expected: prints `hello` to stdout, `world` to stderr, exits 42.
+
+- [ ] **Step 5: Rewrite `relayd.c`'s wait-loop dispatch, scratch addressing, and fabricate verb**
+
+Remove entirely (no longer used): `SCRATCH_MODE_NONE`/`SCRATCH_MODE_SUBSTITUTE`/`SCRATCH_MODE_FABRICATE`, `struct fabricate_payload`, `SCRATCH_PAYLOAD_OFFSET`, `SCRATCH_PATH_OFFSET` (all added in Task 4 Step 2). Add `#include "base64.h"` to the includes.
+
+Remove the `static char scratch[SCRATCH_SIZE];` declaration from the worker's fork branch, and simplify the ready-handshake to drop transmitting an address:
+
+```c
+        /* tell parent we're ready to be seized */
+        char ok = 'R';
+        write(syncr[1], &ok, 1);
+
+        /* wait for parent's go-ahead (parent has SEIZEd us by now) */
+        char go;
+        if (read(syncg[0], &go, 1) != 1) _exit(125);
+```
+
+Correspondingly simplify the parent's read of that handshake (drop reading a scratch address):
+
+```c
+    char rbyte;
+    if (read_full(syncr[0], &rbyte, 1) != 1 || rbyte != 'R') {
+        logline("req=%s pid=%d: child failed to signal ready", req_id?req_id:"-", pid);
+        goto reap_and_fail;
+    }
+```
+
+Revert the worker's post-`execve`-failure code to the original spike's simple version (no fabricate-descriptor detection needed anymore — fabricate is now always a real, successful exec of `fabricate-emit`):
+
+```c
+        execve(argv[0], argv, envp);
+        /* execve only returns on error */
+        fprintf(stderr, "relay: execve(%s) failed: %s\n", argv[0], strerror(errno));
+        _exit(127);
+```
+
+Replace the entire `if (pfds[si].revents & POLLIN) { ... }` block (the signalfd-drain + waitpid dispatch loop) with:
+
+```c
+        if (pfds[si].revents & POLLIN) {
+            struct signalfd_siginfo si_buf;
+            while (read(sfd, &si_buf, sizeof(si_buf)) == sizeof(si_buf)) { /* drain */ }
+            for (;;) {
+                int status;
+                pid_t w = waitpid(-1, &status, WNOHANG | __WALL);
+                if (w <= 0) break;
+                /* Every waited pid may be relevant: PTRACE_O_TRACEFORK/VFORK/
+                 * CLONE makes descendants tracees of this same tracer, and
+                 * their own seccomp traps arrive through this same waitpid.
+                 * Handled per-pid via `w` throughout; only the ORIGINAL
+                 * top-level process's exit (w == pid) ends the whole request
+                 * — a grandchild exiting is not the command finishing. */
+
+                if (WIFSTOPPED(status)) {
+                    int sig = WSTOPSIG(status);
+                    int event = status >> 16;
+                    if (sig == SIGTRAP && event == PTRACE_EVENT_SECCOMP) {
+                        unsigned long msg = 0;
+                        ptrace(PTRACE_GETEVENTMSG, w, 0, &msg);
+                        struct arm64_regs regs;
+                        get_regs(w, &regs);
+                        int is_execveat = (msg == (unsigned long)SYS_execveat);
+                        unsigned long long path_reg = is_execveat ? regs.regs[1] : regs.regs[0];
+                        char reqpath[1024];
+                        read_tracee_str(w, path_reg, reqpath, sizeof(reqpath));
+
+                        unsigned long long argv_ptr_reg = is_execveat ? regs.regs[2] : regs.regs[1];
+                        char tracee_argv[EXEC_RELAY_MAX_ARGV][256];
+                        int tracee_argc = read_tracee_argv(w, argv_ptr_reg, tracee_argv, EXEC_RELAY_MAX_ARGV);
+                        char *argv_ptrs[EXEC_RELAY_MAX_ARGV];
+                        for (int ai = 0; ai < tracee_argc; ai++) argv_ptrs[ai] = tracee_argv[ai];
+
+                        const struct exec_rule *rule = config_match(plan, argv_ptrs, tracee_argc);
+                        const char *rule_name = rule ? rule->name : "fallback";
+                        const char *verb_name = "passthrough";
+                        char detail[1200] = "-";
+
+                        /* Computed fresh from THIS trap's own live SP, not a
+                         * fixed address handed over once by the top-level
+                         * worker at startup — this is what makes substitute
+                         * (and fabricate's redirect-to-helper, below) work
+                         * for ANY tracee, including a grandchild running a
+                         * completely different program's memory image. */
+                        unsigned long long scratch_addr = regs.sp - SCRATCH_SIZE;
+
+                        if (!rule) {
+                            /* passthrough: leave the syscall untouched */
+                        } else if (rule->verb == VERB_SUBSTITUTE) {
+                            verb_name = "substitute";
+                            const char *replacement = rule->replacement_argv[0];
+                            size_t rl = strlen(replacement) + 1;
+                            if (rl <= SCRATCH_SIZE) {
+                                write_tracee_mem(w, scratch_addr, replacement, rl);
+                                if (is_execveat) regs.regs[1] = scratch_addr;
+                                else regs.regs[0] = scratch_addr;
+                                set_regs(w, &regs);
+                                snprintf(detail, sizeof(detail), "%s", replacement);
+                            } else {
+                                verb_name = "substitute-failed-scratch-too-small";
+                            }
+                        } else if (rule->verb == VERB_FABRICATE) {
+                            verb_name = "fabricate";
+                            /* Redirect (substitute-style) to a baked-in helper,
+                             * passing the canned result via argv — argv content
+                             * is copied by the kernel as part of execve() itself,
+                             * so (unlike scratch memory) it survives a REAL exec
+                             * even though the new image gets a fresh, ASLR-
+                             * randomized stack. This is what lets fabricate work
+                             * on a grandchild, not just the top-level worker. */
+                            char *b64_stdout = base64_encode(rule->fabricate_stdout, rule->fabricate_stdout_len);
+                            char *b64_stderr = base64_encode(rule->fabricate_stderr, rule->fabricate_stderr_len);
+                            char exit_code_str[16];
+                            snprintf(exit_code_str, sizeof(exit_code_str), "%d", rule->fabricate_exit_code);
+
+                            int ok = 0;
+                            if (b64_stdout && b64_stderr) {
+                                static const char HELPER_PATH[] = "/usr/local/bin/fabricate-emit";
+                                const char *helper_argv[4] = { HELPER_PATH, exit_code_str, b64_stdout, b64_stderr };
+
+                                uint8_t buf[SCRATCH_SIZE];
+                                size_t off = 0;
+                                unsigned long long str_addrs[4];
+                                int fits = 1;
+                                for (int ai = 0; ai < 4 && fits; ai++) {
+                                    size_t sl = strlen(helper_argv[ai]) + 1;
+                                    if (off + sl > SCRATCH_SIZE - 64) { fits = 0; break; }
+                                    memcpy(buf + off, helper_argv[ai], sl);
+                                    str_addrs[ai] = scratch_addr + off;
+                                    off += sl;
+                                }
+                                if (fits) {
+                                    off = (off + 7) & ~(size_t)7; /* 8-byte align the pointer array */
+                                    unsigned long long ptr_array_addr = scratch_addr + off;
+                                    unsigned long long ptrs[5] = { str_addrs[0], str_addrs[1], str_addrs[2], str_addrs[3], 0 };
+                                    memcpy(buf + off, ptrs, sizeof(ptrs));
+                                    off += sizeof(ptrs);
+
+                                    write_tracee_mem(w, scratch_addr, buf, off);
+                                    if (is_execveat) { regs.regs[1] = str_addrs[0]; regs.regs[2] = ptr_array_addr; }
+                                    else { regs.regs[0] = str_addrs[0]; regs.regs[1] = ptr_array_addr; }
+                                    set_regs(w, &regs);
+                                    snprintf(detail, sizeof(detail), "exit=%d stdout_b64_len=%zu stderr_b64_len=%zu",
+                                             rule->fabricate_exit_code, strlen(b64_stdout), strlen(b64_stderr));
+                                    ok = 1;
+                                }
+                            }
+                            if (!ok) verb_name = "fabricate-failed-encode-or-scratch";
+                            free(b64_stdout);
+                            free(b64_stderr);
+                        } else if (rule->verb == VERB_REWRITE) {
+                            verb_name = "rewrite";
+                            snprintf(detail, sizeof(detail), "stdout_find=%s",
+                                      rule->has_stdout_rewrite ? rule->stdout_find : "(none)");
+                        }
+
+                        logline("req=%s pid=%d syscall=%s requested=%s verb=%s rule=%s detail=%s",
+                                req_id?req_id:"-", w, is_execveat?"execveat":"execve",
+                                reqpath, verb_name, rule_name, detail);
+                        disclosure_record(req_id, reqpath, rule_name, verb_name, detail);
+                        active_rewrite = (rule && rule->verb == VERB_REWRITE) ? rule : NULL;
+                        ptrace(PTRACE_CONT, w, 0, 0);
+                    } else if (sig == SIGTRAP && event != 0) {
+                        ptrace(PTRACE_CONT, w, 0, 0);
+                    } else {
+                        ptrace(PTRACE_CONT, w, 0, (void*)(long)sig);
+                    }
+                } else if (WIFEXITED(status)) {
+                    if (w == pid) { ecode = WEXITSTATUS(status); have_exit = 1; }
+                } else if (WIFSIGNALED(status)) {
+                    if (w == pid) { ecode = 128 + WTERMSIG(status); have_exit = 1; }
+                }
+            }
+        }
+```
+
+- [ ] **Step 6: Compile-check**
+
+Run: `cd runtime/images/guest-exec-relay && cc -c -Wall -Wextra -std=c11 -o /tmp/relayd.o src/relayd.c 2>&1 | head -40`
+Expected: same three forward-reference errors as before (`plan`, `active_rewrite`, `disclosure_record` — still Task 5's to resolve), no other errors. Also re-run Step 3's `test_config` build/run to confirm the base64 refactor didn't break Task 3's existing tests.
+
+- [ ] **Step 7: Commit**
+
+```bash
+cd runtime && git add images/guest-exec-relay/src/base64.h images/guest-exec-relay/src/base64.c images/guest-exec-relay/src/fabricate-emit.c images/guest-exec-relay/src/config.c images/guest-exec-relay/src/relayd.c images/guest-exec-relay/tests/run_c_tests.sh
+git commit -m "fix: per-process scratch addressing and argv-based fabricate so substitute/fabricate/coverage extend to nested execs, not just the top-level command"
+```
+
+---
+
 ### Task 5: `relayd.c` — concurrency fix, watchdog timeout, disclosure log
 
 **Files:**
@@ -1829,7 +2196,7 @@ int main(int argc, char **argv) {
 Run:
 ```bash
 cd runtime/images/guest-exec-relay
-cc -O2 -Wall -Wextra -std=c11 -o /tmp/execrelayd src/relayd.c src/config.c src/json.c
+cc -O2 -Wall -Wextra -std=c11 -o /tmp/execrelayd src/relayd.c src/config.c src/json.c src/base64.c
 CHAMBER_EXEC_CONSEQUENCE_SPEC_B64=$(printf '{"rules":[]}' | base64) /tmp/execrelayd --self-test /bin/true
 echo "exit=$?"
 ```
@@ -1981,7 +2348,7 @@ git commit -m "feat: add stub, the docker-exec-targeted relay client"
 - Create: `runtime/images/guest-exec-relay/Dockerfile`
 
 **Interfaces:**
-- Consumes: `runtime/images/guest-exec-relay/src/*.c` (Tasks 2–6).
+- Consumes: `runtime/images/guest-exec-relay/src/*.c` (Tasks 2–6, including Task 4's revision — `base64.c` and `fabricate-emit.c`).
 - Produces: a buildable image tag (`chamber-guest-exec-relay:test`), consumed later by `plan.images.guest` in Task 9's tests and by Task 12's e2e tests.
 
 - [ ] **Step 1: Write the multi-stage Dockerfile**
@@ -1994,14 +2361,17 @@ git commit -m "feat: add stub, the docker-exec-targeted relay client"
 FROM alpine:3.20 AS builder
 RUN apk add --no-cache gcc musl-dev linux-headers
 WORKDIR /src
-COPY src/json.h src/json.c src/config.h src/config.c src/relayd.c src/stub.c ./
-RUN gcc -O2 -Wall -Wextra -std=c11 -o /out/execrelayd relayd.c config.c json.c \
- && gcc -O2 -Wall -Wextra -std=c11 -o /out/stub stub.c
+RUN mkdir -p /out
+COPY src/json.h src/json.c src/base64.h src/base64.c src/config.h src/config.c src/relayd.c src/stub.c src/fabricate-emit.c ./
+RUN gcc -O2 -Wall -Wextra -std=c11 -o /out/execrelayd relayd.c config.c json.c base64.c \
+ && gcc -O2 -Wall -Wextra -std=c11 -o /out/stub stub.c \
+ && gcc -O2 -Wall -Wextra -std=c11 -o /out/fabricate-emit fabricate-emit.c base64.c
 
 FROM alpine:3.20
 RUN apk add --no-cache curl ca-certificates bind-tools
 COPY --from=builder /out/execrelayd /usr/local/bin/execrelayd
 COPY --from=builder /out/stub /usr/local/bin/stub
+COPY --from=builder /out/fabricate-emit /usr/local/bin/fabricate-emit
 WORKDIR /work
 ENTRYPOINT ["/usr/local/bin/execrelayd"]
 ```
@@ -2506,36 +2876,56 @@ pub fn record_exec_consequence_log(log: &mut RunLog, disclosure_log_text: &str, 
 Run: `cd runtime && cargo test -p chamber-run record_exec_consequence_log`
 Expected: PASS.
 
-- [ ] **Step 5: Wire the sealing read into `wind_down`'s `BoundarySeal` stage**
+- [ ] **Step 5: Read the disclosure log before `wind_down`, not inside it — corrected design**
 
-In `run.rs`'s `run_detonation`, before the `wind_down(...)` call, add a variable to carry the disclosure text out to the `RunRecord` closure (mirroring how `transcript` is already captured before the call):
+**This step was revised after the task review empirically caught a real bug in the original text below and confirmed it with a live Docker container** — kept here, struck through in spirit, so the reasoning is on record: the original design put the read inside `wind_down`'s `BoundarySeal` closure (stage 2), reasoning "after the observer is stopped but before `SandboxTeardown` destroys the cell." That reasoning only tracked Rust-level ownership (`Option<AgentCell>` isn't `.take()`n until stage 3) — it missed that `AgentHalt` (stage 1, running *before* `BoundarySeal`) calls `cell.halt(CELL_HALT_GRACE)`, which is a literal `docker stop`. A stopped container refuses `docker exec`. The reviewer confirmed this against a real throwaway container: `docker stop` then `docker exec ... cat ...` → `Error response from daemon: container ... is not running`, exit code 1. Since `AgentHalt` always runs before `BoundarySeal` (`Stage::SEQUENCE` in `winddown.rs`), the disclosure-log read as originally specified would silently fail on every real run — and silently, because `Container::exec` returns `Ok` for any exit status (only a timeout or spawn failure is `Err` — see `docker.rs`'s own doc comment: "callers that need a non-zero exit to be an error say so with `ExecOutcome::ok()`"), and the original code never checked `.ok()`.
 
-```rust
-    let exec_consequence_log: std::rc::Rc<std::cell::RefCell<Option<String>>> = Default::default();
-```
+**Corrected design**: read the disclosure log at the same point the codebase already reads something else from the cell for exactly this reason — the closing worksnapshot, captured explicitly "while the cell is still alive and before ownership passes to the wind-down," i.e. *before* `arming.disarm()` and before `wind_down` is called at all. This is the true last point the cell is guaranteed to still be *running* (not just Rust-owned), so no ordering-vs-`AgentHalt` question can arise. Since the value is now fully computed before any wind-down closure runs (unlike the original design, which needed to write it *from inside* a stage), it doesn't need the `Rc<RefCell<...>>` wrapper the original text used — a plain `Option<String>`, borrowed by the `RunRecord` closure the same way `plan`/`transcript` already are, is enough.
 
-Inside the `BoundarySeal` closure (stage 2), after `capture.stop(...)` succeeds and before it returns — this is "after the observer is stopped but before `SandboxTeardown` destroys the cell," per the design's sealing requirement — add:
+Immediately after the existing `work_diff` block (which ends `};`) and before `let turns_taken = transcript.len();`, add:
 
 ```rust
-                if plan.exec_consequence.is_some() {
-                    if let Some(cell) = chamber.borrow().cell.as_ref() {
-                        match cell.exec(&["cat", "/work/.execrelay.log"], OP_WINDOW) {
-                            Ok(outcome) => *exec_consequence_log.borrow_mut() = Some(outcome.stdout),
-                            Err(e) => eprintln!("chamber: could not read exec-consequence disclosure log: {e}"),
-                        }
-                    }
-                }
+    // The exec-relay's disclosure log, read here for the same reason as the
+    // closing snapshot just above: this is the last point the cell is
+    // guaranteed to still be RUNNING, not just Rust-owned. AgentHalt
+    // (wind_down's first stage) calls `docker stop` on the cell — a stopped
+    // container refuses `docker exec`, so reading this any later (even
+    // inside BoundarySeal, the *second* stage) would always hit an
+    // already-stopped container. A read failure here is logged, not fatal —
+    // this secondary channel does not bear a verdict, so the run's own
+    // evidence emission is never blocked on it.
+    let exec_consequence_log: Option<String> = if plan.exec_consequence.is_some() {
+        let cell = arming.cell.as_ref().expect("armed");
+        match cell.exec(&["cat", "/work/.execrelay.log"], OP_WINDOW) {
+            Ok(outcome) if outcome.ok() => Some(outcome.stdout),
+            Ok(outcome) => {
+                eprintln!(
+                    "chamber: exec-consequence disclosure log read failed: {}",
+                    outcome.stderr
+                );
+                None
+            }
+            Err(e) => {
+                eprintln!("chamber: could not read exec-consequence disclosure log: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
 ```
 
-(A read failure here is logged, not fatal — matching the existing best-effort tone of the worksnapshot code found during research; the run's own evidence isn't blocked on this secondary channel, which itself doesn't bear verdict.)
+Remove the `BoundarySeal` closure's disclosure-read block entirely (the `if plan.exec_consequence.is_some() && let Some(cell) = ... { match cell.exec(...) ... }` block that was inserted there) — restore that closure to exactly what it was before this task touched it (just the `capture.stop`/`capture.destroy` logic and its `stopped` return). Do **not** add anything to `AgentHalt`, `SandboxTeardown`, or any other wind-down closure.
 
 Inside the `RunRecord` closure (stage 4), alongside the existing `bundle::record_guest_commands(&mut log, &transcript, &secrets);` line, add:
 
 ```rust
-                if let Some(text) = exec_consequence_log.borrow().as_deref() {
+                if let Some(text) = exec_consequence_log.as_deref() {
                     bundle::record_exec_consequence_log(&mut log, text, &secrets);
                 }
 ```
+
+(No `.borrow()` needed now — `exec_consequence_log` is a plain `Option<String>` captured by shared reference, the same way `plan` already is by this same closure.)
 
 - [ ] **Step 6: Run the full `chamber-run` suite**
 
