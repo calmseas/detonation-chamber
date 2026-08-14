@@ -205,35 +205,59 @@ static void disclosure_init(void) {
  * emit here (argv entries, rule names, free-form `detail` text) — backslash
  * and double-quote are the only bytes this schema's own values can contain
  * that would break JSON (argv/name/detail never carry control characters in
- * practice; this only needs to not corrupt the log, not be a general escaper). */
-static void write_json_escaped(int fd, const char *s) {
-    char buf[4096];
-    size_t o = 0;
-    for (; *s && o < sizeof(buf) - 2; s++) {
-        if (*s == '"' || *s == '\\') { buf[o++] = '\\'; }
-        buf[o++] = *s;
+ * practice; this only needs to not corrupt the log, not be a general escaper).
+ * Appends into `buf` at offset `off` (bounded by `bufcap`) and returns the
+ * new offset — a building block for assembling one full record in memory
+ * before it ever touches the fd (see disclosure_record). */
+static size_t append_json_escaped(char *buf, size_t off, size_t bufcap, const char *s) {
+    for (; *s && off + 2 <= bufcap; s++) {
+        if (*s == '"' || *s == '\\') buf[off++] = '\\';
+        buf[off++] = *s;
     }
-    write_full(fd, buf, o);
+    return off;
 }
 
+/* vsnprintf-and-advance: formats into `buf` at offset `off` (bounded by
+ * `bufcap`), returns the new offset. Truncates safely (never past bufcap)
+ * rather than overflowing if a record ever runs long. */
+static size_t append_fmt(char *buf, size_t off, size_t bufcap, const char *fmt, ...) {
+    if (off >= bufcap) return off;
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(buf + off, bufcap - off, fmt, ap);
+    va_end(ap);
+    if (n <= 0) return off;
+    size_t written = (size_t)n < bufcap - off ? (size_t)n : bufcap - off - 1;
+    return off + written;
+}
+
+/* Builds one complete JSON record in a local buffer and writes it with a
+ * SINGLE write_full() call. This matters because g_disclosure_fd is opened
+ * once in main() before run_server() forks any handlers, so every
+ * concurrent handler process (Step 5) inherits and shares the same fd:
+ * O_APPEND makes each individual write() atomic, but a record built from
+ * several separate write() calls is not — two handlers racing here could
+ * interleave their writes into one corrupted, unparseable line. Composing
+ * the whole line first and issuing one write() (comfortably under any
+ * filesystem's atomic-write block size at this record's bounded size)
+ * keeps concurrent records from ever interleaving. */
 static void disclosure_record(const char *turn_id, const char *requested_argv0,
                                const char *matched_rule, const char *verb_applied,
                                const char *detail) {
     if (g_disclosure_fd < 0) return;
     struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
-    char pre[256];
-    int n = snprintf(pre, sizeof(pre),
+    char buf[8192];
+    size_t off = 0;
+    off = append_fmt(buf, off, sizeof(buf),
         "{\"turn_id\":\"%s\",\"timestamp\":%ld.%03ld,\"requested_argv0\":\"",
         turn_id ? turn_id : "-", (long)ts.tv_sec, ts.tv_nsec / 1000000);
-    write_full(g_disclosure_fd, pre, (size_t)n);
-    write_json_escaped(g_disclosure_fd, requested_argv0);
-    char mid[256];
-    n = snprintf(mid, sizeof(mid), "\",\"matched_rule\":\"%s\",\"verb_applied\":\"%s\",\"detail\":\"",
-                 matched_rule, verb_applied);
-    write_full(g_disclosure_fd, mid, (size_t)n);
-    write_json_escaped(g_disclosure_fd, detail);
-    static const char tail[] = "\"}\n";
-    write_full(g_disclosure_fd, tail, sizeof(tail) - 1);
+    off = append_json_escaped(buf, off, sizeof(buf), requested_argv0);
+    off = append_fmt(buf, off, sizeof(buf),
+                      "\",\"matched_rule\":\"%s\",\"verb_applied\":\"%s\",\"detail\":\"",
+                      matched_rule, verb_applied);
+    off = append_json_escaped(buf, off, sizeof(buf), detail);
+    off = append_fmt(buf, off, sizeof(buf), "\"}\n");
+    write_full(g_disclosure_fd, buf, off);
 }
 
 static size_t apply_rewrite(char *buf, size_t len, const char *find, const char *replace, char *out, size_t outcap) {
