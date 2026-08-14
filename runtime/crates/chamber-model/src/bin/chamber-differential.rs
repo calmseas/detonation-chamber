@@ -398,6 +398,9 @@ async fn main() -> ExitCode {
         }],
         max_turns,
         consequence,
+        // No CLI wiring configures exec-interception for the differential yet;
+        // when it does, arm_detonation_plan already propagates it to both arms.
+        exec_consequence: None,
     };
 
     if let Err(e) = std::fs::create_dir_all(&evidence_root) {

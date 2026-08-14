@@ -111,7 +111,10 @@ pub enum ExecConsequenceConfigError {
     /// relay's fixed scratch-buffer budget (2000 bytes each, 4000 total) —
     /// checked here so an oversized payload is a startup refusal, not a
     /// runtime truncation discovered mid-run.
-    FabricatePayloadTooLarge { rule_index: usize, len: usize },
+    FabricatePayloadTooLarge {
+        rule_index: usize,
+        len: usize,
+    },
     /// A `Rewrite` rule with exactly one of a `_find`/`_replace` pair set —
     /// the other half `None`. The guest-side C parser (`config.c`'s
     /// `load_verb`) only turns rewriting on for a given stream when BOTH its
@@ -122,7 +125,10 @@ pub enum ExecConsequenceConfigError {
     /// here so that shape is a loud startup error instead of a rule that
     /// looks configured but is quietly inert. `pair` names which pair
     /// ("stdout" or "stderr").
-    AsymmetricRewritePair { rule_index: usize, pair: &'static str },
+    AsymmetricRewritePair {
+        rule_index: usize,
+        pair: &'static str,
+    },
     TimeoutZero,
     MaxConcurrentHandlersZero,
 }
@@ -131,10 +137,16 @@ impl std::fmt::Display for ExecConsequenceConfigError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::SpecNotBase64(e) => write!(f, "{EXEC_SPEC_B64_VAR} is not valid base64: {e}"),
-            Self::SpecNotJson(e) => write!(f, "{EXEC_SPEC_B64_VAR} decoded but is not valid JSON: {e}"),
+            Self::SpecNotJson(e) => {
+                write!(f, "{EXEC_SPEC_B64_VAR} decoded but is not valid JSON: {e}")
+            }
             Self::EmptyRuleName(i) => write!(f, "rule {i} has an empty name"),
-            Self::EmptyMatchArgv(i) => write!(f, "rule {i}'s match_argv matches everything (empty)"),
-            Self::EmptyReplacementArgv(i) => write!(f, "rule {i}'s substitute.replacement_argv is empty"),
+            Self::EmptyMatchArgv(i) => {
+                write!(f, "rule {i}'s match_argv matches everything (empty)")
+            }
+            Self::EmptyReplacementArgv(i) => {
+                write!(f, "rule {i}'s substitute.replacement_argv is empty")
+            }
             Self::FabricatePayloadTooLarge { rule_index, len } => write!(
                 f,
                 "rule {rule_index}'s fabricate stdout+stderr is {len} bytes, exceeds the 4000-byte guest scratch budget"
@@ -153,13 +165,20 @@ impl std::error::Error for ExecConsequenceConfigError {}
 
 impl ExecConsequencePlan {
     pub fn from_json(text: &str) -> Result<Self, ExecConsequenceConfigError> {
-        let plan: ExecConsequencePlan =
-            serde_json::from_str(text).map_err(|e| ExecConsequenceConfigError::SpecNotJson(e.to_string()))?;
+        let plan: ExecConsequencePlan = serde_json::from_str(text)
+            .map_err(|e| ExecConsequenceConfigError::SpecNotJson(e.to_string()))?;
         plan.validate()?;
         Ok(plan)
     }
 
-    fn validate(&self) -> Result<(), ExecConsequenceConfigError> {
+    /// Every semantic check on a plan (nonzero timeouts, non-empty rule
+    /// names/matchers, symmetric rewrite pairs, fabricate payloads within
+    /// the guest scratch budget). `pub` so the production arming path can run
+    /// it directly: the real `run_detonation` builds an `ExecConsequencePlan`
+    /// in-process and calls `to_env_pairs()` without ever going through
+    /// `from_json`/`from_env_value`, so this is the only place those checks
+    /// can run before the plan is handed to the guest.
+    pub fn validate(&self) -> Result<(), ExecConsequenceConfigError> {
         if self.timeout_ms == 0 {
             return Err(ExecConsequenceConfigError::TimeoutZero);
         }
@@ -181,7 +200,12 @@ impl ExecConsequencePlan {
                 ExecVerb::Substitute { replacement_argv } if replacement_argv.is_empty() => {
                     return Err(ExecConsequenceConfigError::EmptyReplacementArgv(i));
                 }
-                ExecVerb::Rewrite { stdout_find, stdout_replace, stderr_find, stderr_replace } => {
+                ExecVerb::Rewrite {
+                    stdout_find,
+                    stdout_replace,
+                    stderr_find,
+                    stderr_replace,
+                } => {
                     if stdout_find.is_some() != stdout_replace.is_some() {
                         return Err(ExecConsequenceConfigError::AsymmetricRewritePair {
                             rule_index: i,
@@ -225,7 +249,9 @@ impl ExecConsequencePlan {
     /// Pure by construction — process environment is global mutable state,
     /// and under edition 2024 writing it is `unsafe` precisely because
     /// concurrent tests race on it. Mirrors `ConsequencePlan::from_env_value`.
-    pub fn from_env_value(spec_b64: Option<&str>) -> Result<Option<Self>, ExecConsequenceConfigError> {
+    pub fn from_env_value(
+        spec_b64: Option<&str>,
+    ) -> Result<Option<Self>, ExecConsequenceConfigError> {
         let Some(spec) = spec_b64 else {
             return Ok(None);
         };
@@ -411,8 +437,14 @@ mod tests {
             max_concurrent_handlers: 32,
         };
         let json = serde_json::to_string(&plan).unwrap();
-        assert!(!json.contains("stderr_find"), "stderr_find should be omitted, not nulled: {json}");
-        assert!(!json.contains("stderr_replace"), "stderr_replace should be omitted, not nulled: {json}");
+        assert!(
+            !json.contains("stderr_find"),
+            "stderr_find should be omitted, not nulled: {json}"
+        );
+        assert!(
+            !json.contains("stderr_replace"),
+            "stderr_replace should be omitted, not nulled: {json}"
+        );
         assert!(json.contains("\"stdout_find\":\"secret\""));
 
         // Still round-trips cleanly: absence on the wire deserializes back to
@@ -461,7 +493,10 @@ mod tests {
         let err = ExecConsequencePlan::from_env_value(Some(&spec)).unwrap_err();
         assert_eq!(
             err,
-            ExecConsequenceConfigError::AsymmetricRewritePair { rule_index: 0, pair: "stdout" }
+            ExecConsequenceConfigError::AsymmetricRewritePair {
+                rule_index: 0,
+                pair: "stdout"
+            }
         );
     }
 
@@ -491,7 +526,10 @@ mod tests {
         let err = ExecConsequencePlan::from_env_value(Some(&spec)).unwrap_err();
         assert_eq!(
             err,
-            ExecConsequenceConfigError::AsymmetricRewritePair { rule_index: 0, pair: "stderr" }
+            ExecConsequenceConfigError::AsymmetricRewritePair {
+                rule_index: 0,
+                pair: "stderr"
+            }
         );
     }
 

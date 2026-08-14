@@ -9,7 +9,10 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 
-#define SOCK_PATH "/tmp/relay.sock"
+/* Must match relayd.c's SOCK_PATH exactly. Under /work (the only tmpfs the
+ * real read-only cell provides), inside a hidden subdirectory execrelayd
+ * creates at startup. */
+#define SOCK_PATH "/work/.exec-relay/relay.sock"
 #define MAX_FRAME_LEN 65536
 
 static ssize_t read_full(int fd, void *buf, size_t n) {

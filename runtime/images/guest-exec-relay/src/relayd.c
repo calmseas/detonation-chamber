@@ -38,7 +38,17 @@ struct arm64_regs {
     unsigned long long pstate;
 };
 
-#define SOCK_PATH "/tmp/relay.sock"
+/* Both the control socket and the disclosure log live under a hidden
+ * subdirectory of the /work tmpfs. The real cell (chamber-isolation's
+ * AgentCell::start) runs read-only with a tmpfs ONLY at /work — /tmp does not
+ * exist as a writable path there, so a socket under /tmp cannot be bound.
+ * /work/.exec-relay/ keeps both artefacts inside the one writable filesystem
+ * that always exists, and folds them out of the agent's bare working directory
+ * so a casual `ls /work` does not surface them (coherent-per-tool, not
+ * forensic-proof — that is this project's stated bar). RELAY_DIR is created in
+ * main() before either is opened. */
+#define RELAY_DIR "/work/.exec-relay"
+#define SOCK_PATH RELAY_DIR "/relay.sock"
 #define SCRATCH_SIZE 16384
 
 static void logline(const char *fmt, ...) {
@@ -189,7 +199,7 @@ static int read_tracee_argv(int pid, unsigned long long argv_addr, char out[][25
 }
 
 /* ---------------------------- disclosure log ---------------------------- */
-#define DISCLOSURE_LOG_PATH "/work/.execrelay.log"
+#define DISCLOSURE_LOG_PATH RELAY_DIR "/disclosure.log"
 static int g_disclosure_fd = -1;
 
 static void disclosure_init(void) {
@@ -248,9 +258,17 @@ static void disclosure_record(const char *turn_id, const char *requested_argv0,
     struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
     char buf[8192];
     size_t off = 0;
+    /* turn_id is guest-controlled (it arrives verbatim from `stub --turn-id=`),
+     * so it MUST go through the same escaper as requested_argv0/detail — not a
+     * raw %s. A crafted turn_id could otherwise close the JSON string early and
+     * inject its own keys (e.g. a fake "known_residual_tells"), making the whole
+     * record either fail to parse or be misread as the header and silently
+     * dropped from the sealed bundle (see bundle.rs record_exec_consequence_log). */
+    off = append_fmt(buf, off, sizeof(buf), "{\"turn_id\":\"");
+    off = append_json_escaped(buf, off, sizeof(buf), turn_id ? turn_id : "-");
     off = append_fmt(buf, off, sizeof(buf),
-        "{\"turn_id\":\"%s\",\"timestamp\":%ld.%03ld,\"requested_argv0\":\"",
-        turn_id ? turn_id : "-", (long)ts.tv_sec, ts.tv_nsec / 1000000);
+        "\",\"timestamp\":%ld.%03ld,\"requested_argv0\":\"",
+        (long)ts.tv_sec, ts.tv_nsec / 1000000);
     off = append_json_escaped(buf, off, sizeof(buf), requested_argv0);
     off = append_fmt(buf, off, sizeof(buf),
                       "\",\"matched_rule\":\"%s\",\"verb_applied\":\"%s\",\"detail\":\"",
@@ -337,9 +355,21 @@ static int run_traced(char *const argv[], char *const envp_extra[], int envp_ext
         for (int i = 0; i < envp_extra_n; i++) envp[k++] = envp_extra[i];
         envp[k] = NULL;
 
-        execve(argv[0], argv, envp);
-        /* execve only returns on error */
-        fprintf(stderr, "relay: execve(%s) failed: %s\n", argv[0], strerror(errno));
+        /* execvpe, not execve: a bare command name (argv[0] without a slash)
+         * must be resolved against PATH exactly as a shell would — the bridge
+         * itself issues bare names (e.g. `cat` for every ReadFile directive),
+         * and plain execve() would fail every one with ENOENT. execvpe tries
+         * each PATH candidate with its own execve() syscall, so the seccomp
+         * trap still fires per attempt; argv[0] stays the literal original name
+         * throughout, which is what config_match matches on, so rule matching
+         * composes unchanged. (musl 1.2.5 on Alpine 3.20 provides execvpe;
+         * verified it compiles/links/runs in that environment.) */
+        execvpe(argv[0], argv, envp);
+        /* execvpe only returns on error. The message must NOT name this as an
+         * interception layer — a generic "<name>: not found" matches what a
+         * real missing-binary failure looks like (coherent-per-tool, this
+         * project's stated bar; not byte-identical shell mimicry). */
+        fprintf(stderr, "%s: not found\n", argv[0]);
         _exit(127);
     }
 
@@ -478,11 +508,24 @@ static int run_traced(char *const argv[], char *const envp_extra[], int envp_ext
                             const char *replacement = rule->replacement_argv[0];
                             size_t rl = strlen(replacement) + 1;
                             if (rl <= SCRATCH_SIZE) {
-                                write_tracee_mem(w, scratch_addr, replacement, rl);
-                                if (is_execveat) regs.regs[1] = scratch_addr;
-                                else regs.regs[0] = scratch_addr;
-                                set_regs(w, &regs);
-                                snprintf(detail, sizeof(detail), "%s", replacement);
+                                /* Both the memory poke and the register write can
+                                 * fail (e.g. the tracee raced to exit); if either
+                                 * does, the real syscall proceeds UNMODIFIED, so
+                                 * recording verb_applied="substitute" would file a
+                                 * failed substitution as a successful one in the
+                                 * evidence. Check both and fall to the existing
+                                 * substitute-failed-* convention on either. */
+                                if (write_tracee_mem(w, scratch_addr, replacement, rl) != 0) {
+                                    verb_name = "substitute-failed-mem-write";
+                                } else {
+                                    if (is_execveat) regs.regs[1] = scratch_addr;
+                                    else regs.regs[0] = scratch_addr;
+                                    if (set_regs(w, &regs) != 0) {
+                                        verb_name = "substitute-failed-set-regs";
+                                    } else {
+                                        snprintf(detail, sizeof(detail), "%s", replacement);
+                                    }
+                                }
                             } else {
                                 verb_name = "substitute-failed-scratch-too-small";
                             }
@@ -710,6 +753,16 @@ int main(int argc, char **argv) {
     if (config_load_from_env(&plan) != 0) {
         fprintf(stderr, "execrelayd: refusing to start — CHAMBER_EXEC_CONSEQUENCE_SPEC_B64 "
                          "is absent, malformed, or invalid\n");
+        return 1;
+    }
+    /* The control socket (run_server) and the disclosure log (disclosure_init)
+     * both live under RELAY_DIR; create it before either is opened. /work is a
+     * fresh tmpfs each run, so this normally does not exist yet — EEXIST is
+     * fine, anything else means neither the socket nor the log can be created
+     * and the relay cannot function, so refuse to start. */
+    if (mkdir(RELAY_DIR, 0700) != 0 && errno != EEXIST) {
+        fprintf(stderr, "execrelayd: refusing to start — could not create %s: %s\n",
+                RELAY_DIR, strerror(errno));
         return 1;
     }
     if (ptrace_self_check() != 0) {

@@ -47,6 +47,13 @@ jobs:
       # ...except this one, which lives in chamber-e2e because it guards the
       # containment work, but is a source scan and needs no engine at all.
       - run: cargo test -p chamber-e2e --test no_flush_ruleset
+      # The exec-relay's C unit tests (its JSON value parser and config loader)
+      # are pure logic over portable C and need no Linux guest — only a C
+      # compiler, which ubuntu-latest ships (`cc`). They compile the very
+      # sources the guest image builds, so a parser regression is caught here
+      # rather than only surfacing inside a Docker build no CI job ran.
+      - name: exec-relay C unit tests
+        run: images/guest-exec-relay/tests/run_c_tests.sh
 
   # The container gate.
   #
@@ -76,6 +83,32 @@ jobs:
       # serialise themselves in-process. Doing it with a CLI flag here would
       # leave a plain `cargo test` broken for anyone running it locally.
       - run: cargo test -p chamber-e2e --test containment
+
+  # The exec-consequence gate: the ptrace+seccomp exec-interception relay, end
+  # to end against the real read-only cell spec. Same container gate as
+  # containment (FAIL, not skip, when Docker is absent; no `continue-on-error`).
+  # Its own job rather than a step folded into `containment` because it builds a
+  # separate guest image (guest-exec-relay) and its failures are about a
+  # different mechanism -- a red here means the interception layer is broken,
+  # not that egress containment is. Without this job the whole exec_consequence
+  # suite ran in no CI at all.
+  exec-consequence:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: runtime
+    env:
+      CHAMBER_REQUIRE_CONTAINERS: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: runtime
+      # Same subnet-serialisation note as containment: the tests raise the
+      # chamber's fixed subnet and serialise themselves in-process, so no
+      # --test-threads=1 here either.
+      - run: cargo test -p chamber-e2e --test exec_consequence
 
   # The fixture matrix: the whole tool, end to end. Rows 2-5 are the
   # anti-rubber-stamp tests and none may be #[ignore]d. Same container gate as

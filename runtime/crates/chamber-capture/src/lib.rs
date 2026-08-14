@@ -33,9 +33,9 @@ pub mod canary;
 // while linking none of the proxy stack. See the note on the feature split in
 // Cargo.toml.
 pub mod consequence;
-pub mod exec_consequence;
 #[cfg(feature = "observer")]
 pub mod dns;
+pub mod exec_consequence;
 #[cfg(feature = "observer")]
 pub mod proxy;
 pub mod recorder;

@@ -352,7 +352,7 @@ pub async fn run_detonation(
     // evidence emission is never blocked on it.
     let exec_consequence_log: Option<String> = if plan.exec_consequence.is_some() {
         let cell = arming.cell.as_ref().expect("armed");
-        match cell.exec(&["cat", "/work/.execrelay.log"], OP_WINDOW) {
+        match cell.exec(&["cat", "/work/.exec-relay/disclosure.log"], OP_WINDOW) {
             Ok(outcome) if outcome.ok() => Some(outcome.stdout),
             Ok(outcome) => {
                 eprintln!(
@@ -680,6 +680,14 @@ fn apply_exec_consequence_env(
     let Some(exec_plan) = exec_plan else {
         return Ok(());
     };
+    // Nothing on the real run path goes through from_json/from_env_value, so
+    // this is the only place the plan's semantic checks (nonzero timeouts,
+    // symmetric rewrite pairs, fabricate-payload budget, ...) run before the
+    // spec reaches the guest. Without it a misconfigured plan becomes a silent
+    // no-op or an opaque guest-side failure; with it it becomes a proper
+    // host-side ArmingRefusal::Environment (seal_cell_environment propagates
+    // this function's Err that way).
+    exec_plan.validate().map_err(|e| e.to_string())?;
     let relay = Rationale {
         reason: "configures the guest's exec-interception relay for this run",
         required_by: "chamber-run::seal_cell_environment",

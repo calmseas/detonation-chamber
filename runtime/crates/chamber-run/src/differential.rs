@@ -282,14 +282,15 @@ pub fn shape_gaps() -> Vec<CoverageGap> {
             scope: "Dropped packets, inference calls, guest commands, and exec consequences \
                     contribute no shape. Repetition and timing are not compared."
                 .into(),
-            justification: "A dropped packet's five-tuple carries an ephemeral port, so every drop \
+            justification:
+                "A dropped packet's five-tuple carries an ephemeral port, so every drop \
                             would be unique and every run would appear to diverge. Inference \
                             request and response digests differ every run by construction. A guest \
                             command and exec consequence are inside the sealed cell rather than at \
                             the boundary, which is the same reasoning that keeps them out of \
                             Channel::bears_verdict. Comparing counts instead of sets would make \
                             this axis the threshold-laden thing it was designed not to be."
-                .into(),
+                    .into(),
         },
     ]
 }
@@ -838,8 +839,14 @@ mod activity_tests {
         );
 
         let activity = activity_of(&opened);
-        assert_eq!(activity.guest_commands, 1, "ExecConsequence should not count as guest command");
-        assert_eq!(activity.crossings, 1, "ExecConsequence should not count as crossing");
+        assert_eq!(
+            activity.guest_commands, 1,
+            "ExecConsequence should not count as guest command"
+        );
+        assert_eq!(
+            activity.crossings, 1,
+            "ExecConsequence should not count as crossing"
+        );
         assert_eq!(activity.ending, RunEnding::Completed);
     }
 
@@ -2380,6 +2387,14 @@ pub struct DifferentialPlan {
     /// of the boundary rather than because of the candidate, and the subtraction
     /// would report that difference as the artefact's behaviour.
     pub consequence: Option<ConsequencePlan>,
+    /// The guest's exec-interception plan, applied identically to both arms.
+    ///
+    /// **One field, for the same reason as `consequence` above** — the
+    /// exec-consequence relay is part of the *environment* both arms meet, not
+    /// part of the artefact under test. If one arm ran with the relay and the
+    /// other without, the subtraction would attribute the relay's own effect on
+    /// command behaviour to the candidate. `None` is "no exec interception".
+    pub exec_consequence: Option<chamber_capture::exec_consequence::ExecConsequencePlan>,
 }
 
 /// Why no differential happened.
@@ -2499,7 +2514,12 @@ fn arm_detonation_plan(
         // NOT matched on role: both arms meet the same boundary, or the
         // subtraction attributes the environment's difference to the artefact.
         consequence: plan.consequence.clone(),
-        exec_consequence: None,
+        // Cloned, NOT hardcoded None: for the same reason as `consequence`
+        // just above, the exec-interception relay is part of the environment
+        // both arms meet. Dropping it for either arm would run that arm's
+        // commands unintercepted, and the subtraction would then read the
+        // relay's own effect on behaviour as the artefact's.
+        exec_consequence: plan.exec_consequence.clone(),
     }
 }
 
@@ -2622,6 +2642,7 @@ mod plan_tests {
             canaries,
             max_turns: 4,
             consequence: None,
+            exec_consequence: None,
         }
     }
 

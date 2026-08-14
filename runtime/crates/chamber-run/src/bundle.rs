@@ -596,7 +596,10 @@ mod tests {
     fn exec_consequence_is_watched_when_turns_driven() {
         let with_turns = healthy();
         let coverage = coverage_for(&with_turns);
-        assert_eq!(coverage.status(Channel::ExecConsequence), &ChannelCoverage::Watched);
+        assert_eq!(
+            coverage.status(Channel::ExecConsequence),
+            &ChannelCoverage::Watched
+        );
 
         let without_turns = Observed {
             turns_driven: 0,
