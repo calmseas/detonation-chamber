@@ -13,6 +13,16 @@
 //! the second is weaker than its own test suite believes, with nothing
 //! anywhere reporting the difference.
 //!
+//! # An assert that could not be measured did not hold
+//!
+//! Each check answers two questions, not one: did the inspection run, and what
+//! did it find. They collapse dangerously — "found no `default` route" and
+//! "produced no output" are the same string — and the collapse always favours
+//! the answer that lets the run proceed. So a check that cannot show it ran
+//! reports *did not hold*, and the run refuses to arm with the evidence
+//! attached. A refusal is recoverable; a chamber that believes it has no
+//! egress is not.
+//!
 //! # These describe the chamber network, not any network
 //!
 //! [`Preflight::run`] is meaningful only against an `--internal` network. A
@@ -136,6 +146,7 @@ impl Preflight {
             // used: an inspector that only reads should not be able to write.
             cap_add: vec!["NET_ADMIN".into(), "NET_RAW".into()],
             argv: vec!["iptables-save".into(), "-t".into(), table.to_owned()],
+            entrypoint: None,
             sysctls: vec![],
             env_file: None,
             dns: vec![],
@@ -150,6 +161,21 @@ impl Preflight {
         Ok(logs.stdout)
     }
 
+    /// Runs `ip route` in the guest image on the chamber network.
+    ///
+    /// # `ip` is the entrypoint, not the command
+    ///
+    /// `argv` alone is not enough. An image that declares an `ENTRYPOINT`
+    /// receives `argv` as *arguments to that entrypoint*, so `ip route` never
+    /// runs — and the exec-consequence relay image declares one
+    /// (`execrelayd`). Without its config in the environment `execrelayd`
+    /// refuses to start, writes the refusal to stderr and exits non-zero,
+    /// leaving stdout empty. A check that reads "no `default` line" out of an
+    /// empty stdout records the assert as *held*, which is how the egress
+    /// assert that gates arming came to pass without ever being measured on
+    /// every exec-consequence run. Overriding the entrypoint fixes the
+    /// general case; [`Preflight::judge_routing_table`] refuses to be fooled
+    /// by the specific one.
     fn check_no_default_route(
         network: &Network,
         guest_image: &str,
@@ -163,7 +189,8 @@ impl Preflight {
                 ip: None,
             },
             cap_add: vec![],
-            argv: vec!["ip".into(), "route".into()],
+            entrypoint: Some("ip".to_owned()),
+            argv: vec!["route".into()],
             sysctls: vec![],
             env_file: None,
             dns: vec![],
@@ -172,20 +199,56 @@ impl Preflight {
             volumes: vec![],
         })?;
         container.start()?;
-        container.wait(INSPECT_WINDOW)?;
+        let exit_code = container.wait(INSPECT_WINDOW)?;
         let logs = container.logs()?;
         container.destroy(INSPECT_WINDOW)?;
 
-        let routes = logs.stdout;
-        let has_default = routes
-            .lines()
-            .any(|line| line.split_whitespace().next() == Some("default"));
+        Ok(Self::judge_routing_table(
+            exit_code,
+            &logs.stdout,
+            &logs.stderr,
+        ))
+    }
 
-        Ok(AssertOutcome {
+    /// Decides what a routing table — or the absence of one — proves.
+    ///
+    /// The absence of a `default` line is evidence of isolation **only if a
+    /// routing table was printed at all**. A command that never ran produces
+    /// exactly the same "no `default` line" as a genuinely isolated cell, and
+    /// the two are not the same measurement: the first says nothing, and
+    /// reading it as the second is a safety gate reporting a result it never
+    /// obtained.
+    ///
+    /// So two things must both be true before this assert may hold: `ip route`
+    /// exited zero, and its stdout contains at least one line that is
+    /// recognisably a route. Anything else is *not held* — fail-closed, in
+    /// line with the rest of the chamber. That also covers the neighbouring
+    /// failures: a guest image with no `ip`, an entrypoint that ignored its
+    /// arguments, a container that died before it printed.
+    ///
+    /// The cost of being wrong in this direction is a legible refusal to arm
+    /// carrying the stderr that explains it. The cost of being wrong in the
+    /// other direction is a chamber that believes it has no egress.
+    fn judge_routing_table(exit_code: i32, stdout: &str, stderr: &str) -> AssertOutcome {
+        let destinations: Vec<&str> = stdout.lines().filter_map(route_destination).collect();
+        let measured = exit_code == 0 && !destinations.is_empty();
+        let has_default = destinations.contains(&"default");
+
+        AssertOutcome {
             which: StructuralAssert::NoDefaultRoute,
-            held: !has_default,
-            evidence: routes,
-        })
+            held: measured && !has_default,
+            evidence: if measured {
+                stdout.to_owned()
+            } else {
+                format!(
+                    "`ip route` printed no routing table and exited {exit_code}, so it was not \
+                     measured: the absence of a `default` line here is the absence of any output, \
+                     not evidence of isolation.\n  stdout: {}\n  stderr: {}",
+                    excerpt(stdout),
+                    excerpt(stderr),
+                )
+            },
+        }
     }
 
     fn check_no_masquerade(network: &Network, nat_table: &str) -> AssertOutcome {
@@ -276,6 +339,77 @@ fn bridge_name(network_id: &str) -> String {
     format!("br-{short}")
 }
 
+/// Route types `ip route` may print ahead of the destination.
+///
+/// `ip` omits `unicast` in the common case and prints the rest, so
+/// `blackhole 10.1.0.0/24` is a route line whose first token is not its
+/// destination.
+const ROUTE_TYPES: [&str; 9] = [
+    "unicast",
+    "local",
+    "broadcast",
+    "multicast",
+    "throw",
+    "unreachable",
+    "prohibit",
+    "blackhole",
+    "nat",
+];
+
+/// The destination of one routing-table line, or `None` if the line is not a
+/// route at all.
+///
+/// `ip route` prints one route per line, destination first — `default via
+/// 10.66.0.1 dev eth0`, `10.66.0.0/24 dev eth0 scope link src 10.66.0.2` —
+/// optionally preceded by a route type. Recognising the destination is what
+/// lets the check tell "a table with no default route" from "not a table":
+/// a usage banner, a daemon's startup refusal and an empty stream all yield
+/// no destinations, and none of them measured anything.
+fn route_destination(line: &str) -> Option<&str> {
+    let mut tokens = line.split_whitespace();
+    let first = tokens.next()?;
+    let destination = if ROUTE_TYPES.contains(&first) {
+        tokens.next()?
+    } else {
+        first
+    };
+
+    (destination == "default" || is_address_like(destination)).then_some(destination)
+}
+
+/// Whether a token could be an address or prefix, in either family.
+///
+/// Deliberately loose — it separates `10.66.0.0/24` and `fe80::/64` from
+/// `dev`, `execrelayd:` and `Usage:`, which is all it is asked to do. Parsing
+/// addresses properly here would buy nothing: the question is whether the
+/// guest printed a routing table, not whether the engine's addresses are
+/// well-formed.
+fn is_address_like(token: &str) -> bool {
+    let host = token.split('/').next().unwrap_or(token);
+    !host.is_empty()
+        && host
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() || c == '.' || c == ':')
+        && host.chars().any(|c| c == '.' || c == ':')
+}
+
+/// A bounded, trimmed excerpt for an evidence string.
+///
+/// The stderr of a daemon that refused to start is the single most useful
+/// thing in the failure, and also the one field with no bound on its length.
+fn excerpt(text: &str) -> String {
+    const LIMIT: usize = 400;
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return "<empty>".to_owned();
+    }
+    let mut out: String = trimmed.chars().take(LIMIT).collect();
+    if trimmed.chars().nth(LIMIT).is_some() {
+        out.push('…');
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -351,6 +485,117 @@ mod tests {
             "a pair belonging to another bridge was accepted as ours: {}",
             out.evidence
         );
+    }
+
+    /// The routing table a genuinely isolated cell prints: its own subnet and
+    /// nothing else. This is the case the assert exists to recognise, and the
+    /// one every stricter reading of the output risks breaking.
+    #[test]
+    fn a_table_without_a_default_route_holds() {
+        // Measured on a live `--internal` network, busybox `ip` in alpine
+        // 3.20 — two spaces before `src` included, as it prints them.
+        let out = Preflight::judge_routing_table(
+            0,
+            "10.66.0.0/24 dev eth0 scope link  src 10.66.0.2\n",
+            "",
+        );
+        assert!(out.held, "{}", out.evidence);
+        assert!(
+            out.evidence.contains("10.66.0.0/24"),
+            "the table itself must survive as the evidence: {}",
+            out.evidence
+        );
+    }
+
+    #[test]
+    fn a_default_route_fails_the_assert() {
+        let out = Preflight::judge_routing_table(
+            0,
+            "default via 10.66.0.1 dev eth0 \n10.66.0.0/24 dev eth0 scope link  src 10.66.0.2\n",
+            "",
+        );
+        assert!(!out.held);
+    }
+
+    /// The bug this whole path was rewritten for.
+    ///
+    /// `execrelayd` is the exec-consequence relay image's `ENTRYPOINT`.
+    /// Handed no config it refuses to start, writes that to **stderr** and
+    /// exits non-zero — so `ip route` never runs and stdout is empty. Reading
+    /// that as "no `default` line, therefore isolated" made the egress assert
+    /// that gates arming vacuous on every exec-consequence run: it would have
+    /// reported `held` just the same on a host whose cells *did* have a
+    /// default route, because it was never looking at a routing table.
+    #[test]
+    fn an_empty_table_from_a_refusing_entrypoint_does_not_hold() {
+        let out = Preflight::judge_routing_table(
+            1,
+            "",
+            "execrelayd: refusing to start — CHAMBER_EXEC_CONSEQUENCE_SPEC_B64 is absent, \
+             malformed, or invalid\n",
+        );
+        assert!(
+            !out.held,
+            "a check that never ran was reported as isolation confirmed: {}",
+            out.evidence
+        );
+        assert!(
+            out.evidence.contains("execrelayd"),
+            "the stderr that explains the empty table is the whole diagnosis and must be kept: {}",
+            out.evidence
+        );
+        assert!(
+            out.evidence.contains("exited 1"),
+            "the exit status is what distinguishes this from an empty table: {}",
+            out.evidence
+        );
+    }
+
+    /// Exit zero is not enough on its own. An entrypoint that accepts any
+    /// arguments and prints nothing exits zero, and there is no routing table
+    /// behind that silence either.
+    #[test]
+    fn an_empty_table_does_not_hold_even_on_a_clean_exit() {
+        let out = Preflight::judge_routing_table(0, "", "");
+        assert!(!out.held, "{}", out.evidence);
+    }
+
+    /// Output is not enough either: it has to look like a routing table. A
+    /// non-zero exit is the *usual* signal that the command never ran, not a
+    /// guaranteed one — busybox prints usage for an unknown applet, and an
+    /// image whose entrypoint greets and exits does so successfully.
+    #[test]
+    fn output_that_is_not_a_routing_table_does_not_hold() {
+        let out = Preflight::judge_routing_table(
+            0,
+            "BusyBox v1.36.1 (2024-01-01) multi-call binary.\nUsage: ip [OPTIONS] ...\n",
+            "",
+        );
+        assert!(
+            !out.held,
+            "a usage banner was accepted as a routing table: {}",
+            out.evidence
+        );
+    }
+
+    /// The looser shapes `ip route` can print must still read as a table, or
+    /// the fail-closed rule above starts refusing genuinely isolated cells.
+    #[test]
+    fn typed_and_v6_routes_are_still_a_table() {
+        let out = Preflight::judge_routing_table(
+            0,
+            "blackhole 10.1.0.0/24\nfe80::/64 dev eth0 proto kernel metric 256 pref medium\n",
+            "",
+        );
+        assert!(out.held, "{}", out.evidence);
+    }
+
+    /// A default route announced with its type spelled out is the same default
+    /// route. Matching only on the line's first token would miss it.
+    #[test]
+    fn a_typed_default_route_is_still_a_default_route() {
+        let out = Preflight::judge_routing_table(0, "unicast default via 10.66.0.1 dev eth0\n", "");
+        assert!(!out.held, "{}", out.evidence);
     }
 
     /// One direction is not containment. An outbound-only drop still lets the

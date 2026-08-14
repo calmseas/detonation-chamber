@@ -4,7 +4,7 @@ use chamber_capture::exec_consequence::{
     ArgvMatcher, ExecConsequencePlan, ExecConsequenceRule, ExecVerb,
 };
 use chamber_evidence::{Channel, ChannelCoverage, ObservationKind, OpenedBundle};
-use chamber_isolation::{Attach, Container, ContainerSpec};
+use chamber_isolation::{Attach, Container, ContainerSpec, NetFabric, Preflight, StructuralAssert};
 use chamber_run::{
     ArmingRefusal, DetonationPlan, ImageTags, PlantedCanary, ScriptedTurns, run_detonation,
 };
@@ -67,6 +67,9 @@ fn start_cell_with_volumes(plan: &ExecConsequencePlan, volumes: Vec<String>) -> 
         attach: Attach::None,
         cap_add: vec![],
         argv: vec![],
+        // The image's own `execrelayd` entrypoint, exactly as production
+        // starts it.
+        entrypoint: None,
         sysctls: vec![],
         env_file: Some(env_file.path().clone()),
         dns: vec![],
@@ -2305,5 +2308,56 @@ fn an_exec_consequence_against_a_relayless_guest_image_refuses_to_arm() {
         !evidence.exists(),
         "a refusal must write nothing, but {} was created",
         evidence.display()
+    );
+}
+
+/// The egress assert must be *measured* against the relay image, not merely
+/// reported as held.
+///
+/// `run_detonation` runs the preflight against `plan.images.guest`, which for
+/// any exec-consequence plan is this image — and this image's `ENTRYPOINT` is
+/// `execrelayd`, which without its spec in the environment refuses to start,
+/// prints to stderr and exits non-zero. The routing check used to hand
+/// `["ip", "route"]` in as `argv`, where it became arguments to `execrelayd`
+/// and never ran; the empty stdout that produced contained no `default` line,
+/// and the assert recorded `held`. It would have recorded `held` just as
+/// readily on an engine that left the cells a default route.
+///
+/// So `held` alone proves nothing here and is not what this asserts. The
+/// evidence has to be a real routing table naming the chamber's own subnet —
+/// which only exists if `ip route` actually ran inside the relay image.
+#[test]
+fn the_egress_assert_reads_a_real_routing_table_out_of_the_relay_image() {
+    let Some(_engine) = require_containers() else {
+        return;
+    };
+    ensure_images_including(&[IMAGE]);
+    let _serialised = chamber_subnet_lock();
+
+    let fabric = NetFabric::raise().expect("raise the chamber fabric");
+    let subnet = fabric.egress().subnet().to_owned();
+    // Torn down before anything can panic: a leaked `chamber-egress` fails
+    // every later test in this binary with "Pool overlaps".
+    let measured = Preflight::run(fabric.egress(), IMAGE, "chamber-inspector:test");
+    let _ = fabric.destroy();
+
+    let preflight = measured.expect("the preflight inspections must be performable");
+    let route = preflight
+        .outcomes()
+        .iter()
+        .find(|o| o.which == StructuralAssert::NoDefaultRoute)
+        .expect("the routing assert must be among the outcomes");
+
+    assert!(
+        route.evidence.contains(&subnet),
+        "the routing check produced no table mentioning {subnet}, so it did not run inside \
+         {IMAGE} — held={} evidence: {}",
+        route.held,
+        route.evidence
+    );
+    assert!(
+        route.held,
+        "the chamber network left the relay cell a default route: {}",
+        route.evidence
     );
 }

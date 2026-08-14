@@ -252,6 +252,7 @@ fn containment_probe_is_capable_of_succeeding_when_unarmed() {
         },
         cap_add: vec![],
         argv: vec![],
+        entrypoint: None,
         sysctls: vec![],
         env_file: Some(sink_env.path().clone()),
         dns: vec![],
@@ -291,6 +292,7 @@ fn containment_probe_is_capable_of_succeeding_when_unarmed() {
         // unattainable by the thing it is a baseline for.
         cap_add: vec![],
         argv: vec!["probe".into(), "unarmed".into()],
+        entrypoint: None,
         sysctls: vec![],
         env_file: Some(probe_env.path().clone()),
         dns: vec!["10.77.0.50".into()],
@@ -462,6 +464,7 @@ fn the_armed_chamber_blocks_and_records_what_the_baseline_reached() {
         argv: std::iter::once("probe".to_owned())
             .chain(ARMED_ROWS.iter().map(|s| (*s).to_owned()))
             .collect(),
+        entrypoint: None,
         sysctls: vec![],
         env_file: None,
         dns: vec![],
@@ -632,6 +635,7 @@ fn an_inbound_connection_to_the_cell_is_refused_and_counted() {
                 NetFabric::WARDEN_IP
             ),
         ],
+        entrypoint: None,
         sysctls: vec![],
         env_file: None,
         dns: vec![],
@@ -863,6 +867,7 @@ fn the_observer_refuses_the_proxied_request_and_answers_every_name() {
         },
         cap_add: vec![],
         argv: vec![],
+        entrypoint: None,
         sysctls: vec![],
         env_file: Some(capture_env.path().clone()),
         dns: vec![],

@@ -96,6 +96,9 @@ impl AgentCell {
             // ran the artefact directly would end the container the moment it
             // finished, taking the namespace's observability window with it.
             argv: vec!["sleep".into(), "infinity".into()],
+            // The image's own entrypoint, whatever it is. The relay-capable
+            // guest starts `execrelayd` here, and that is the point of it.
+            entrypoint: None,
             sysctls: vec![],
             env_file: Some(env_file.path().clone()),
             dns: vec![],

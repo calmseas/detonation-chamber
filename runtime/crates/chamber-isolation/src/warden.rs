@@ -270,6 +270,7 @@ impl Warden {
             // touch.
             cap_add: vec!["NET_ADMIN".into()],
             argv: vec!["sleep".into(), "infinity".into()],
+            entrypoint: None,
             sysctls: vec![],
             env_file: None,
             // The resolver is configured HERE, not on the agent cell, and that

@@ -393,6 +393,18 @@ pub struct ContainerSpec {
     pub cap_add: Vec<String>,
     /// `--cap-drop ALL` is applied unconditionally and is not configurable.
     pub argv: Vec<String>,
+    /// `--entrypoint`, replacing whatever the image declares. `None` leaves the
+    /// image's own entrypoint in place, which is what everything that wants to
+    /// run the image *as itself* should use.
+    ///
+    /// It exists for the one caller that wants to run a command *in* an image
+    /// rather than run the image: [`crate::preflight`]'s routing check, which
+    /// needs `ip route` out of the guest image. An image with an `ENTRYPOINT`
+    /// — the exec-consequence relay's is `execrelayd` — swallows `argv` as
+    /// arguments to that entrypoint, so the command never runs. Left
+    /// unoverridden that produced no output at all, which the routing check
+    /// then read as "no default route". See `check_no_default_route`.
+    pub entrypoint: Option<String>,
     /// Sysctls the cell needs. Applied with `--sysctl`.
     pub sysctls: Vec<(String, String)>,
     /// A 0600 file of `KEY=VALUE` lines, passed as `--env-file`.
@@ -585,6 +597,10 @@ impl Container {
         for cap in &spec.cap_add {
             argv.push("--cap-add".into());
             argv.push(cap.clone());
+        }
+        if let Some(entrypoint) = &spec.entrypoint {
+            argv.push("--entrypoint".into());
+            argv.push(entrypoint.clone());
         }
         for (k, v) in &spec.sysctls {
             argv.push("--sysctl".into());

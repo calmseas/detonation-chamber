@@ -699,6 +699,7 @@ fn start_observer(
         },
         cap_add: vec![],
         argv: vec![],
+        entrypoint: None,
         sysctls: vec![],
         env_file: Some(env_file.path().clone()),
         dns: vec![],
