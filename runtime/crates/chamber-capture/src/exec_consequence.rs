@@ -36,14 +36,30 @@ pub enum ExecVerb {
     /// Let the real command run; transform its captured output before the
     /// caller ever sees it. Literal substring find/replace in v1 — not
     /// regex, to keep the guest-side C matcher simple and injection-free.
+    ///
+    /// `skip_serializing_if` on all four fields, not just `default` on
+    /// deserialize: the guest-side C parser (`config.c`'s `load_verb`) treats
+    /// "key present" (a non-NULL `json_object_get` pointer) as "value
+    /// supplied", regardless of whether that value is a JSON string or a JSON
+    /// `null` — it never inspects the value's type before handing it to
+    /// `json_as_string`, which returns NULL for anything that isn't a string,
+    /// which `copy_str` then treats as a hard parse error. Without
+    /// `skip_serializing_if`, serde's default behaviour serializes a `None`
+    /// as an explicit `"stderr_find":null` rather than omitting the key, so a
+    /// rule setting only stdout_find/stdout_replace (the ordinary one-sided
+    /// case — see `exec_consequence.rs`'s own
+    /// `rewrite_transforms_output_of_a_real_run` test) produced a spec that
+    /// made `execrelayd` refuse to start outright. Confirmed live: the guest
+    /// container exited immediately with "execrelayd: refusing to start —
+    /// CHAMBER_EXEC_CONSEQUENCE_SPEC_B64 is absent, malformed, or invalid".
     Rewrite {
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         stdout_find: Option<String>,
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         stdout_replace: Option<String>,
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         stderr_find: Option<String>,
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         stderr_replace: Option<String>,
     },
     /// Run nothing; the caller observes exactly this canned result.
@@ -329,6 +345,49 @@ mod tests {
             max_concurrent_handlers: 4,
         };
         let json = serde_json::to_string(&plan).unwrap();
+        let back: ExecConsequencePlan = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, plan);
+    }
+
+    #[test]
+    fn one_sided_rewrite_omits_the_unset_pair_from_the_wire_json() {
+        // Regression test for a real bug found via chamber-e2e's live-container
+        // suite (Task 11): the guest-side C parser (config.c's load_verb)
+        // treats a JSON key's mere PRESENCE as "value supplied", even when
+        // that value is a JSON `null` — it never checks the value's type
+        // before extracting a string from it. Serializing an unset
+        // Option<String> as `"stderr_find":null` (serde's default behaviour
+        // without skip_serializing_if) made execrelayd refuse to start for
+        // any one-sided rewrite rule — which is the ordinary case; a caller
+        // wanting only stdout rewritten has no reason to also set stderr
+        // fields. The fix is `skip_serializing_if` on all four Rewrite
+        // fields, asserted here directly on the wire text rather than through
+        // a round trip: round-tripping alone can't catch this, because
+        // deserializing `null` back into `None` via `#[serde(default)]`
+        // hides the very shape that broke the C side.
+        let plan = ExecConsequencePlan {
+            rules: vec![ExecConsequenceRule {
+                name: "rw".to_owned(),
+                match_argv: ArgvMatcher::Argv0 {
+                    name: "/bin/echo".to_owned(),
+                },
+                verb: ExecVerb::Rewrite {
+                    stdout_find: Some("secret".to_owned()),
+                    stdout_replace: Some("REDACTED".to_owned()),
+                    stderr_find: None,
+                    stderr_replace: None,
+                },
+            }],
+            timeout_ms: 60_000,
+            max_concurrent_handlers: 32,
+        };
+        let json = serde_json::to_string(&plan).unwrap();
+        assert!(!json.contains("stderr_find"), "stderr_find should be omitted, not nulled: {json}");
+        assert!(!json.contains("stderr_replace"), "stderr_replace should be omitted, not nulled: {json}");
+        assert!(json.contains("\"stdout_find\":\"secret\""));
+
+        // Still round-trips cleanly: absence on the wire deserializes back to
+        // None via #[serde(default)], same as an explicit null used to.
         let back: ExecConsequencePlan = serde_json::from_str(&json).unwrap();
         assert_eq!(back, plan);
     }

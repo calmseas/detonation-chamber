@@ -124,6 +124,30 @@ pub fn ensure_images() {
     *done = true;
 }
 
+/// [`ensure_images`], plus any of the given extra image tags this test binary
+/// needs — currently just `chamber-guest-exec-relay:test`, built from
+/// `runtime/images/guest-exec-relay`. A separate memoisation set from
+/// `ensure_images`'s own `BUILT` flag: that flag means "the fixed core set is
+/// built", and folding an opt-in image into the same bool would make the core
+/// set's memoisation depend on which extra tags the first caller happened to
+/// ask for.
+pub fn ensure_images_including(extra: &[&str]) {
+    ensure_images();
+    static EXTRA_BUILT: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
+    let built = EXTRA_BUILT.get_or_init(|| Mutex::new(Default::default()));
+    let mut built = built.lock().unwrap_or_else(|e| e.into_inner());
+    for &tag in extra {
+        if built.contains(tag) {
+            continue;
+        }
+        if tag == "chamber-guest-exec-relay:test" {
+            build_image(&images_dir().join("guest-exec-relay"), tag)
+                .expect("could not build the guest-exec-relay image");
+        }
+        built.insert(tag.to_owned());
+    }
+}
+
 /// Serialises the tests that raise the chamber's subnet.
 ///
 /// The chamber's network name and subnet (`chamber-egress`, `10.66.0.0/24`)

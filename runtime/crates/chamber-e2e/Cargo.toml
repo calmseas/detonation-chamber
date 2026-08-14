@@ -23,6 +23,10 @@ path = "tests/no_flush_ruleset.rs"
 name = "matrix"
 path = "tests/matrix.rs"
 
+[[test]]
+name = "exec_consequence"
+path = "tests/exec_consequence.rs"
+
 [dev-dependencies]
 # The supervisor's judge trait is async, so a scripted judge in a test needs the
 # same macro the trait was declared with.
@@ -30,5 +34,9 @@ async-trait = "0.1.92"
 chamber-isolation = { path = "../chamber-isolation" }
 chamber-run = { path = "../chamber-run" }
 chamber-evidence = { path = "../chamber-evidence" }
+# default-features = false: this test only needs ExecConsequencePlan and its
+# rule/verb types, not the observer feature's proxy/DNS stack — same reasoning
+# as chamber-run's own dependency on this crate.
+chamber-capture = { path = "../chamber-capture", default-features = false }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 serde_json = "1"
