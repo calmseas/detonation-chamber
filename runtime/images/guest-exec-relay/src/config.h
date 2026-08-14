@@ -49,6 +49,42 @@
  * rejects a payload of exactly this length (`outlen >= ...`). */
 #define EXEC_RELAY_MAX_FABRICATE_BYTES 2000
 
+/* Longest CHAMBER_EXEC_CONSEQUENCE_SPEC_B64 VALUE, in base64 characters — the
+ * whole spec, not one of its fields.
+ *
+ * Every limit above bounds one field, and a plan can satisfy all of them and
+ * still be far too large in aggregate: 64 rules, each with a 32-element match
+ * argv and a 32-element replacement argv of 255-byte elements and two 2000-byte
+ * fabricate payloads, is on the order of a megabyte of JSON and around 1.4 MB
+ * once base64'd. Nothing above refuses it, and it cannot be delivered.
+ *
+ * The bound is NOT a buffer in this file — the decode mallocs and the JSON
+ * parser allocates as it goes, so there is no fixed array here to overrun, and
+ * looking for one is how this limit came to be missed. It is the KERNEL's, and
+ * it applies before any line of this program runs. The runtime hands execrelayd
+ * its environment through execve(), and Linux caps each individual argv/envp
+ * string at MAX_ARG_STRLEN = 32 * PAGE_SIZE; strnlen_user counts the NUL, so
+ * with the smallest page size in use (4096) one string may be at most 131072
+ * bytes including it, i.e. 131071 characters. "CHAMBER_EXEC_CONSEQUENCE_SPEC_B64="
+ * is 34 of those, leaving 131037 for the value. Past it execve fails E2BIG and
+ * the container never starts — no message from this program, no ArmingRefusal,
+ * just a cell that will not come up.
+ *
+ * So this is checked host-side (chamber-capture's `validate`, against the
+ * mirrored constant) to turn that into a legible refusal, and enforced here as
+ * well so the two parsers agree on a stated limit rather than on a kernel
+ * behaviour one of them cannot see. A larger PAGE_SIZE (16K/64K aarch64 kernels
+ * exist) only makes the kernel MORE permissive than this number, so the check
+ * stays the tighter of the two on every configuration — which is the direction
+ * that fails closed.
+ *
+ * Rounded DOWN to a multiple of 4 (131036, from the 131037 the arithmetic
+ * above gives) because padded base64 has no other length: no encoded spec can
+ * be exactly 131037 characters, so a limit stated there would have an
+ * unreachable boundary and no test could sit on it. Inclusive: a value of
+ * exactly this length loads. */
+#define EXEC_RELAY_MAX_SPEC_B64 131036
+
 typedef enum { MATCH_PREFIX, MATCH_EXACT, MATCH_ARGV0 } match_kind_t;
 typedef enum { VERB_SUBSTITUTE, VERB_REWRITE, VERB_FABRICATE } verb_kind_t;
 

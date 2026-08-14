@@ -11,6 +11,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include "../src/config.h"
+/* base64_encode, to build a spec of an exact encoded length with the guest's
+ * own encoder rather than a hand-rolled one. */
+#include "../src/base64.h"
 
 static void test_loads_empty_rules_with_defaults(void) {
     const char *json = "{\"rules\":[]}";
@@ -119,6 +122,73 @@ static void test_rejects_base64_with_invalid_character(void) {
     int rc = config_load_from_env(&plan);
     unsetenv("CHAMBER_EXEC_CONSEQUENCE_SPEC_B64");
     assert(rc == -1);
+}
+
+/* The one limit that is not a field's: the WHOLE spec's encoded size.
+ *
+ * Every other bound in config.h caps one value, and a plan can satisfy all of
+ * them at once and still be undeliverable — 64 rules each near its own limits
+ * base64s to well over a megabyte. Nothing refused that, on either side, and
+ * the failure it produced was the worst-shaped one available: execve() rejects
+ * an over-long environment string with E2BIG before this program's first
+ * instruction runs, so the cell simply never started, with no message from
+ * anything that knew why.
+ *
+ * Built here as valid, decodable base64 of valid JSON, one character past the
+ * limit — so what is measured is the length check and not a decode or parse
+ * failure: the value is refused before base64_decode is ever asked for it. The
+ * boundary is inclusive, so the at-limit case must LOAD, and load as a real
+ * plan rather than merely fail to be refused. */
+static void test_spec_total_size_edge(void) {
+    struct exec_plan plan;
+
+    /* A JSON document padded to exactly the byte count whose base64 is
+     * EXEC_RELAY_MAX_SPEC_B64 characters. The limit is a multiple of 4 and
+     * base64 is 4 characters per 3 bytes, so this divides exactly and the
+     * encoding carries no padding. */
+    const size_t want_json = ((size_t)EXEC_RELAY_MAX_SPEC_B64 / 4) * 3;
+    const char *head = "{\"timeout_ms\":60000,\"pad\":\"";
+    const char *tail = "\",\"rules\":[]}";
+    assert(want_json > strlen(head) + strlen(tail));
+    size_t padlen = want_json - strlen(head) - strlen(tail);
+
+    char *json = malloc(want_json + 1);
+    assert(json != NULL);
+    memcpy(json, head, strlen(head));
+    memset(json + strlen(head), 'p', padlen);
+    memcpy(json + strlen(head) + padlen, tail, strlen(tail) + 1);
+    assert(strlen(json) == want_json);
+
+    /* The guest's own encoder, so the length asserted here is the length the
+     * guest would actually be handed. */
+    char *b64 = base64_encode(json, strlen(json));
+    assert(b64 != NULL);
+    assert(strlen(b64) == (size_t)EXEC_RELAY_MAX_SPEC_B64);
+
+    setenv("CHAMBER_EXEC_CONSEQUENCE_SPEC_B64", b64, 1);
+    int at_limit = config_load_from_env(&plan);
+    unsetenv("CHAMBER_EXEC_CONSEQUENCE_SPEC_B64");
+    assert(at_limit == 0);
+    assert(plan.n_rules == 0);
+    assert(plan.timeout_ms == 60000);
+
+    /* One character more. */
+    size_t n = strlen(b64);
+    char *past = malloc(n + 2);
+    assert(past != NULL);
+    memcpy(past, b64, n);
+    past[n] = 'A';
+    past[n + 1] = '\0';
+    assert(strlen(past) == (size_t)EXEC_RELAY_MAX_SPEC_B64 + 1);
+
+    setenv("CHAMBER_EXEC_CONSEQUENCE_SPEC_B64", past, 1);
+    int over = config_load_from_env(&plan);
+    unsetenv("CHAMBER_EXEC_CONSEQUENCE_SPEC_B64");
+    assert(over == -1);
+
+    free(past);
+    free(b64);
+    free(json);
 }
 
 /* ---------------------- the limits, at their exact edges -------------------
@@ -265,6 +335,7 @@ int main(void) {
     test_rejects_exit_code_out_of_int32_range();
     test_rejects_max_concurrent_handlers_out_of_uint32_range();
     test_rejects_base64_with_invalid_character();
+    test_spec_total_size_edge();
     test_fabricate_payload_edge();
     test_rule_name_edge();
     test_argv_edges();

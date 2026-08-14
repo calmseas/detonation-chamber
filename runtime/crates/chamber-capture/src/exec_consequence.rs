@@ -55,6 +55,30 @@ pub mod guest_limits {
     /// `EXEC_RELAY_MAX_FABRICATE_BYTES` — fabricate stdout/stderr budget.
     /// EXCLUSIVE: `config.c` rejects a payload of exactly this length.
     pub const MAX_FABRICATE_BYTES: usize = 2000;
+    /// `EXEC_RELAY_MAX_SPEC_B64` — longest base64 spec VALUE the guest can be
+    /// handed at all, counting the whole encoded document rather than any one
+    /// field. Inclusive.
+    ///
+    /// Every other limit here bounds a single value, and a plan can satisfy all
+    /// of them and still be undeliverable: `MAX_RULES` rules, each with two
+    /// `MAX_ARGV`-element argvs of `MAX_ARGV_ELEM` bytes and two
+    /// `MAX_FABRICATE_BYTES` payloads, is roughly a megabyte of JSON — 1.4 MB
+    /// once base64'd, and every per-field check passes.
+    ///
+    /// The guest-side ceiling is NOT a buffer (the decode mallocs and the JSON
+    /// parser allocates as it goes) — it is the kernel's. The spec travels as
+    /// one environment variable, the runtime hands it to `execrelayd` through
+    /// `execve`, and Linux caps each individual argv/envp string at
+    /// `MAX_ARG_STRLEN` = `32 * PAGE_SIZE`. At the smallest page size in use
+    /// that is 131072 bytes including the NUL, less the 34 characters of
+    /// `CHAMBER_EXEC_CONSEQUENCE_SPEC_B64=`, rounded down to a multiple of 4
+    /// because padded base64 has no other length. Past it `execve` fails
+    /// `E2BIG` and the cell never starts — no message, no `ArmingRefusal`, just
+    /// a container that will not come up. Checked here so that is a legible
+    /// host-side refusal instead, and restated in `config.h` (and enforced by
+    /// `config_load_from_env`) so the two parsers agree on a stated number
+    /// rather than on a kernel behaviour only one of them can observe.
+    pub const MAX_SPEC_B64: usize = 131_036;
     /// Largest `timeout_ms` the guest carries FAITHFULLY — 2^53.
     ///
     /// Not a `#define`: it falls out of how `json.c` parses numbers, which is
@@ -233,6 +257,17 @@ pub enum ExecConsequenceConfigError {
         rule_index: usize,
         pair: &'static str,
     },
+    /// The whole base64-encoded spec is larger than the guest can be handed —
+    /// see [`guest_limits::MAX_SPEC_B64`]. The only limit here that is not a
+    /// property of one field: a plan can pass every per-field check and still
+    /// combine into a document that cannot be delivered, which is the exact
+    /// host-accepts/guest-refuses shape the other limits were aligned to close.
+    /// It is also the worst-presenting one, because the refusal happens in
+    /// `execve` before `execrelayd` runs: without this check the operator sees
+    /// a cell that will not start and nothing at all about why.
+    SpecTooLarge {
+        encoded_len: usize,
+    },
     TimeoutZero,
     MaxConcurrentHandlersZero,
 }
@@ -306,6 +341,15 @@ impl std::fmt::Display for ExecConsequenceConfigError {
             Self::AsymmetricRewritePair { rule_index, pair } => write!(
                 f,
                 "rule {rule_index}'s rewrite.{pair}_find/{pair}_replace must both be set or both be absent, not just one"
+            ),
+            Self::SpecTooLarge { encoded_len } => write!(
+                f,
+                "the plan encodes to {encoded_len} base64 characters; {EXEC_SPEC_B64_VAR} \
+                 travels to the guest as one environment variable and the kernel accepts at \
+                 most {} for it, past which execve fails E2BIG and the cell never starts. \
+                 Every individual field is within its own limit — it is the total that is \
+                 not, so the fix is fewer or smaller rules rather than a shorter single value",
+                guest_limits::MAX_SPEC_B64
             ),
             Self::TimeoutZero => write!(f, "timeout_ms must be nonzero"),
             Self::MaxConcurrentHandlersZero => write!(f, "max_concurrent_handlers must be nonzero"),
@@ -471,7 +515,29 @@ impl ExecConsequencePlan {
                 }
             }
         }
+        // LAST, and on the whole document rather than on any field — the one
+        // check here that no per-field pass could ever subsume. Reported after
+        // the field checks deliberately: "rule 7's name is too long" is a
+        // better first answer than "the total is too big" when both are true,
+        // because it names something the operator can act on directly.
+        //
+        // Encoded rather than estimated: the transport carries base64, the
+        // guest's limit is stated in base64 characters, and
+        // `to_env_pairs` produces the very string this measures. `encode_len`
+        // is exact for a padded encoding, so this needs no allocation of the
+        // encoded form itself.
+        let encoded_len = BASE64.encode_len(self.wire_json().len());
+        if encoded_len > guest_limits::MAX_SPEC_B64 {
+            return Err(ExecConsequenceConfigError::SpecTooLarge { encoded_len });
+        }
         Ok(())
+    }
+
+    /// The exact JSON `to_env_pairs` base64s. One place, so the size
+    /// `validate` measures and the bytes the guest receives cannot be
+    /// different documents.
+    fn wire_json(&self) -> String {
+        serde_json::to_string(self).expect("ExecConsequencePlan always serializes")
     }
 
     /// First rule whose matcher matches `argv`. `None` means passthrough.
@@ -510,8 +576,10 @@ impl ExecConsequencePlan {
 
     #[must_use]
     pub fn to_env_pairs(&self) -> Vec<(String, String)> {
-        let json = serde_json::to_string(self).expect("ExecConsequencePlan always serializes");
-        vec![(EXEC_SPEC_B64_VAR.to_owned(), BASE64.encode(json.as_bytes()))]
+        vec![(
+            EXEC_SPEC_B64_VAR.to_owned(),
+            BASE64.encode(self.wire_json().as_bytes()),
+        )]
     }
 }
 
@@ -1098,6 +1166,107 @@ mod tests {
         assert!(plan.validate().is_err());
     }
 
+    /// A plan every per-field check passes and the guest cannot be handed.
+    ///
+    /// This is the gap the field-by-field alignment left open. Each limit above
+    /// was carefully matched to `config.c`, boundary conventions and all — and
+    /// none of them says anything about the TOTAL. `MAX_RULES` rules, each
+    /// individually valid and each near its own ceilings, encodes to well over
+    /// a megabyte, and the failure it produces is the worst-presenting one in
+    /// this whole system: `execve` refuses the environment string with `E2BIG`
+    /// before `execrelayd` runs, so there is no guest-side error message, no
+    /// `ArmingRefusal`, and no bundle — only a cell that will not come up.
+    ///
+    /// Built out of `Fabricate` payloads because they are the largest per-rule
+    /// field, so the plan stays small in rule count and obviously legitimate:
+    /// nothing about it is a stress shape, it is 64 ordinary rules with big
+    /// canned outputs.
+    #[test]
+    fn a_plan_valid_field_by_field_can_still_be_too_large_in_aggregate() {
+        let payload = "x".repeat(guest_limits::MAX_FABRICATE_BYTES - 1);
+        let plan = ExecConsequencePlan {
+            rules: (0..guest_limits::MAX_RULES)
+                .map(|i| ExecConsequenceRule {
+                    name: format!("rule-{i}"),
+                    match_argv: ArgvMatcher::Argv0 {
+                        name: format!("/bin/tool-{i}"),
+                    },
+                    verb: fabricate(payload.clone(), payload.clone()),
+                })
+                .collect(),
+            timeout_ms: 60_000,
+            max_concurrent_handlers: 32,
+        };
+
+        let encoded_len = plan.to_env_pairs().remove(0).1.len();
+        assert!(
+            encoded_len > guest_limits::MAX_SPEC_B64,
+            "this plan is supposed to be over the transport limit; it encoded to \
+             {encoded_len}"
+        );
+        assert_eq!(
+            plan.validate().unwrap_err(),
+            ExecConsequenceConfigError::SpecTooLarge { encoded_len },
+            "a plan that cannot be delivered must be refused here, where the operator \
+             can read why, and not by execve inside the engine"
+        );
+        // And the message says the thing that is actually actionable: it is the
+        // total, not any one field.
+        let printed = ExecConsequenceConfigError::SpecTooLarge { encoded_len }.to_string();
+        assert!(printed.contains(EXEC_SPEC_B64_VAR), "{printed}");
+        assert!(printed.contains("total"), "{printed}");
+    }
+
+    /// The boundary, walked from below rather than asserted from above.
+    ///
+    /// A check that refused everything large would be as wrong as one that
+    /// refused nothing, and a test that merely validates something comfortably
+    /// small would not tell the difference. This adds rules one at a time until
+    /// the next one would cross the transport limit, then asserts BOTH sides of
+    /// that step: the largest plan that fits validates, and the one rule more
+    /// is refused as `SpecTooLarge` — not as `TooManyRules`, which is a
+    /// different limit that this shape stays well inside.
+    #[test]
+    fn the_transport_limit_admits_the_largest_plan_that_fits_and_refuses_the_next() {
+        let payload = "x".repeat(guest_limits::MAX_FABRICATE_BYTES - 1);
+        let mut plan = ExecConsequencePlan {
+            rules: vec![],
+            timeout_ms: 60_000,
+            max_concurrent_handlers: 32,
+        };
+        loop {
+            let mut next = plan.clone();
+            let i = next.rules.len();
+            next.rules.push(ExecConsequenceRule {
+                name: format!("rule-{i}"),
+                match_argv: ArgvMatcher::Argv0 {
+                    name: format!("/bin/tool-{i}"),
+                },
+                verb: fabricate(payload.clone(), String::new()),
+            });
+            assert!(
+                next.rules.len() <= guest_limits::MAX_RULES,
+                "this shape was supposed to hit the size limit well before the rule-count \
+                 one; it did not, so the test is measuring the wrong limit"
+            );
+            let encoded_len = next.to_env_pairs().remove(0).1.len();
+            if encoded_len > guest_limits::MAX_SPEC_B64 {
+                assert_eq!(
+                    next.validate().unwrap_err(),
+                    ExecConsequenceConfigError::SpecTooLarge { encoded_len }
+                );
+                break;
+            }
+            plan = next;
+        }
+        assert!(
+            !plan.rules.is_empty(),
+            "one rule of this size must fit, or the limit is set absurdly low"
+        );
+        plan.validate()
+            .expect("the largest plan that fits the transport must not be refused");
+    }
+
     /// The constants above are a copy of the guest's, and a copy is a thing
     /// that drifts. This reads the actual C headers and fails if any of them
     /// has moved — which is the only way the two parsers can be kept honest
@@ -1149,6 +1318,10 @@ mod tests {
         assert_eq!(
             defined(&protocol_h, "EXEC_RELAY_MAX_ARGV"),
             guest_limits::MAX_ARGV
+        );
+        assert_eq!(
+            defined(&config_h, "EXEC_RELAY_MAX_SPEC_B64"),
+            guest_limits::MAX_SPEC_B64
         );
     }
 
