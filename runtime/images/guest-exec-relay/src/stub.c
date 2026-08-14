@@ -5,15 +5,37 @@
 #include <string.h>
 #include <unistd.h>
 #include <stdint.h>
+#include <stddef.h>
 #include <errno.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 
-/* Must match relayd.c's SOCK_PATH exactly. Under /work (the only tmpfs the
- * real read-only cell provides), inside a hidden subdirectory execrelayd
- * creates at startup. */
-#define SOCK_PATH "/work/.exec-relay/relay.sock"
+/* Must match relayd.c's SOCK_ABSTRACT_NAME byte for byte — the two are a
+ * matched pair with no filesystem artefact to discover the name from.
+ *
+ * Linux ABSTRACT namespace, not a path: the socket has no directory entry, so
+ * it cannot be unlinked or pre-empted by anything holding mere write access to
+ * /work — which the sandboxed agent under evaluation does hold, and can run
+ * arbitrary root commands with. A filesystem socket there would be removable
+ * and re-bindable by the agent, letting it switch off or impersonate the very
+ * interception layer that is watching it. The leading NUL is prepended when
+ * the address is built (see below); it is part of the name, not a terminator. */
+#define SOCK_ABSTRACT_NAME "chamber-exec-relay"
+_Static_assert(sizeof(SOCK_ABSTRACT_NAME) <= sizeof(((struct sockaddr_un *)0)->sun_path),
+               "abstract socket name must fit sun_path alongside its leading NUL");
 #define MAX_FRAME_LEN 65536
+
+/* Mirror of relayd.c's fill_abstract_addr. The addrlen is what carries the
+ * name's length to the kernel — an abstract name is not NUL-terminated — so it
+ * must be offsetof(...sun_path) + 1 + strlen(name), never sizeof(*addr). */
+static socklen_t fill_abstract_addr(struct sockaddr_un *addr) {
+    memset(addr, 0, sizeof(*addr));
+    addr->sun_family = AF_UNIX;
+    size_t n = strlen(SOCK_ABSTRACT_NAME);
+    addr->sun_path[0] = '\0';
+    memcpy(addr->sun_path + 1, SOCK_ABSTRACT_NAME, n);
+    return (socklen_t)(offsetof(struct sockaddr_un, sun_path) + 1 + n);
+}
 
 static ssize_t read_full(int fd, void *buf, size_t n) {
     char *p = buf; size_t left = n;
@@ -53,9 +75,9 @@ int main(int argc, char **argv) {
         perror("stub: socket");
         return 111;
     }
-    struct sockaddr_un addr = { .sun_family = AF_UNIX };
-    strncpy(addr.sun_path, SOCK_PATH, sizeof(addr.sun_path)-1);
-    if (connect(sfd, (struct sockaddr*)&addr, sizeof(addr)) != 0) {
+    struct sockaddr_un addr;
+    socklen_t addrlen = fill_abstract_addr(&addr);
+    if (connect(sfd, (struct sockaddr*)&addr, addrlen) != 0) {
         perror("stub: connect");
         close(sfd);
         return 111;

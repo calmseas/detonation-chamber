@@ -38,17 +38,53 @@ struct arm64_regs {
     unsigned long long pstate;
 };
 
-/* Both the control socket and the disclosure log live under a hidden
- * subdirectory of the /work tmpfs. The real cell (chamber-isolation's
- * AgentCell::start) runs read-only with a tmpfs ONLY at /work — /tmp does not
- * exist as a writable path there, so a socket under /tmp cannot be bound.
- * /work/.exec-relay/ keeps both artefacts inside the one writable filesystem
- * that always exists, and folds them out of the agent's bare working directory
- * so a casual `ls /work` does not surface them (coherent-per-tool, not
- * forensic-proof — that is this project's stated bar). RELAY_DIR is created in
- * main() before either is opened. */
+/* The disclosure log is a regular file under a hidden subdirectory of the
+ * /work tmpfs. The real cell (chamber-isolation's AgentCell::start) runs
+ * read-only with a tmpfs ONLY at /work — /tmp does not exist as a writable
+ * path there, so nothing of ours can live under /tmp. /work/.exec-relay/ keeps
+ * the log inside the one writable filesystem that always exists, and folds it
+ * out of the agent's bare working directory so a casual `ls /work` does not
+ * surface it (coherent-per-tool, not forensic-proof — that is this project's
+ * stated bar). RELAY_DIR is created in main() before the log is opened.
+ *
+ * The CONTROL SOCKET deliberately does NOT live there. /work is writable by
+ * the sandboxed agent under evaluation, and TurnDirective::RunCommand runs
+ * arbitrary commands in the cell as root, so a socket at a filesystem path
+ * under /work could be `rm`ed and re-bound by the very agent this relay exists
+ * to observe — disabling or spoofing the entire interception and disclosure
+ * mechanism. Linux's ABSTRACT socket namespace has no filesystem entry at all:
+ * the name is owned by the network namespace, not by any directory, so
+ * filesystem write access to /work grants no purchase on it, and the name
+ * cannot be pre-empted while execrelayd holds it (a second bind() gets
+ * EADDRINUSE) nor unlinked. It also vanishes with the socket, so there is no
+ * stale entry to clean up on restart. */
 #define RELAY_DIR "/work/.exec-relay"
-#define SOCK_PATH RELAY_DIR "/relay.sock"
+
+/* The abstract name, WITHOUT its leading NUL — that byte is prepended when the
+ * address is filled in. stub.c must define this to the identical string; the
+ * two are a matched pair and there is no filesystem artefact to discover it
+ * from at runtime. */
+#define SOCK_ABSTRACT_NAME "chamber-exec-relay"
+_Static_assert(sizeof(SOCK_ABSTRACT_NAME) <= sizeof(((struct sockaddr_un *)0)->sun_path),
+               "abstract socket name must fit sun_path alongside its leading NUL");
+
+/* Fills `addr` with the abstract-namespace address and returns the addrlen to
+ * hand bind()/connect(). An abstract address is NOT a C string: sun_path[0] is
+ * a NUL that is part of the name, the rest of the name follows it un-
+ * terminated, and the kernel takes the name's length from this addrlen alone.
+ * Hence offsetof(...sun_path) + 1 + strlen(name), not sizeof(*addr) — passing
+ * sizeof(*addr) would make the name the full 108-byte sun_path including its
+ * trailing zero padding, and the server's and client's names would only agree
+ * if both made the identical mistake. */
+static socklen_t fill_abstract_addr(struct sockaddr_un *addr) {
+    memset(addr, 0, sizeof(*addr));
+    addr->sun_family = AF_UNIX;
+    size_t n = strlen(SOCK_ABSTRACT_NAME);
+    addr->sun_path[0] = '\0';
+    memcpy(addr->sun_path + 1, SOCK_ABSTRACT_NAME, n);
+    return (socklen_t)(offsetof(struct sockaddr_un, sun_path) + 1 + n);
+}
+
 #define SCRATCH_SIZE 16384
 
 static void logline(const char *fmt, ...) {
@@ -278,6 +314,49 @@ static void disclosure_record(const char *turn_id, const char *requested_argv0,
     write_full(g_disclosure_fd, buf, off);
 }
 
+/* Will this trap's target actually load, or is it one of execvpe()'s PATH
+ * probes that is about to come straight back with ENOENT?
+ *
+ * The worker resolves a bare argv[0] with execvpe(), which issues one execve()
+ * per PATH entry until one loads — and the seccomp filter traps every one of
+ * them. So a single real `cat` (which the bridge issues for EVERY ReadFile
+ * directive) traps once per PATH directory: six times on this image, five of
+ * them naming files that do not exist and that nothing ever referenced.
+ * Recording those five would file five fictions in the sealed evidence bundle.
+ *
+ * musl's execvpe continues its loop on ENOENT/ENOTDIR/EACCES and stops
+ * otherwise, so "exists and is executable" is exactly the condition that ends
+ * the search — the one candidate that will actually be loaded.
+ *
+ * Resolution has to be done as the TRACEE would do it, not as this tracer
+ * would: absolute paths (which every PATH candidate is) mean the same to both,
+ * but a relative one is resolved against the tracee's own cwd — or, for
+ * execveat, against its dirfd. The tracee is stopped at the trap, so
+ * /proc/<pid>/cwd and /proc/<pid>/fd/<n> are both stable to resolve against.
+ *
+ * Returns 1 for "will load" AND for "cannot tell" — a record that this code is
+ * unsure about must stay in the log, because silently dropping a real exec is
+ * the one failure the disclosure log must never have. Returns 0 only when the
+ * target is definitively not loadable. */
+static int trap_target_is_loadable(pid_t pid, int is_execveat,
+                                    unsigned long long dirfd_reg, const char *path) {
+    if (!path || !path[0]) return 1;              /* execveat AT_EMPTY_PATH: nothing to check */
+    if (path[0] == '/') return access(path, X_OK) == 0;
+
+    char base[64];
+    int dirfd = is_execveat ? (int)(long)dirfd_reg : AT_FDCWD;
+    if (dirfd != AT_FDCWD) {
+        snprintf(base, sizeof(base), "/proc/%d/fd/%d", (int)pid, dirfd);
+    } else {
+        snprintf(base, sizeof(base), "/proc/%d/cwd", (int)pid);
+    }
+    int dfd = open(base, O_RDONLY | O_DIRECTORY);
+    if (dfd < 0) return 1;                        /* cannot resolve — keep the record */
+    int ok = faccessat(dfd, path, X_OK, 0) == 0;
+    close(dfd);
+    return ok;
+}
+
 static size_t apply_rewrite(char *buf, size_t len, const char *find, const char *replace, char *out, size_t outcap) {
     if (!find || !find[0]) { size_t n = len < outcap ? len : outcap; memcpy(out, buf, n); return n; }
     size_t findlen = strlen(find), replacelen = strlen(replace);
@@ -482,6 +561,13 @@ static int run_traced(char *const argv[], char *const envp_extra[], int envp_ext
                         char reqpath[1024];
                         read_tracee_str(w, path_reg, reqpath, sizeof(reqpath));
 
+                        /* Computed HERE, from the trap's untouched registers,
+                         * because the verb dispatch below rewrites regs[0]/
+                         * regs[1] in this local copy for substitute and
+                         * fabricate — after that point the dirfd is gone. */
+                        int will_load = trap_target_is_loadable(
+                            w, is_execveat, is_execveat ? regs.regs[0] : 0, reqpath);
+
                         unsigned long long argv_ptr_reg = is_execveat ? regs.regs[2] : regs.regs[1];
                         char tracee_argv[EXEC_RELAY_MAX_ARGV][256];
                         int tracee_argc = read_tracee_argv(w, argv_ptr_reg, tracee_argv, EXEC_RELAY_MAX_ARGV);
@@ -584,10 +670,23 @@ static int run_traced(char *const argv[], char *const envp_extra[], int envp_ext
                                       rule->has_stdout_rewrite ? rule->stdout_find : "(none)");
                         }
 
-                        logline("req=%s pid=%d syscall=%s requested=%s verb=%s rule=%s detail=%s",
+                        logline("req=%s pid=%d syscall=%s requested=%s verb=%s rule=%s detail=%s%s",
                                 req_id?req_id:"-", w, is_execveat?"execveat":"execve",
-                                reqpath, verb_name, rule_name, detail);
-                        disclosure_record(req_id, reqpath, rule_name, verb_name, detail);
+                                reqpath, verb_name, rule_name, detail,
+                                (!rule && !will_load) ? " [path-probe, not disclosed]" : "");
+                        /* Interception is unchanged: every trap was matched
+                         * against the plan above and every trap resumes below.
+                         * Only RECORDING is gated, and only for the
+                         * passthrough case. A trap that matched a rule is
+                         * always recorded whether or not its target exists —
+                         * fabricate exists precisely to answer for targets
+                         * that are not on disk (the suite's own canaries,
+                         * `touch-canary` and `/nonexistent/touch-canary`, are
+                         * both deliberately absent), and a rule firing is the
+                         * single most important thing this log has to say. */
+                        if (rule || will_load) {
+                            disclosure_record(req_id, reqpath, rule_name, verb_name, detail);
+                        }
                         active_rewrite = (rule && rule->verb == VERB_REWRITE) ? rule : NULL;
                         ptrace(PTRACE_CONT, w, 0, 0);
                     } else if (sig == SIGTRAP && event != 0) {
@@ -673,14 +772,20 @@ static void reap_finished_handlers(void) {
 }
 
 static int run_server(const struct exec_plan *plan) {
-    unlink(SOCK_PATH);
     int sfd = socket(AF_UNIX, SOCK_STREAM, 0);
-    struct sockaddr_un addr = { .sun_family = AF_UNIX };
-    strncpy(addr.sun_path, SOCK_PATH, sizeof(addr.sun_path)-1);
-    if (bind(sfd, (struct sockaddr*)&addr, sizeof(addr)) != 0) { perror("bind"); return 1; }
-    chmod(SOCK_PATH, 0666);
+    if (sfd < 0) { perror("socket"); return 1; }
+    /* No unlink() and no chmod() before/after bind: an abstract address has no
+     * directory entry to clear away or to set a mode on. Reachability is
+     * network-namespace scoped instead — every process in this cell (which is
+     * exactly stub, plus whatever the agent runs) can connect, and nothing
+     * outside the cell can. */
+    struct sockaddr_un addr;
+    socklen_t addrlen = fill_abstract_addr(&addr);
+    if (bind(sfd, (struct sockaddr*)&addr, addrlen) != 0) { perror("bind"); return 1; }
     if (listen(sfd, 64) != 0) { perror("listen"); return 1; }
-    logline("relayd listening on %s pid=%d", SOCK_PATH, getpid());
+    /* '@' is the conventional rendering of the leading NUL in an abstract
+     * name (the same form /proc/net/unix and `ss -x` print). */
+    logline("relayd listening on @%s pid=%d", SOCK_ABSTRACT_NAME, getpid());
 
     signal(SIGPIPE, SIG_IGN);
 
@@ -755,11 +860,14 @@ int main(int argc, char **argv) {
                          "is absent, malformed, or invalid\n");
         return 1;
     }
-    /* The control socket (run_server) and the disclosure log (disclosure_init)
-     * both live under RELAY_DIR; create it before either is opened. /work is a
-     * fresh tmpfs each run, so this normally does not exist yet — EEXIST is
-     * fine, anything else means neither the socket nor the log can be created
-     * and the relay cannot function, so refuse to start. */
+    /* The disclosure log (disclosure_init) lives under RELAY_DIR; create it
+     * before the log is opened. The control socket no longer needs this
+     * directory — it is abstract-namespace now — but the log genuinely does,
+     * and the log is not optional: without it a run produces no exec-
+     * consequence evidence at all. /work is a fresh tmpfs each run, so this
+     * normally does not exist yet — EEXIST is fine, anything else means the
+     * log cannot be created and the relay cannot do its job, so refuse to
+     * start. */
     if (mkdir(RELAY_DIR, 0700) != 0 && errno != EEXIST) {
         fprintf(stderr, "execrelayd: refusing to start — could not create %s: %s\n",
                 RELAY_DIR, strerror(errno));

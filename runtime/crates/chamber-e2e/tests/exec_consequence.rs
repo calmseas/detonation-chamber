@@ -60,10 +60,20 @@ fn start_cell(plan: &ExecConsequencePlan) -> CellGuard {
         // Matches production (AgentCell::start) exactly: a read-only rootfs
         // with the /work tmpfs as the ONLY writable path — no /tmp. This is
         // what exercises the relay under the real cell's constraints, where
-        // the socket and disclosure log must live under /work/.exec-relay/
-        // rather than /tmp.
+        // the disclosure log must live under /work/.exec-relay/ rather than
+        // /tmp.
+        //
+        // The bare path with NO option suffix is the point, not an omission:
+        // `AgentCell::start` builds this entry as `scratch_root().display()`
+        // and nothing more, which Docker expands to `rw,nosuid,nodev,noexec,
+        // relatime` — i.e. production's /work is NOEXEC. Writing `/work:rw,exec`
+        // here would hand the test an executable /work that production does not
+        // have, and this spec is supposed to match production exactly. Nothing
+        // in this feature executes anything out of /work (execrelayd, stub and
+        // fabricate-emit all live in /usr/local/bin on the read-only rootfs),
+        // so noexec costs the suite nothing and closes the gap.
         read_only: true,
-        tmpfs: vec!["/work:rw,exec".to_owned()],
+        tmpfs: vec!["/work".to_owned()],
         volumes: vec![],
     })
     .expect("create cell");
@@ -419,5 +429,71 @@ fn disclosure_log_is_readable_via_the_sealing_cat_path() {
         log.stdout.lines().count(),
         3,
         "1 header + 2 request records"
+    );
+}
+
+#[test]
+fn a_path_searched_bare_command_records_exactly_one_line() {
+    let Some(_engine) = require_containers() else {
+        return;
+    };
+    let _serialised = chamber_subnet_lock();
+
+    let plan = ExecConsequencePlan {
+        rules: vec![],
+        timeout_ms: 60_000,
+        max_concurrent_handlers: 32,
+    };
+    let cell = start_cell(&plan);
+    cell.start().expect("start");
+    std::thread::sleep(Duration::from_millis(300));
+
+    // A BARE name, deliberately — every other test in this file passes an
+    // absolute path, which execvpe() hands straight to execve() with no PATH
+    // search and therefore exactly one trap. The bridge does NOT: every
+    // `TurnDirective::ReadFile` runs a bare `cat` (bridge.rs's
+    // `carry_out_observed`), so the bare-name path is the one production
+    // actually takes and the one that was silently multiplying records.
+    //
+    // execvpe() tries one execve() per PATH entry until one loads, and the
+    // seccomp filter traps every attempt — `cat` lives at /bin/cat, last on
+    // this image's PATH (/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:
+    // /sbin:/bin), so SIX execve() syscalls trap for this one real command.
+    // Five of them name files that do not exist and that nothing ever asked
+    // for. Recording all six would put five fictions into the sealed evidence
+    // bundle (bundle.rs's `record_exec_consequence_log` turns every record
+    // line into an ExecConsequence observation), so the disclosure log would
+    // claim the agent referenced /usr/local/sbin/cat — which it never did.
+    let out = cell
+        .exec(&["stub", "cat", "/etc/hostname"], OP_WINDOW)
+        .expect("exec via relay");
+    assert_eq!(
+        out.status,
+        Some(0),
+        "bare `cat` should still resolve through PATH: {out:?}"
+    );
+
+    let log = cell
+        .exec(&["cat", "/work/.exec-relay/disclosure.log"], OP_WINDOW)
+        .expect("cat log");
+    // Count records the way the bundle does: every line that is not the
+    // header becomes one ExecConsequence observation.
+    let records: Vec<&str> = log
+        .stdout
+        .lines()
+        .filter(|line| !line.contains("known_residual_tells"))
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+    assert_eq!(
+        records.len(),
+        1,
+        "one real command must yield exactly one disclosure record, not one \
+         per PATH candidate probed; log was:\n{}",
+        log.stdout
+    );
+    assert!(
+        records[0].contains("\"requested_argv0\":\"/bin/cat\""),
+        "the single record must name the binary that actually ran:\n{}",
+        records[0]
     );
 }
