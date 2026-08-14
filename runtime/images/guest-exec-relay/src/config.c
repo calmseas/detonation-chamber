@@ -4,7 +4,6 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
-#include <limits.h>
 
 static int copy_str(char *dst, size_t dstsz, const char *src) {
     if (!src) return -1;
@@ -159,7 +158,7 @@ int config_load_from_env(struct exec_plan *out) {
         unsigned char c = (unsigned char)b64[i];
         if (c == '=' || c == '\n' || c == '\r') continue;
         signed char d = T[c];
-        if (d < 0 && c != 'A') { free(decoded); return -1; } /* 'A' maps validly to 0 */
+        if (d < 0) { free(decoded); return -1; } /* invalid base64 character */
         val = (val << 6) | d;
         valb += 6;
         if (valb >= 0) {

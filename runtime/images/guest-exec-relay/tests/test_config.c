@@ -2,6 +2,7 @@
 #include <assert.h>
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include "../src/config.h"
 
 static void test_loads_empty_rules_with_defaults(void) {
@@ -101,17 +102,16 @@ static void test_rejects_max_concurrent_handlers_out_of_uint32_range(void) {
 }
 
 static void test_rejects_base64_with_invalid_character(void) {
-    /* A valid base64 string with an invalid character (e.g., '!') should fail */
-    /* "SGVsbG8=" decodes to "Hello", but "SGVs!G8=" has '!' which is invalid base64 */
-    /* This test uses the env var path, which would need environment setup.
-     * Instead, we verify by checking that the base64 decoder properly rejects
-     * invalid chars. We use config_load_from_json directly since that's what
-     * gets called after base64 decode. The key point is the base64 decoder now
-     * rejects invalid chars and returns -1, which stops the config load. */
-    /* Note: Testing config_load_from_env would require setting the env var,
-     * which is integration-level testing. The unit test above for malformed
-     * JSON covers the JSON parser gate. The base64 fix ensures invalid chars
-     * return -1 before attempting JSON parse. */
+    /* Base64 string with an invalid character ('!') should be rejected.
+     * '!' is not in the base64 alphabet (A-Z, a-z, 0-9, +, /).
+     * Under the old broken table, it would decode as 0 (same as 'A').
+     * With the fix, the lookup table correctly initializes to -1, so
+     * invalid characters return -1 and the config load fails. */
+    setenv("CHAMBER_EXEC_CONSEQUENCE_SPEC_B64", "SGVs!bG8=", 1);
+    struct exec_plan plan;
+    int rc = config_load_from_env(&plan);
+    unsetenv("CHAMBER_EXEC_CONSEQUENCE_SPEC_B64");
+    assert(rc == -1);
 }
 
 int main(void) {
