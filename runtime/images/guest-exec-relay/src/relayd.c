@@ -50,6 +50,8 @@
 #include "base64.h"
 #include "protocol.h"
 #include "record.h"
+#include "rewrite.h"
+#include "scratch.h"
 
 /* ---- aarch64 register set (matches kernel struct user_pt_regs / NT_PRSTATUS) ---- */
 struct arm64_regs {
@@ -232,7 +234,18 @@ static int read_tracee_argv(int pid, unsigned long long argv_addr, char out[][25
 #define DISCLOSURE_LOG_PATH RELAY_DIR "/disclosure.log"
 static int g_disclosure_fd = -1;
 
-static void disclosure_init(void) {
+/* Opens the log, or fails. Returns 0 on success and -1 if the log could not be
+ * opened — and the caller MUST refuse to start on -1.
+ *
+ * This used to return void and simply leave g_disclosure_fd at -1, which every
+ * later disclosure_record() short-circuited on. The relay then served every
+ * request while recording nothing, with no indication anywhere that its entire
+ * reason for existing was switched off: the run produced a bundle whose
+ * exec-consequence channel was empty, which reads exactly like a run in which
+ * the agent execed nothing. §9 is fail-closed for the same reason
+ * config_load_from_env is — a relay that cannot record is not a weaker relay,
+ * it is a relay whose output is a lie by omission. */
+static int disclosure_init(void) {
     /* O_CLOEXEC is load-bearing, not hygiene. Without it this WRITABLE,
      * O_APPEND descriptor to the sealed evidence log survives the worker
      * child's execve into the agent's own command, which can then append
@@ -243,11 +256,25 @@ static void disclosure_init(void) {
      * `l-wx------ 3 -> /work/.exec-relay/disclosure.log`, and a forged record
      * written through it landed in the log. */
     g_disclosure_fd = open(DISCLOSURE_LOG_PATH, O_CREAT | O_WRONLY | O_APPEND | O_CLOEXEC, 0600);
-    if (g_disclosure_fd < 0) { perror("disclosure: open"); return; }
+    if (g_disclosure_fd < 0) {
+        fprintf(stderr, "execrelayd: refusing to start — the disclosure log %s could not "
+                        "be opened: %s. A relay that cannot record is not a degraded "
+                        "relay; every request it then served would be absent from the "
+                        "evidence with nothing saying so.\n",
+                DISCLOSURE_LOG_PATH, strerror(errno));
+        return -1;
+    }
     static const char header[] =
         "{\"known_residual_tells\":[\"TracerPid nonzero in /proc/self/status "
         "\\u2014 structural to ptrace, not masked\"]}\n";
-    proto_write_full(g_disclosure_fd, header, sizeof(header) - 1);
+    if (proto_write_full(g_disclosure_fd, header, sizeof(header) - 1) < 0) {
+        fprintf(stderr, "execrelayd: refusing to start — the disclosure log %s could not "
+                        "be written: %s\n", DISCLOSURE_LOG_PATH, strerror(errno));
+        close(g_disclosure_fd);
+        g_disclosure_fd = -1;
+        return -1;
+    }
+    return 0;
 }
 
 /* Builds one complete JSON record in a local buffer and writes it with a
@@ -268,6 +295,11 @@ static void disclosure_init(void) {
 static void disclosure_record(const char *turn_id, const char *requested_argv0,
                                const char *matched_rule, const char *verb_applied,
                                const char *detail) {
+    /* Unreachable by construction now: main() refuses to start if
+     * disclosure_init() could not open the log, so this fd is always valid
+     * here. Kept as a belt-and-braces guard rather than removed, but it is no
+     * longer a DEGRADED MODE — it used to be the thing that quietly turned the
+     * whole disclosure log into a no-op for the life of a run. */
     if (g_disclosure_fd < 0) return;
     struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
     char buf[8192];
@@ -321,20 +353,67 @@ static int trap_target_is_loadable(pid_t pid, int is_execveat,
     return ok;
 }
 
-static size_t apply_rewrite(char *buf, size_t len, const char *find, const char *replace, char *out, size_t outcap) {
-    if (!find || !find[0]) { size_t n = len < outcap ? len : outcap; memcpy(out, buf, n); return n; }
-    size_t findlen = strlen(find), replacelen = strlen(replace);
-    size_t oi = 0, i = 0;
-    while (i < len && oi < outcap) {
-        if (i + findlen <= len && memcmp(buf + i, find, findlen) == 0) {
-            size_t n = replacelen < (outcap - oi) ? replacelen : (outcap - oi);
-            memcpy(out + oi, replace, n);
-            oi += n; i += findlen;
-        } else {
-            out[oi++] = buf[i++];
+/* ------------------------- one output stream's plumbing -------------------
+ *
+ * Forwards `len` bytes read from the worker's stdout or stderr pipe to the
+ * caller, through the rewrite transform when a rewrite rule is in force.
+ *
+ * The transform is a STREAM (rewrite.c), not a function of one chunk, because
+ * the per-chunk version could not see a find string split across two reads —
+ * `printf SEC; printf RET` defeated it, and the untransformed bytes went
+ * straight to the host. `rs` therefore has to persist across reads, which is
+ * why it is owned by run_traced and threaded through here rather than being a
+ * local.
+ *
+ * `rule_find`/`rule_replace` are NULL when no rewrite applies. Switching from a
+ * rewriting to a non-rewriting rule mid-stream (a nested exec that matches
+ * nothing) flushes what the old rule was holding before the raw bytes resume,
+ * so no byte is ever dropped or reordered by the switch. */
+static void forward_stream(int fd, uint8_t tag, struct rewrite_stream *rs,
+                            const char *rule_find, const char *rule_replace,
+                            const char *buf, size_t len, const char *req_id) {
+    /* The transform in force changed: flush and retire the old stream first.
+     * Compared by CONTENT, not by rule identity — two rules configured with the
+     * same find/replace pair (one matching the shell, one matching a helper it
+     * execs) are the same transform, and restarting the window between them
+     * would release the held-back tail early and leak a match spanning that
+     * boundary, which is the very thing the window exists to stop. */
+    if (rs->active &&
+        (strcmp(rs->find, rule_find ? rule_find : "") != 0
+         || strcmp(rs->replace, rule_replace ? rule_replace : "") != 0)) {
+        const char *tail = NULL; size_t tail_len = 0;
+        if (rewrite_stream_finish(rs, &tail, &tail_len) == 0 && tail_len) {
+            send_frame(fd, tag, tail, (uint32_t)tail_len);
         }
+        rewrite_stream_end(rs);
     }
-    return oi;
+    if (!rule_find) {
+        if (len) send_frame(fd, tag, buf, (uint32_t)len);
+        return;
+    }
+    if (!rs->active) rewrite_stream_begin(rs, rule_find, rule_replace);
+
+    const char *out = NULL; size_t out_len = 0;
+    if (rewrite_stream_push(rs, buf, len, &out, &out_len) != 0) {
+        /* Allocation failure. Fail CLOSED — forwarding the raw bytes here would
+         * emit exactly the string the rule exists to remove, at the one moment
+         * nobody is watching. Loud in the container log; the record for this
+         * exec already named the rule that was in force. */
+        logline("req=%s rewrite: transform failed (out of memory), %zu bytes dropped",
+                req_id ? req_id : "-", len);
+        return;
+    }
+    if (out_len) send_frame(fd, tag, out, (uint32_t)out_len);
+}
+
+/* Releases whatever the stream is still holding back, at pipe EOF. */
+static void finish_stream(int fd, uint8_t tag, struct rewrite_stream *rs) {
+    if (!rs->active) return;
+    const char *tail = NULL; size_t tail_len = 0;
+    if (rewrite_stream_finish(rs, &tail, &tail_len) == 0 && tail_len) {
+        send_frame(fd, tag, tail, (uint32_t)tail_len);
+    }
+    rewrite_stream_end(rs);
 }
 
 /* ---------------------------------------------------------------------
@@ -344,11 +423,25 @@ static size_t apply_rewrite(char *buf, size_t len, const char *find, const char 
  * (with verb dispatch applied at the seccomp trap), streaming
  * stdout/stderr through the given fds and returning the exit code.
  * req_id may be NULL.
+ *
+ * The worker's environment is `environ` and nothing else. It used to also carry
+ * an injected RELAY_REQ_ID, which no code anywhere read (producers only, in
+ * this file) and which `stub env` showed where a plain `docker exec env` does
+ * not — an undisclosed tell bought for no consumer. The turn id reaches the
+ * evidence through the disclosure record, which is where it belongs.
  * --------------------------------------------------------------------- */
-static int run_traced(char *const argv[], char *const envp_extra[], int envp_extra_n,
+static int run_traced(char *const argv[],
                        const char *req_id, int out_fd, int err_fd, int *exit_code_out,
                        const struct exec_plan *plan, uint64_t timeout_ms) {
     const struct exec_rule *active_rewrite = NULL;
+    /* Persist across reads: a find string split across two read()s is only
+     * matchable if the transform remembers the tail of the previous chunk. */
+    struct rewrite_stream rw_out; memset(&rw_out, 0, sizeof(rw_out));
+    struct rewrite_stream rw_err; memset(&rw_err, 0, sizeof(rw_err));
+    /* Whether ANY exec under this request reached the disclosure log. A request
+     * that ends with this still zero ran nothing at all, and says so below —
+     * see the passthrough-exec-failed record. */
+    int recorded_any = 0;
     int outp[2], errp[2], syncr[2], syncg[2];
     /* pipe2(O_CLOEXEC), not pipe(): every one of these eight descriptors is
      * relay-private and none may survive into the agent's own command. The two
@@ -421,26 +514,43 @@ static int run_traced(char *const argv[], char *const envp_extra[], int envp_ext
         if (out_fd > STDERR_FILENO) close(out_fd);         /* the stub's connection */
         if (err_fd > STDERR_FILENO && err_fd != out_fd) close(err_fd);
 
-        /* build envp: inherited environ + any extras (e.g. RELAY_REQ_ID) */
-        extern char **environ;
-        int base_n = 0; while (environ[base_n]) base_n++;
-        char **envp = malloc(sizeof(char*) * (base_n + envp_extra_n + 1));
-        int k = 0;
-        for (int i = 0; i < base_n; i++) envp[k++] = environ[i];
-        for (int i = 0; i < envp_extra_n; i++) envp[k++] = envp_extra[i];
-        envp[k] = NULL;
+        /* The signal environment execve() will carry into the agent's own
+         * command, restored to what a directly-`docker exec`ed process gets.
+         *
+         * Two things follow a process across execve and both were wrong here:
+         * the signal MASK is inherited outright, and a signal set to SIG_IGN
+         * stays ignored (only handlers are reset to default). This process
+         * inherited a BLOCKED SIGCHLD from the tracer's pre-fork sigprocmask
+         * and an IGNORED SIGPIPE from run_server's `signal(SIGPIPE, SIG_IGN)`,
+         * and passed both to the command.
+         *
+         * SIGPIPE is the one with teeth: `sh -c 'yes | head -1'` relies on the
+         * writer DYING of SIGPIPE when the reader exits. With SIGPIPE ignored
+         * the write returns EPIPE instead, and `yes` keeps running and keeps
+         * failing — different exit status, different behaviour, and it triggers
+         * on the FALLBACK path where no rule matched at all. §3 says zero
+         * config must be byte-identical to no interception; this was not.
+         *
+         * Deliberately last, after every relay-private descriptor is closed and
+         * immediately before execvp: nothing between here and the exec needs
+         * SIGCHLD blocked, and doing it earlier only widens the window in which
+         * this process's own behaviour differs from the tracer's expectations. */
+        sigset_t none; sigemptyset(&none);
+        sigprocmask(SIG_SETMASK, &none, NULL);
+        signal(SIGPIPE, SIG_DFL);
 
-        /* execvpe, not execve: a bare command name (argv[0] without a slash)
+        /* execvp, not execve: a bare command name (argv[0] without a slash)
          * must be resolved against PATH exactly as a shell would — the bridge
          * itself issues bare names (e.g. `cat` for every ReadFile directive),
-         * and plain execve() would fail every one with ENOENT. execvpe tries
+         * and plain execve() would fail every one with ENOENT. execvp tries
          * each PATH candidate with its own execve() syscall, so the seccomp
          * trap still fires per attempt; argv[0] stays the literal original name
          * throughout, which is what config_match matches on, so rule matching
-         * composes unchanged. (musl 1.2.5 on Alpine 3.20 provides execvpe;
-         * verified it compiles/links/runs in that environment.) */
-        execvpe(argv[0], argv, envp);
-        /* execvpe only returns on error. The message must NOT name this as an
+         * composes unchanged. (execvp rather than the execvpe this used to
+         * call: with RELAY_REQ_ID gone the environment is exactly `environ`,
+         * which is what execvp passes.) */
+        execvp(argv[0], argv);
+        /* execvp only returns on error. The message must NOT name this as an
          * interception layer — a generic "<name>: not found" matches what a
          * real missing-binary failure looks like (coherent-per-tool, this
          * project's stated bar; not byte-identical shell mimicry). */
@@ -493,8 +603,21 @@ static int run_traced(char *const argv[], char *const envp_extra[], int envp_ext
         if (remaining_ms <= 0) {
             logline("req=%s pid=%d TIMEOUT after %llu ms, killing", req_id?req_id:"-", pid,
                     (unsigned long long)timeout_ms);
+            /* The container log is execrelayd's own stdout — NOT the sealed
+             * evidence. A watchdog kill that only ever appeared there was
+             * invisible to every reader of the bundle: the exec's record (if it
+             * got one) says the command was let through and nothing anywhere
+             * says it was then killed at the deadline. §8 requires the record;
+             * it goes in before the early return, since this path never reaches
+             * the end of the function. */
+            char why[128];
+            snprintf(why, sizeof(why), "killed by the watchdog after %llu ms; exit=124",
+                     (unsigned long long)timeout_ms);
+            disclosure_record(req_id, argv[0] ? argv[0] : "-", "-", "watchdog-timeout", why);
             kill(pid, SIGKILL);
             { int st; waitpid(pid, &st, 0); }
+            finish_stream(out_fd, TAG_STDOUT, &rw_out);
+            finish_stream(err_fd, TAG_STDERR, &rw_err);
             close(sfd); close(outp[0]); close(errp[0]);
             if (exit_code_out) *exit_code_out = 124; /* matches GNU `timeout`'s convention */
             return -1;
@@ -503,32 +626,35 @@ static int run_traced(char *const argv[], char *const envp_extra[], int envp_ext
         if (pr < 0) { if (errno == EINTR) continue; break; }
 
         if (oi >= 0 && (pfds[oi].revents & (POLLIN|POLLHUP))) {
-            char buf[8192], out[8192];
+            char buf[8192];
             ssize_t r = read(outp[0], buf, sizeof(buf));
             if (r > 0) {
-                if (active_rewrite && active_rewrite->has_stdout_rewrite) {
-                    size_t n = apply_rewrite(buf, (size_t)r, active_rewrite->stdout_find,
-                                              active_rewrite->stdout_replace, out, sizeof(out));
-                    send_frame(out_fd, TAG_STDOUT, out, (uint32_t)n);
-                } else {
-                    send_frame(out_fd, TAG_STDOUT, buf, (uint32_t)r);
-                }
+                int rw = active_rewrite && active_rewrite->has_stdout_rewrite;
+                forward_stream(out_fd, TAG_STDOUT, &rw_out,
+                               rw ? active_rewrite->stdout_find : NULL,
+                               rw ? active_rewrite->stdout_replace : NULL,
+                               buf, (size_t)r, req_id);
             }
-            else { have_out = 0; close(outp[0]); }
+            else {
+                /* EOF: release whatever the sliding window is still holding. */
+                finish_stream(out_fd, TAG_STDOUT, &rw_out);
+                have_out = 0; close(outp[0]);
+            }
         }
         if (ei >= 0 && (pfds[ei].revents & (POLLIN|POLLHUP))) {
-            char buf[8192], out[8192];
+            char buf[8192];
             ssize_t r = read(errp[0], buf, sizeof(buf));
             if (r > 0) {
-                if (active_rewrite && active_rewrite->has_stderr_rewrite) {
-                    size_t n = apply_rewrite(buf, (size_t)r, active_rewrite->stderr_find,
-                                              active_rewrite->stderr_replace, out, sizeof(out));
-                    send_frame(err_fd, TAG_STDERR, out, (uint32_t)n);
-                } else {
-                    send_frame(err_fd, TAG_STDERR, buf, (uint32_t)r);
-                }
+                int rw = active_rewrite && active_rewrite->has_stderr_rewrite;
+                forward_stream(err_fd, TAG_STDERR, &rw_err,
+                               rw ? active_rewrite->stderr_find : NULL,
+                               rw ? active_rewrite->stderr_replace : NULL,
+                               buf, (size_t)r, req_id);
             }
-            else { have_err = 0; close(errp[0]); }
+            else {
+                finish_stream(err_fd, TAG_STDERR, &rw_err);
+                have_err = 0; close(errp[0]);
+            }
         }
         if (pfds[si].revents & POLLIN) {
             struct signalfd_siginfo si_buf;
@@ -587,29 +713,68 @@ static int run_traced(char *const argv[], char *const envp_extra[], int envp_ext
                             /* passthrough: leave the syscall untouched */
                         } else if (rule->verb == VERB_SUBSTITUTE) {
                             verb_name = "substitute";
-                            const char *replacement = rule->replacement_argv[0];
-                            size_t rl = strlen(replacement) + 1;
-                            if (rl <= SCRATCH_SIZE) {
-                                /* Both the memory poke and the register write can
-                                 * fail (e.g. the tracee raced to exit); if either
-                                 * does, the real syscall proceeds UNMODIFIED, so
-                                 * recording verb_applied="substitute" would file a
-                                 * failed substitution as a successful one in the
-                                 * evidence. Check both and fall to the existing
-                                 * substitute-failed-* convention on either. */
-                                if (write_tracee_mem(w, scratch_addr, replacement, rl) != 0) {
-                                    verb_name = "substitute-failed-mem-write";
+                            /* The WHOLE replacement_argv, not just element 0.
+                             *
+                             * config.c has always parsed the full array (up to
+                             * EXEC_RELAY_MAX_ARGV elements) and this branch used
+                             * to repoint only the PATH register at
+                             * replacement_argv[0], leaving the tracee's own argv
+                             * pointer untouched — so a rule configured
+                             * `replacement_argv: ["/bin/echo", "intercepted"]`
+                             * ran /bin/echo with the ORIGINAL requested argv and
+                             * silently dropped everything past index 0. Nothing
+                             * refused that config and nothing reported the
+                             * discrepancy; it simply did something other than
+                             * what it said.
+                             *
+                             * Note the consequence for a ONE-element
+                             * replacement, which is a real behaviour change: the
+                             * replacement argv is now exactly what was
+                             * configured, so the requested command's own
+                             * arguments are no longer inherited. That is what
+                             * "replacement_argv" means, and a rule that wants
+                             * arguments now has to say so.
+                             *
+                             * Mechanically this is fabricate's redirect, which
+                             * has always written a full argv this way — the
+                             * layout arithmetic is shared with it now, in
+                             * scratch.c, where it can be unit-tested. */
+                            const char *sub_argv[EXEC_RELAY_MAX_ARGV];
+                            int sub_argc = rule->replacement_argv_len;
+                            if (sub_argc > EXEC_RELAY_MAX_ARGV) sub_argc = EXEC_RELAY_MAX_ARGV;
+                            for (int ai = 0; ai < sub_argc; ai++) sub_argv[ai] = rule->replacement_argv[ai];
+
+                            /* Every step checked. The memory poke and the
+                             * register write can both fail (e.g. the tracee
+                             * raced to exit); if either does, the real syscall
+                             * proceeds UNMODIFIED, so recording
+                             * verb_applied="substitute" would file a failed
+                             * substitution as a successful one in the evidence.
+                             * Each failure gets its own substitute-failed-*
+                             * name, so the record says which step gave way. */
+                            uint8_t sbuf[SCRATCH_SIZE];
+                            size_t slen = 0;
+                            unsigned long long path_addr = 0, argv_addr = 0;
+                            if (scratch_pack_argv(sbuf, sizeof(sbuf), scratch_addr,
+                                                  sub_argv, sub_argc, &slen,
+                                                  &path_addr, &argv_addr) != 0) {
+                                verb_name = "substitute-failed-scratch-too-small";
+                            } else if (write_tracee_mem(w, scratch_addr, sbuf, slen) != 0) {
+                                verb_name = "substitute-failed-mem-write";
+                            } else {
+                                if (is_execveat) { regs.regs[1] = path_addr; regs.regs[2] = argv_addr; }
+                                else { regs.regs[0] = path_addr; regs.regs[1] = argv_addr; }
+                                if (set_regs(w, &regs) != 0) {
+                                    verb_name = "substitute-failed-set-regs";
                                 } else {
-                                    if (is_execveat) regs.regs[1] = scratch_addr;
-                                    else regs.regs[0] = scratch_addr;
-                                    if (set_regs(w, &regs) != 0) {
-                                        verb_name = "substitute-failed-set-regs";
-                                    } else {
-                                        snprintf(detail, sizeof(detail), "%s", replacement);
+                                    size_t dl = 0;
+                                    for (int ai = 0; ai < sub_argc && dl < sizeof(detail) - 1; ai++) {
+                                        int n = snprintf(detail + dl, sizeof(detail) - dl,
+                                                         ai ? " %s" : "%s", sub_argv[ai]);
+                                        if (n < 0) break;
+                                        dl += (size_t)n < sizeof(detail) - dl ? (size_t)n : sizeof(detail) - dl - 1;
                                     }
                                 }
-                            } else {
-                                verb_name = "substitute-failed-scratch-too-small";
                             }
                         } else if (rule->verb == VERB_FABRICATE) {
                             verb_name = "fabricate";
@@ -625,39 +790,43 @@ static int run_traced(char *const argv[], char *const envp_extra[], int envp_ext
                             char exit_code_str[16];
                             snprintf(exit_code_str, sizeof(exit_code_str), "%d", rule->fabricate_exit_code);
 
-                            int ok = 0;
-                            if (b64_stdout && b64_stderr) {
+                            if (!b64_stdout || !b64_stderr) {
+                                verb_name = "fabricate-failed-encode-or-scratch";
+                            } else {
                                 static const char HELPER_PATH[] = "/usr/local/bin/fabricate-emit";
                                 const char *helper_argv[4] = { HELPER_PATH, exit_code_str, b64_stdout, b64_stderr };
 
                                 uint8_t buf[SCRATCH_SIZE];
                                 size_t off = 0;
-                                unsigned long long str_addrs[4];
-                                int fits = 1;
-                                for (int ai = 0; ai < 4 && fits; ai++) {
-                                    size_t sl = strlen(helper_argv[ai]) + 1;
-                                    if (off + sl > SCRATCH_SIZE - 64) { fits = 0; break; }
-                                    memcpy(buf + off, helper_argv[ai], sl);
-                                    str_addrs[ai] = scratch_addr + off;
-                                    off += sl;
-                                }
-                                if (fits) {
-                                    off = (off + 7) & ~(size_t)7; /* 8-byte align the pointer array */
-                                    unsigned long long ptr_array_addr = scratch_addr + off;
-                                    unsigned long long ptrs[5] = { str_addrs[0], str_addrs[1], str_addrs[2], str_addrs[3], 0 };
-                                    memcpy(buf + off, ptrs, sizeof(ptrs));
-                                    off += sizeof(ptrs);
-
-                                    write_tracee_mem(w, scratch_addr, buf, off);
-                                    if (is_execveat) { regs.regs[1] = str_addrs[0]; regs.regs[2] = ptr_array_addr; }
-                                    else { regs.regs[0] = str_addrs[0]; regs.regs[1] = ptr_array_addr; }
-                                    set_regs(w, &regs);
-                                    snprintf(detail, sizeof(detail), "exit=%d stdout_b64_len=%zu stderr_b64_len=%zu",
-                                             rule->fabricate_exit_code, strlen(b64_stdout), strlen(b64_stderr));
-                                    ok = 1;
+                                unsigned long long path_addr = 0, ptr_array_addr = 0;
+                                /* The same packing substitute uses, and the same
+                                 * checking. Both calls below were previously
+                                 * unchecked: on a failed poke or a failed
+                                 * register write the tracee runs the REAL
+                                 * (unintended) target, and the record still said
+                                 * verb_applied="fabricate" — the evidence
+                                 * asserting nothing ran while something did.
+                                 * Mirrors substitute's fabricate-failed-*
+                                 * convention exactly. */
+                                if (scratch_pack_argv(buf, sizeof(buf), scratch_addr,
+                                                      helper_argv, 4, &off,
+                                                      &path_addr, &ptr_array_addr) != 0) {
+                                    verb_name = "fabricate-failed-encode-or-scratch";
+                                } else if (write_tracee_mem(w, scratch_addr, buf, off) != 0) {
+                                    verb_name = "fabricate-failed-mem-write";
+                                } else {
+                                    if (is_execveat) { regs.regs[1] = path_addr; regs.regs[2] = ptr_array_addr; }
+                                    else { regs.regs[0] = path_addr; regs.regs[1] = ptr_array_addr; }
+                                    if (set_regs(w, &regs) != 0) {
+                                        verb_name = "fabricate-failed-set-regs";
+                                    } else {
+                                        snprintf(detail, sizeof(detail),
+                                                 "exit=%d stdout_b64_len=%zu stderr_b64_len=%zu",
+                                                 rule->fabricate_exit_code,
+                                                 strlen(b64_stdout), strlen(b64_stderr));
+                                    }
                                 }
                             }
-                            if (!ok) verb_name = "fabricate-failed-encode-or-scratch";
                             free(b64_stdout);
                             free(b64_stderr);
                         } else if (rule->verb == VERB_REWRITE) {
@@ -682,6 +851,7 @@ static int run_traced(char *const argv[], char *const envp_extra[], int envp_ext
                          * single most important thing this log has to say. */
                         if (rule || will_load) {
                             disclosure_record(req_id, reqpath, rule_name, verb_name, detail);
+                            recorded_any = 1;
                         }
                         active_rewrite = (rule && rule->verb == VERB_REWRITE) ? rule : NULL;
                         ptrace(PTRACE_CONT, w, 0, 0);
@@ -693,12 +863,49 @@ static int run_traced(char *const argv[], char *const envp_extra[], int envp_ext
                 } else if (WIFEXITED(status)) {
                     if (w == pid) { ecode = WEXITSTATUS(status); have_exit = 1; }
                 } else if (WIFSIGNALED(status)) {
-                    if (w == pid) { ecode = 128 + WTERMSIG(status); have_exit = 1; }
+                    if (w == pid) {
+                        ecode = 128 + WTERMSIG(status);
+                        have_exit = 1;
+                        /* §8's other missing record. A worker that died of a
+                         * signal — the agent's own command segfaulting, or
+                         * killing itself, or being killed by something in the
+                         * cell — left NO trace at all: the exec's own record
+                         * says the command was let through, the exit code
+                         * reaches the caller, and the sealed evidence never
+                         * says the process was terminated rather than
+                         * returning. */
+                        char why[128];
+                        snprintf(why, sizeof(why),
+                                 "worker terminated by signal %d; exit=%d",
+                                 WTERMSIG(status), ecode);
+                        disclosure_record(req_id, argv[0] ? argv[0] : "-", "-",
+                                          "worker-signaled", why);
+                    }
                 }
             }
         }
     }
+    finish_stream(out_fd, TAG_STDOUT, &rw_out);
+    finish_stream(err_fd, TAG_STDERR, &rw_err);
     close(sfd);
+    /* A real exec attempt that never loaded anything. The disclosure log's own
+     * invariant — "silently dropping a real exec is the one failure the
+     * disclosure log must never have", stated above trap_target_is_loadable —
+     * did not hold for the no-match case: a passthrough whose target genuinely
+     * does not exist trapped, was found not-loadable, and was filed as a PATH
+     * probe, so `stub /nonexistent/thing` produced exit 127 and an empty log.
+     * A bare name that resolves nowhere produced one such trap per PATH entry
+     * and still nothing.
+     *
+     * `recorded_any` is the precise condition: it is zero exactly when no exec
+     * under this request ever reached a loadable target, i.e. when nothing ran.
+     * One record, naming what was asked for — not one per probe. */
+    if (!recorded_any) {
+        char why[128];
+        snprintf(why, sizeof(why), "no exec under this request loaded a target; exit=%d", ecode);
+        disclosure_record(req_id, argv[0] ? argv[0] : "-", "fallback",
+                          "passthrough-exec-failed", why);
+    }
     if (exit_code_out) *exit_code_out = ecode;
     return 0;
 
@@ -708,6 +915,14 @@ reap_and_fail:
      * deadlock in waitpid. */
     kill(pid, SIGKILL);
     { int st; waitpid(pid, &st, 0); }
+    /* Same invariant as the passthrough-exec-failed record above, for the other
+     * way a request can run nothing at all: the supervision itself failed to
+     * come up. Rare — ptrace_self_check catches an environment-level ptrace
+     * problem before the first request — but a request that was accepted and
+     * then answered with nothing must not be absent from the log. */
+    disclosure_record(req_id, argv[0] ? argv[0] : "-", "-",
+                      "worker-setup-failed",
+                      "the worker could not be started or seized; nothing ran");
     close(sfd);
     if (exit_code_out) *exit_code_out = -1;
     return -1;
@@ -723,6 +938,14 @@ reap_and_fail:
  * that neither side could see had happened. */
 static void protocol_error(int cfd, const char *id, const char *what) {
     logline("req id=%s REFUSED: protocol error: %s", id ? id : "-", what);
+    /* And into the sealed evidence, not only into the container log. A refusal
+     * is a request the relay declined to run: without a record it is
+     * indistinguishable in the bundle from an ordinary non-zero guest command,
+     * and the one thing a reviewer most needs to know about it — that the relay
+     * refused rather than the command failing — is exactly what is missing. A
+     * refusal has no matched rule and no verb, hence the "-" rule name and the
+     * `protocol-refused` verb, with the reason in `detail`. */
+    disclosure_record(id, "-", "-", "protocol-refused", what);
     char msg[256];
     int n = snprintf(msg, sizeof(msg), "relay: protocol error: %s\n", what);
     if (n > 0) send_frame(cfd, TAG_STDERR, msg, (uint32_t)n);
@@ -755,12 +978,8 @@ static void handle_conn(int cfd, const struct exec_plan *plan) {
 
     logline("accepted req id=%s argv0=%s argc=%d", req.id, req.argv[0], req.argc);
 
-    char idenv[300];
-    snprintf(idenv, sizeof(idenv), "RELAY_REQ_ID=%s", req.id);
-    char *extra[1] = { idenv };
-
     int ecode = -1;
-    run_traced(req.argv, extra, 1, req.id, cfd, cfd, &ecode, plan, plan->timeout_ms);
+    run_traced(req.argv, req.id, cfd, cfd, &ecode, plan, plan->timeout_ms);
 
     uint32_t code_be = (uint32_t)ecode;
     uint8_t payload[4] = { (code_be>>24)&0xff, (code_be>>16)&0xff, (code_be>>8)&0xff, code_be&0xff };
@@ -770,14 +989,68 @@ static void handle_conn(int cfd, const struct exec_plan *plan) {
     protocol_request_free(&req);
 }
 
-static volatile sig_atomic_t g_active_handlers = 0;
+/* ------------------------ the live handler processes ------------------------
+ *
+ * execrelayd is PID 1 of the cell, so it is the reaper of last resort for
+ * EVERY orphan in the container — a grandchild whose parent exited, anything
+ * the agent's own command backgrounded and walked away from. Those arrive
+ * through the same waitpid(-1) as this relay's own handler forks.
+ *
+ * They must not be confused. The reaper used to decrement the concurrency
+ * counter for every pid it reaped, including pids it never spawned, so an
+ * ordinary `sh -c 'something &'` inside the cell silently lowered the counter
+ * below the number of handlers actually running and the cap drifted: with
+ * max_concurrent_handlers=1 and one orphan reaped, two handlers could then run
+ * at once. The counter drifts DOWNWARD, so the symptom is a cap quietly
+ * failing open, which is the direction that matters.
+ *
+ * A tracked set fixes it: a pid is only counted out if it was counted in. It
+ * grows on demand rather than being sized from max_concurrent_handlers (which
+ * the config allows up to UINT32_MAX — an array of that is not a cap, it is an
+ * allocation bug), and it never exceeds the number of handlers actually alive.
+ */
+static uint32_t g_active_handlers = 0;
+static pid_t *g_handler_pids = NULL;
+static size_t g_handler_cap = 0;
+
+static void handler_track(pid_t pid) {
+    if (g_active_handlers >= g_handler_cap) {
+        size_t want = g_handler_cap ? g_handler_cap * 2 : 16;
+        pid_t *grown = realloc(g_handler_pids, want * sizeof(*g_handler_pids));
+        if (!grown) {
+            /* Untracked, so its exit will not decrement the counter and this
+             * process's cap becomes permanently one tighter. Refusing work is
+             * the safe direction, and this is a malloc of 128 bytes. */
+            logline("handler tracking: out of memory, pid %d untracked (cap will run tight)",
+                    (int)pid);
+            return;
+        }
+        g_handler_pids = grown;
+        g_handler_cap = want;
+    }
+    g_handler_pids[g_active_handlers++] = pid;
+}
+
+/* Returns 1 if `pid` was one of ours (and removes it), 0 if it was an orphan
+ * that merely landed on PID 1. */
+static int handler_untrack(pid_t pid) {
+    for (uint32_t i = 0; i < g_active_handlers; i++) {
+        if (g_handler_pids[i] != pid) continue;
+        g_handler_pids[i] = g_handler_pids[g_active_handlers - 1];
+        g_active_handlers--;
+        return 1;
+    }
+    return 0;
+}
 
 static void reap_finished_handlers(void) {
     for (;;) {
         int status;
         pid_t w = waitpid(-1, &status, WNOHANG);
         if (w <= 0) break;
-        if (g_active_handlers > 0) g_active_handlers--;
+        /* Reaped either way — that is PID 1's job — but only counted out if it
+         * was one of this relay's own handlers. */
+        handler_untrack(w);
     }
 }
 
@@ -815,12 +1088,21 @@ static int run_server(const struct exec_plan *plan) {
         int cfd = accept4(sfd, NULL, NULL, SOCK_CLOEXEC);
         if (cfd < 0) { if (errno == EINTR) continue; perror("accept4"); continue; }
 
-        if ((uint32_t)g_active_handlers >= plan->max_concurrent_handlers) {
-            logline("rejecting connection: %d handlers already active (cap %u)",
+        if (g_active_handlers >= plan->max_concurrent_handlers) {
+            /* Through protocol_error, like every other wire-level refusal.
+             * This path used to write a bare unframed line onto a socket whose
+             * every other byte is length-prefixed frames: the stub read the
+             * first five bytes of "relay: too many..." as a frame header, got a
+             * tag of 'r' it did not recognise, and gave up with its own default
+             * exit 1 — a refusal indistinguishable from the command having
+             * failed. Now it is a TAG_STDERR frame plus TAG_EXIT/112, and it
+             * gets a disclosure record like any other refusal. */
+            char why[96];
+            snprintf(why, sizeof(why), "too many concurrent requests (cap %u)",
+                     plan->max_concurrent_handlers);
+            logline("rejecting connection: %u handlers already active (cap %u)",
                     g_active_handlers, plan->max_concurrent_handlers);
-            static const char msg[] = "relay: too many concurrent requests\n";
-            proto_write_full(cfd, msg, sizeof(msg) - 1);
-            close(cfd);
+            protocol_error(cfd, "-", why);
             continue;
         }
 
@@ -838,7 +1120,7 @@ static int run_server(const struct exec_plan *plan) {
             _exit(0);
         }
         close(cfd);
-        g_active_handlers++;
+        handler_track(hpid);
     }
 }
 
@@ -898,11 +1180,17 @@ int main(int argc, char **argv) {
                          "whole relay depends on is not usable in this environment\n");
         return 1;
     }
-    disclosure_init();
+    /* Fail-closed, exactly like a malformed config: a relay that cannot write
+     * its disclosure log has nothing to say about anything it then does, and a
+     * silent no-op log is worse than no relay at all — the bundle looks like a
+     * run in which the agent execed nothing. */
+    if (disclosure_init() != 0) {
+        return 1;
+    }
 
     if (argc >= 2 && strcmp(argv[1], "--self-test") == 0) {
         int ecode = -1;
-        run_traced(argv + 2, NULL, 0, "self-test", STDOUT_FILENO, STDERR_FILENO,
+        run_traced(argv + 2, "self-test", STDOUT_FILENO, STDERR_FILENO,
                    &ecode, &plan, plan.timeout_ms);
         return ecode;
     }

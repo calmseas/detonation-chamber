@@ -46,6 +46,14 @@ impl Drop for CellGuard {
 }
 
 fn start_cell(plan: &ExecConsequencePlan) -> CellGuard {
+    start_cell_with_volumes(plan, vec![])
+}
+
+/// [`start_cell`], plus bind mounts. Only the fail-closed disclosure-log test
+/// needs one — it makes the log's directory read-only, which is the one way to
+/// make the log's `open()` fail without also making the `mkdir` above it fail,
+/// so the refusal being exercised is the one under test.
+fn start_cell_with_volumes(plan: &ExecConsequencePlan, volumes: Vec<String>) -> CellGuard {
     ensure_images_including(&[IMAGE]); // extend the existing ensure_images() helper to also build this image's Dockerfile — see support/mod.rs's existing memoized-build pattern
     let pairs = plan.to_env_pairs();
     let env_file = chamber_isolation::EnvFile::write(&pairs).expect("env file");
@@ -74,10 +82,37 @@ fn start_cell(plan: &ExecConsequencePlan) -> CellGuard {
         // so noexec costs the suite nothing and closes the gap.
         read_only: true,
         tmpfs: vec!["/work".to_owned()],
-        volumes: vec![],
+        volumes,
     })
     .expect("create cell");
     CellGuard::new(container)
+}
+
+/// Every disclosure record the cell has written, one JSON object per entry,
+/// with the `known_residual_tells` header skipped — counted exactly the way
+/// `bundle.rs`'s `record_exec_consequence_log` counts them.
+fn disclosure_records(cell: &Container) -> Vec<serde_json::Value> {
+    let log = cell
+        .exec(&["cat", "/work/.exec-relay/disclosure.log"], OP_WINDOW)
+        .expect("cat the disclosure log");
+    log.stdout
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| {
+            serde_json::from_str::<serde_json::Value>(l)
+                .unwrap_or_else(|e| panic!("a disclosure line is not JSON ({e}): {l}"))
+        })
+        .filter(|v| v.get("known_residual_tells").is_none())
+        .collect()
+}
+
+/// The records whose `verb_applied` is exactly `verb`.
+fn records_with_verb(records: &[serde_json::Value], verb: &str) -> Vec<serde_json::Value> {
+    records
+        .iter()
+        .filter(|v| v.get("verb_applied").and_then(|x| x.as_str()) == Some(verb))
+        .cloned()
+        .collect()
 }
 
 #[test]
@@ -254,14 +289,19 @@ fn substitute_runs_the_replacement_binary() {
     // Replacement is /usr/bin/curl, not /bin/true: on this image (alpine:3.20)
     // /bin/true and /bin/false are BOTH symlinks to /bin/busybox, whose applet
     // dispatch reads argv[0] — not the path actually execve()'d — to decide
-    // "act like true" vs "act like false". Substitute (deliberately, for
-    // stealth — see ExecVerb::Substitute's doc comment) only overwrites the
-    // PATH register; it leaves argv untouched. So redirecting to /bin/true
-    // while argv[0] still reads "/bin/false" makes busybox behave as "false"
-    // regardless of which symlink got loaded — exit 1 either way, unable to
-    // distinguish "substitution worked" from "substitution is a no-op". curl
-    // is a real, standalone ELF (confirmed via `file`/readlink — not a
-    // busybox multi-call binary), so its behavior does not depend on argv[0].
+    // "act like true" vs "act like false". curl is a real, standalone ELF
+    // (confirmed via `file`/readlink — not a busybox multi-call binary), so its
+    // behavior does not depend on argv[0].
+    //
+    // EDITED in the Wave-2 fix round, and worth a reviewer's attention: this
+    // test used to configure `replacement_argv: ["/usr/bin/curl"]` and pass
+    // "--version" in the REQUEST, relying on substitute leaving the requested
+    // argv in place — which was the defect (config.c parsed the whole
+    // replacement_argv and the relay used only element 0, so a rule saying
+    // `["/bin/echo", "intercepted"]` ran /bin/echo with the requested argv and
+    // dropped "intercepted" silently). Substitute now replaces the whole argv,
+    // so the flag belongs in the rule. The property asserted is unchanged: curl
+    // really ran, not merely "some program that exits 0".
     let plan = ExecConsequencePlan {
         rules: vec![ExecConsequenceRule {
             name: "sub".to_owned(),
@@ -269,7 +309,7 @@ fn substitute_runs_the_replacement_binary() {
                 name: "/bin/false".to_owned(),
             },
             verb: ExecVerb::Substitute {
-                replacement_argv: vec!["/usr/bin/curl".to_owned()],
+                replacement_argv: vec!["/usr/bin/curl".to_owned(), "--version".to_owned()],
             },
         }],
         timeout_ms: 60_000,
@@ -279,15 +319,7 @@ fn substitute_runs_the_replacement_binary() {
     cell.start().expect("start");
     std::thread::sleep(Duration::from_millis(300));
 
-    // "--version" is inert if real /bin/false runs (busybox false ignores all
-    // args and always exits 1) but is real curl's own flag if the substitute
-    // took effect (argv beyond argv[0] is untouched by substitute, so this
-    // flag reaches whichever binary actually loaded) — exit 0 plus curl's own
-    // banner in stdout is proof curl actually ran, not just "some exit-0
-    // program did".
-    let out = cell
-        .exec(&["stub", "/bin/false", "--version"], OP_WINDOW)
-        .expect("exec");
+    let out = cell.exec(&["stub", "/bin/false"], OP_WINDOW).expect("exec");
     assert_eq!(
         out.status,
         Some(0),
@@ -297,6 +329,561 @@ fn substitute_runs_the_replacement_binary() {
         out.stdout.contains("curl"),
         "stdout did not look like curl's own --version banner:\n{}",
         out.stdout
+    );
+}
+
+#[test]
+fn substitute_replaces_the_whole_argv_not_only_argv0() {
+    let Some(_engine) = require_containers() else {
+        return;
+    };
+    let _serialised = chamber_subnet_lock();
+
+    // The reported defect, in the exact shape it was reported in: a rule
+    // configured `["/bin/echo", "intercepted"]`. config.c has always parsed the
+    // full array and nothing ever refused a longer one, but the relay repointed
+    // only the path register — so /bin/echo ran with the REQUESTED argv and
+    // printed "--version". Silently doing something other than what the config
+    // says is worse than refusing it, which is why this is a fix rather than a
+    // validation error.
+    let plan = ExecConsequencePlan {
+        rules: vec![ExecConsequenceRule {
+            name: "sub-full-argv".to_owned(),
+            match_argv: ArgvMatcher::Argv0 {
+                name: "/bin/false".to_owned(),
+            },
+            verb: ExecVerb::Substitute {
+                replacement_argv: vec!["/bin/echo".to_owned(), "intercepted".to_owned()],
+            },
+        }],
+        timeout_ms: 60_000,
+        max_concurrent_handlers: 32,
+    };
+    let cell = start_cell(&plan);
+    cell.start().expect("start");
+    std::thread::sleep(Duration::from_millis(300));
+
+    let out = cell
+        .exec(&["stub", "/bin/false", "--version"], OP_WINDOW)
+        .expect("exec");
+    assert_eq!(out.status, Some(0));
+    assert_eq!(
+        out.stdout, "intercepted\n",
+        "the configured replacement argv did not reach the exec; pre-fix this printed \
+         the REQUESTED argv (\"--version\") instead"
+    );
+
+    // And the record says what actually ran, in full — a reviewer reading the
+    // bundle must be able to see the argv the relay substituted, not just that
+    // it substituted something.
+    let records = disclosure_records(&cell);
+    let subs = records_with_verb(&records, "substitute");
+    assert_eq!(subs.len(), 1, "{records:#?}");
+    assert_eq!(
+        subs[0]["detail"].as_str(),
+        Some("/bin/echo intercepted"),
+        "{:#?}",
+        subs[0]
+    );
+}
+
+#[test]
+fn rewrite_catches_a_find_string_split_across_reads() {
+    let Some(_engine) = require_containers() else {
+        return;
+    };
+    let _serialised = chamber_subnet_lock();
+
+    // The transform used to be applied to each read() independently, so a find
+    // string straddling a read boundary matched nothing and the ORIGINAL bytes
+    // — the ones the rule exists to remove — went through to the host.
+    //
+    // The boundary is constructed by volume rather than by timing: the relay
+    // reads at most 8192 bytes at a time, so 240 KB of output crosses at least
+    // 29 read boundaries, and with a match every ten bytes some match straddles
+    // one. (The byte-level case — "SEC" then "RET" as two separate chunks — is
+    // pinned deterministically by tests/test_rewrite.c, which drives the same
+    // stream code directly; this is the end-to-end half, through a real pipe.)
+    //
+    // The loop is pure shell builtins on purpose: `seq`, `sleep` and friends
+    // are execs, and a nested exec that matches no rule clears the active
+    // rewrite for everything after it.
+    let plan = ExecConsequencePlan {
+        rules: vec![ExecConsequenceRule {
+            name: "rw-split".to_owned(),
+            match_argv: ArgvMatcher::Argv0 {
+                name: "/bin/sh".to_owned(),
+            },
+            verb: ExecVerb::Rewrite {
+                stdout_find: Some("SECRET".to_owned()),
+                stdout_replace: Some("REDACTED".to_owned()),
+                stderr_find: None,
+                stderr_replace: None,
+            },
+        }],
+        timeout_ms: 60_000,
+        max_concurrent_handlers: 32,
+    };
+    let cell = start_cell(&plan);
+    cell.start().expect("start");
+    std::thread::sleep(Duration::from_millis(300));
+
+    let out = cell
+        .exec(
+            &[
+                "stub",
+                "/bin/sh",
+                "-c",
+                "i=0; while [ $i -lt 20000 ]; do printf 'xxxxSECRET'; i=$((i+1)); done",
+            ],
+            OP_WINDOW,
+        )
+        .expect("exec");
+    assert_eq!(out.status, Some(0));
+    assert!(
+        !out.stdout.contains("SECRET"),
+        "the find string leaked through a read boundary untransformed ({} occurrences)",
+        out.stdout.matches("SECRET").count()
+    );
+    assert_eq!(
+        out.stdout.matches("REDACTED").count(),
+        20_000,
+        "every occurrence must be replaced, not merely the ones inside a chunk"
+    );
+    assert_eq!(out.stdout.len(), 20_000 * "xxxxREDACTED".len());
+}
+
+#[test]
+fn rewrite_does_not_truncate_an_expanding_replacement() {
+    let Some(_engine) = require_containers() else {
+        return;
+    };
+    let _serialised = chamber_subnet_lock();
+
+    // The transform's output buffer was sized the same as the input read
+    // buffer (8192) with a stop-when-full guard, so a replacement longer than
+    // what it replaced silently truncated the command's output. 100 matches of
+    // a one-byte find with a 200-byte replacement is 20000 bytes out of 100 in
+    // — pre-fix this came back as 8192 bytes with the rest simply gone.
+    let replacement = "z".repeat(200);
+    let plan = ExecConsequencePlan {
+        rules: vec![ExecConsequenceRule {
+            name: "rw-expand".to_owned(),
+            match_argv: ArgvMatcher::Argv0 {
+                name: "/bin/sh".to_owned(),
+            },
+            verb: ExecVerb::Rewrite {
+                stdout_find: Some("A".to_owned()),
+                stdout_replace: Some(replacement.clone()),
+                stderr_find: None,
+                stderr_replace: None,
+            },
+        }],
+        timeout_ms: 60_000,
+        max_concurrent_handlers: 32,
+    };
+    let cell = start_cell(&plan);
+    cell.start().expect("start");
+    std::thread::sleep(Duration::from_millis(300));
+
+    let out = cell
+        .exec(
+            &[
+                "stub",
+                "/bin/sh",
+                "-c",
+                "i=0; while [ $i -lt 100 ]; do printf A; i=$((i+1)); done",
+            ],
+            OP_WINDOW,
+        )
+        .expect("exec");
+    assert_eq!(out.status, Some(0));
+    assert_eq!(
+        out.stdout.len(),
+        100 * 200,
+        "the expanded output was truncated to {} bytes",
+        out.stdout.len()
+    );
+    assert!(out.stdout.chars().all(|c| c == 'z'));
+}
+
+#[test]
+fn a_watchdog_timeout_is_disclosed() {
+    let Some(_engine) = require_containers() else {
+        return;
+    };
+    let _serialised = chamber_subnet_lock();
+
+    // §8 requires a record for a watchdog kill. It went only to execrelayd's
+    // own stdout — the container log, which is not sealed evidence — so from
+    // the bundle's point of view the command was let through and simply
+    // finished; nothing said it was killed at the deadline.
+    let plan = ExecConsequencePlan {
+        rules: vec![],
+        timeout_ms: 1_000,
+        max_concurrent_handlers: 32,
+    };
+    let cell = start_cell(&plan);
+    cell.start().expect("start");
+    std::thread::sleep(Duration::from_millis(300));
+
+    let out = cell
+        .exec(&["stub", "/bin/sleep", "30"], OP_WINDOW)
+        .expect("exec");
+    assert_eq!(out.status, Some(124), "the watchdog should have fired");
+
+    let records = disclosure_records(&cell);
+    let timeouts = records_with_verb(&records, "watchdog-timeout");
+    assert_eq!(
+        timeouts.len(),
+        1,
+        "the watchdog kill left no disclosure record:\n{records:#?}"
+    );
+    assert_eq!(timeouts[0]["requested_argv0"].as_str(), Some("/bin/sleep"));
+    assert!(
+        timeouts[0]["detail"]
+            .as_str()
+            .is_some_and(|d| d.contains("1000") && d.contains("124")),
+        "the record does not say what happened: {:#?}",
+        timeouts[0]
+    );
+}
+
+#[test]
+fn a_worker_killed_by_a_signal_is_disclosed() {
+    let Some(_engine) = require_containers() else {
+        return;
+    };
+    let _serialised = chamber_subnet_lock();
+
+    // The other record §8 requires and the relay did not write at all: a worker
+    // that dies of a signal rather than returning. The exit code reaches the
+    // caller (128 + signal) and the sealed evidence never mentions it.
+    let plan = ExecConsequencePlan {
+        rules: vec![],
+        timeout_ms: 60_000,
+        max_concurrent_handlers: 32,
+    };
+    let cell = start_cell(&plan);
+    cell.start().expect("start");
+    std::thread::sleep(Duration::from_millis(300));
+
+    let out = cell
+        .exec(&["stub", "/bin/sh", "-c", "kill -9 $$"], OP_WINDOW)
+        .expect("exec");
+    assert_eq!(out.status, Some(137), "128 + SIGKILL");
+
+    let records = disclosure_records(&cell);
+    let signalled = records_with_verb(&records, "worker-signaled");
+    assert_eq!(
+        signalled.len(),
+        1,
+        "a worker killed by a signal left no disclosure record:\n{records:#?}"
+    );
+    assert!(
+        signalled[0]["detail"]
+            .as_str()
+            .is_some_and(|d| d.contains("signal 9")),
+        "{:#?}",
+        signalled[0]
+    );
+}
+
+#[test]
+fn a_passthrough_exec_that_never_ran_is_disclosed() {
+    let Some(_engine) = require_containers() else {
+        return;
+    };
+    let _serialised = chamber_subnet_lock();
+
+    // relayd.c's own stated invariant, above trap_target_is_loadable: "silently
+    // dropping a real exec is the one failure the disclosure log must never
+    // have". It did not hold for the no-match case. A passthrough whose target
+    // does not exist trapped, was found not-loadable, and was filed as one of
+    // execvpe's PATH probes — so `stub /nonexistent/thing` returned 127 with an
+    // EMPTY log (measured on the pre-fix image).
+    let plan = ExecConsequencePlan {
+        rules: vec![],
+        timeout_ms: 60_000,
+        max_concurrent_handlers: 32,
+    };
+    let cell = start_cell(&plan);
+    cell.start().expect("start");
+    std::thread::sleep(Duration::from_millis(300));
+
+    for (argv0, label) in [
+        ("/nonexistent/thing", "an absolute path that does not exist"),
+        ("totally-not-a-command", "a bare name that resolves nowhere"),
+    ] {
+        let out = cell.exec(&["stub", argv0], OP_WINDOW).expect("exec");
+        assert_eq!(out.status, Some(127), "{label}");
+    }
+
+    let records = disclosure_records(&cell);
+    let failed = records_with_verb(&records, "passthrough-exec-failed");
+    assert_eq!(
+        failed.len(),
+        2,
+        "a real exec attempt that ran nothing went unrecorded:\n{records:#?}"
+    );
+    assert_eq!(
+        failed[0]["requested_argv0"].as_str(),
+        Some("/nonexistent/thing")
+    );
+    assert_eq!(
+        failed[1]["requested_argv0"].as_str(),
+        Some("totally-not-a-command"),
+        "the bare name must produce ONE record, not one per PATH candidate probed"
+    );
+}
+
+#[test]
+fn a_relayed_command_gets_the_same_signal_environment_as_a_direct_one() {
+    let Some(_engine) = require_containers() else {
+        return;
+    };
+    let _serialised = chamber_subnet_lock();
+
+    // §3: with zero rules configured, the relay must be indistinguishable from
+    // no interception. Two things followed the worker across execve and both
+    // were wrong: SIGCHLD stayed BLOCKED (from the tracer's own pre-fork
+    // sigprocmask) and SIGPIPE stayed IGNORED (from run_server's
+    // signal(SIGPIPE, SIG_IGN)) — a signal set to SIG_IGN survives execve,
+    // unlike a handler. Measured on the pre-fix image: SigBlk 0000000000010000
+    // (SIGCHLD) and SigIgn 0000000000001004 (SIGPIPE + SIGQUIT) via the relay,
+    // against SigBlk 0000000000000000 / SigIgn 0000000000000004 directly.
+    let plan = ExecConsequencePlan {
+        rules: vec![],
+        timeout_ms: 60_000,
+        max_concurrent_handlers: 32,
+    };
+    let cell = start_cell(&plan);
+    cell.start().expect("start");
+    std::thread::sleep(Duration::from_millis(300));
+
+    let probe = [
+        "/bin/sh",
+        "-c",
+        "grep -E '^Sig(Blk|Ign):' /proc/self/status",
+    ];
+    let via_relay = cell
+        .exec(&[&["stub"][..], &probe[..]].concat(), OP_WINDOW)
+        .expect("exec via relay");
+    let direct = cell.exec(&probe, OP_WINDOW).expect("exec direct");
+    assert_eq!(
+        via_relay.stdout, direct.stdout,
+        "a relayed command starts with a different signal mask/disposition than a \
+         directly-exec'd one"
+    );
+
+    // And the behaviour that difference actually changed. `yes | head -1` is
+    // the canonical SIGPIPE case: the writer must DIE of SIGPIPE when the
+    // reader exits. With SIGPIPE ignored the write returns EPIPE instead and
+    // busybox prints "yes: Broken pipe" — which is what the pre-fix relay did,
+    // and what a plain docker exec never does.
+    let pipe = ["/bin/sh", "-c", "yes | head -1"];
+    let via_relay = cell
+        .exec(&[&["stub"][..], &pipe[..]].concat(), OP_WINDOW)
+        .expect("exec via relay");
+    let direct = cell.exec(&pipe, OP_WINDOW).expect("exec direct");
+    assert_eq!(via_relay.stdout, direct.stdout);
+    assert_eq!(via_relay.status, direct.status);
+    assert_eq!(
+        via_relay.stderr, direct.stderr,
+        "the relayed pipeline reported something the direct one did not"
+    );
+    assert!(
+        !via_relay.stderr.contains("Broken pipe"),
+        "the writer got EPIPE instead of dying of SIGPIPE: {}",
+        via_relay.stderr
+    );
+
+    // The environment, too: RELAY_REQ_ID used to be injected into every
+    // relayed command and read by nothing, so `stub env` showed a variable
+    // plain `docker exec env` did not.
+    let via_relay = cell
+        .exec(&["stub", "/usr/bin/env"], OP_WINDOW)
+        .expect("exec env via relay");
+    let direct = cell
+        .exec(&["/usr/bin/env"], OP_WINDOW)
+        .expect("exec env direct");
+    assert!(
+        !via_relay.stdout.contains("RELAY_REQ_ID"),
+        "a relayed command carries a variable no plain docker exec has:\n{}",
+        via_relay.stdout
+    );
+    let names = |out: &str| -> Vec<String> {
+        let mut v: Vec<String> = out
+            .lines()
+            .filter_map(|l| l.split_once('=').map(|(k, _)| k.to_owned()))
+            .collect();
+        v.sort();
+        v
+    };
+    assert_eq!(
+        names(&via_relay.stdout),
+        names(&direct.stdout),
+        "the relayed environment names differ from a direct exec's"
+    );
+}
+
+#[test]
+fn a_request_over_the_cap_is_refused_in_frame_and_disclosed() {
+    let Some(_engine) = require_containers() else {
+        return;
+    };
+    let _serialised = chamber_subnet_lock();
+
+    // The over-cap rejection wrote a bare unframed line onto a socket whose
+    // every other byte is a length-prefixed frame: the stub read "relay" as a
+    // 5-byte frame header, did not recognise tag 'r', and gave up with its own
+    // default exit 1 — a refusal indistinguishable from the command failing.
+    // Measured pre-fix: exit 1, empty output. It now goes through the same
+    // protocol_error() Wave 1 built (TAG_STDERR + TAG_EXIT/112) and leaves a
+    // disclosure record, which a wire refusal previously never did.
+    let plan = ExecConsequencePlan {
+        rules: vec![],
+        timeout_ms: 60_000,
+        max_concurrent_handlers: 1,
+    };
+    let cell = start_cell(&plan);
+    cell.start().expect("start");
+    std::thread::sleep(Duration::from_millis(300));
+
+    cell.exec_detached(&["stub", "/bin/sleep", "5"], OP_WINDOW)
+        .expect("hold the single handler slot");
+    std::thread::sleep(Duration::from_millis(500));
+
+    let refused = cell
+        .exec(&["stub", "/bin/echo", "hello"], OP_WINDOW)
+        .expect("exec");
+    assert_eq!(
+        refused.status,
+        Some(112),
+        "an over-cap refusal must arrive as the protocol-error exit code, not as a \
+         bare failure: {refused:?}"
+    );
+    assert!(
+        refused.stderr.contains("too many concurrent requests"),
+        "the refusal said nothing the caller could read: {refused:?}"
+    );
+    assert!(refused.stdout.is_empty());
+
+    let records = disclosure_records(&cell);
+    let refusals = records_with_verb(&records, "protocol-refused");
+    assert_eq!(
+        refusals.len(),
+        1,
+        "a refused request left nothing in the sealed evidence:\n{records:#?}"
+    );
+    assert!(
+        refusals[0]["detail"]
+            .as_str()
+            .is_some_and(|d| d.contains("too many concurrent requests")),
+        "{:#?}",
+        refusals[0]
+    );
+}
+
+#[test]
+fn an_orphan_reaped_by_pid_one_does_not_loosen_the_cap() {
+    let Some(_engine) = require_containers() else {
+        return;
+    };
+    let _serialised = chamber_subnet_lock();
+
+    // execrelayd is PID 1, so every orphan in the cell is re-parented to it and
+    // arrives through the same waitpid(-1) as its own handler forks. The reaper
+    // decremented the concurrency counter for all of them, so an ordinary
+    // `sh -c 'something &'` — the agent backgrounding anything at all — lowered
+    // the cap's idea of how many handlers were running. It drifts DOWNWARD,
+    // i.e. the cap fails open.
+    //
+    // Measured on the pre-fix image with exactly this sequence: the second
+    // concurrent request, which the cap should refuse, ran and returned
+    // "hello" with exit 0.
+    let plan = ExecConsequencePlan {
+        rules: vec![],
+        timeout_ms: 60_000,
+        max_concurrent_handlers: 1,
+    };
+    let cell = start_cell(&plan);
+    cell.start().expect("start");
+    std::thread::sleep(Duration::from_millis(300));
+
+    // An orphan: the middle shell exits at once, so `sleep 1` is re-parented to
+    // PID 1 and dies there. Not run through the relay — the point is that it is
+    // a process execrelayd never spawned as a handler.
+    cell.exec(&["/bin/sh", "-c", "/bin/sleep 1 & exit 0"], OP_WINDOW)
+        .expect("spawn an orphan");
+    std::thread::sleep(Duration::from_millis(2000));
+
+    cell.exec_detached(&["stub", "/bin/sleep", "5"], OP_WINDOW)
+        .expect("hold the single handler slot");
+    std::thread::sleep(Duration::from_millis(500));
+
+    let second = cell
+        .exec(&["stub", "/bin/echo", "hello"], OP_WINDOW)
+        .expect("exec");
+    assert_eq!(
+        second.status,
+        Some(112),
+        "the cap admitted a second handler after PID 1 reaped an orphan it never \
+         spawned: {second:?}"
+    );
+}
+
+#[test]
+fn a_relay_that_cannot_open_its_disclosure_log_refuses_to_start() {
+    let Some(_engine) = require_containers() else {
+        return;
+    };
+    let _serialised = chamber_subnet_lock();
+
+    // §9 is fail-closed. A failed open used to leave g_disclosure_fd at -1,
+    // which every subsequent record write short-circuited on: the relay served
+    // every request and recorded nothing, and the resulting bundle is
+    // indistinguishable from a run in which the agent execed nothing at all.
+    // Measured pre-fix: the container stayed up, logging one line
+    // ("disclosure: open: Read-only file system") to a container log nobody
+    // reads, and answered requests normally.
+    //
+    // A read-only bind mount over the relay's directory is what makes the
+    // open() fail while the mkdir above it still succeeds (EEXIST), so this
+    // exercises the disclosure-log refusal specifically rather than the
+    // directory one.
+    let dir = shared_scratch("exec-relay-readonly-log");
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+
+    let plan = ExecConsequencePlan {
+        rules: vec![],
+        timeout_ms: 60_000,
+        max_concurrent_handlers: 32,
+    };
+    let cell = start_cell_with_volumes(
+        &plan,
+        vec![format!("{}:/work/.exec-relay:ro", dir.display())],
+    );
+    cell.start().expect("start");
+
+    let code = cell.wait(OP_WINDOW).expect("wait for the relay to exit");
+    assert_eq!(
+        code, 1,
+        "the relay kept running with no way to record anything"
+    );
+    let logs = cell.logs().expect("logs");
+    let all = format!("{}{}", logs.stdout, logs.stderr);
+    assert!(
+        all.contains("refusing to start"),
+        "the relay exited without saying why:\n{all}"
+    );
+    assert!(
+        all.contains("disclosure log"),
+        "the refusal does not name the disclosure log:\n{all}"
+    );
+    assert!(
+        !all.contains("listening on"),
+        "the relay bound its socket before discovering it could not record:\n{all}"
     );
 }
 

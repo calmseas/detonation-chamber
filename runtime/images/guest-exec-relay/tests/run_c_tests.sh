@@ -18,4 +18,14 @@ cc -Wall -Wextra -std=c11 -g -o /tmp/test_record ../src/json.c ../src/record.c t
 # only ever be checked by hand, once. Here CI checks them on every push.
 cc -Wall -Wextra -std=c11 -g -o /tmp/test_protocol ../src/protocol.c test_protocol.c
 /tmp/test_protocol
+# The rewrite verb's output transform. Its own translation unit for the third
+# time for the same reason: while it lived in relayd.c, neither of the two ways
+# it silently failed — a find string split across two read()s, and an expanding
+# replacement truncated at the output buffer — could be reached by any test.
+cc -Wall -Wextra -std=c11 -g -o /tmp/test_rewrite ../src/rewrite.c test_rewrite.c
+/tmp/test_rewrite
+# The scratch-buffer argv layout shared by substitute and fabricate: pointer
+# array alignment, its NULL terminator, and the bound that has to cover both.
+cc -Wall -Wextra -std=c11 -g -o /tmp/test_scratch ../src/scratch.c test_scratch.c
+/tmp/test_scratch
 echo "all C unit tests passed"
