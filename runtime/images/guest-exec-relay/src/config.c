@@ -147,7 +147,8 @@ int config_load_from_env(struct exec_plan *out) {
     return rc;
 }
 
-static int argv_matches(char *const argv[], int argc, char (*want)[256], int want_len) {
+static int argv_matches(char *const argv[], int argc,
+                        char (*want)[EXEC_RELAY_MAX_ARGV_ELEM + 1], int want_len) {
     if (argc < want_len) return 0;
     for (int i = 0; i < want_len; i++) {
         if (strcmp(argv[i], want[i]) != 0) return 0;
@@ -164,11 +165,11 @@ const struct exec_rule *config_match(const struct exec_plan *plan, char *const a
                 matched = (argc >= 1) && strcmp(argv[0], rule->match_argv0) == 0;
                 break;
             case MATCH_PREFIX:
-                matched = argv_matches(argv, argc, (char (*)[256])rule->match_argv, rule->match_argv_len);
+                matched = argv_matches(argv, argc, (char (*)[EXEC_RELAY_MAX_ARGV_ELEM + 1])rule->match_argv, rule->match_argv_len);
                 break;
             case MATCH_EXACT:
                 matched = (argc == rule->match_argv_len) &&
-                          argv_matches(argv, argc, (char (*)[256])rule->match_argv, rule->match_argv_len);
+                          argv_matches(argv, argc, (char (*)[EXEC_RELAY_MAX_ARGV_ELEM + 1])rule->match_argv, rule->match_argv_len);
                 break;
         }
         if (matched) return rule;

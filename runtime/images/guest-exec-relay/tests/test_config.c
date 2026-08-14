@@ -121,6 +121,140 @@ static void test_rejects_base64_with_invalid_character(void) {
     assert(rc == -1);
 }
 
+/* ---------------------- the limits, at their exact edges -------------------
+ *
+ * The other half of a two-sided contract. chamber-capture's
+ * `exec_consequence.rs::validate()` refuses a plan that would fail HERE, and
+ * its `guest_limits` constants are asserted against config.h's `#define`s by
+ * `guest_limits_match_the_c_header`. What that cannot check is whether
+ * config.c's code actually enforces what config.h declares — so these do,
+ * at the boundary value and one past it, for every limit the host mirrors.
+ *
+ * Every one of these disagreed with the host before: the host checked
+ * fabricate payloads at `> 2000` where this parser rejects at `>= 2000`, and
+ * checked none of the other five at all. A plan could be host-valid and make
+ * execrelayd refuse to start. */
+
+/* Builds a one-rule plan with `name`, an argv0 matcher on "x", and a fabricate
+ * verb whose stdout is `payload`, and reports whether the parser accepted it. */
+static int loads_rule(const char *name, const char *payload) {
+    static char json[16384];
+    snprintf(json, sizeof(json),
+             "{\"rules\":[{\"name\":\"%s\","
+             "\"match_argv\":{\"type\":\"argv0\",\"name\":\"x\"},"
+             "\"verb\":{\"type\":\"fabricate\",\"exit_code\":0,"
+             "\"stdout\":\"%s\",\"stderr\":\"\"}}]}",
+             name, payload);
+    struct exec_plan plan;
+    return config_load_from_json(json, strlen(json), &plan) == 0;
+}
+
+static void fill(char *buf, size_t n, char c) {
+    memset(buf, c, n);
+    buf[n] = 0;
+}
+
+static void test_fabricate_payload_edge(void) {
+    static char at[EXEC_RELAY_MAX_FABRICATE_BYTES + 2];
+    fill(at, EXEC_RELAY_MAX_FABRICATE_BYTES - 1, 'p');
+    assert(loads_rule("r", at));                       /* 1999 accepted */
+    fill(at, EXEC_RELAY_MAX_FABRICATE_BYTES, 'p');
+    assert(!loads_rule("r", at));                      /* 2000 REJECTED */
+}
+
+static void test_rule_name_edge(void) {
+    static char name[EXEC_RELAY_MAX_RULE_NAME + 2];
+    fill(name, EXEC_RELAY_MAX_RULE_NAME, 'n');
+    assert(loads_rule(name, "ok"));
+    fill(name, EXEC_RELAY_MAX_RULE_NAME + 1, 'n');
+    assert(!loads_rule(name, "ok"));
+}
+
+/* Builds a plan with one prefix-matcher rule of `n` elements, each `elem_len`
+ * bytes, and a substitute verb with the same argv. */
+static int loads_argv(int n, size_t elem_len) {
+    static char json[65536];
+    static char elem[EXEC_RELAY_MAX_ARGV_ELEM + 2];
+    fill(elem, elem_len, 'a');
+    size_t off = (size_t)snprintf(json, sizeof(json),
+        "{\"rules\":[{\"name\":\"r\",\"match_argv\":{\"type\":\"prefix\",\"argv\":[");
+    for (int i = 0; i < n; i++) {
+        off += (size_t)snprintf(json + off, sizeof(json) - off, "%s\"%s\"", i ? "," : "", elem);
+    }
+    off += (size_t)snprintf(json + off, sizeof(json) - off,
+                            "]},\"verb\":{\"type\":\"substitute\",\"replacement_argv\":[");
+    for (int i = 0; i < n; i++) {
+        off += (size_t)snprintf(json + off, sizeof(json) - off, "%s\"%s\"", i ? "," : "", elem);
+    }
+    off += (size_t)snprintf(json + off, sizeof(json) - off, "]}}]}");
+    struct exec_plan plan;
+    return config_load_from_json(json, off, &plan) == 0;
+}
+
+static void test_argv_edges(void) {
+    assert(loads_argv(EXEC_RELAY_MAX_ARGV, 4));        /* the count limit is inclusive */
+    assert(!loads_argv(EXEC_RELAY_MAX_ARGV + 1, 4));
+    assert(loads_argv(2, EXEC_RELAY_MAX_ARGV_ELEM));   /* the length limit is inclusive */
+    assert(!loads_argv(2, EXEC_RELAY_MAX_ARGV_ELEM + 1));
+}
+
+static int loads_rewrite(size_t len) {
+    static char json[8192];
+    static char s[EXEC_RELAY_MAX_REWRITE_STR + 2];
+    fill(s, len, 'f');
+    int n = snprintf(json, sizeof(json),
+                     "{\"rules\":[{\"name\":\"r\",\"match_argv\":{\"type\":\"argv0\",\"name\":\"x\"},"
+                     "\"verb\":{\"type\":\"rewrite\",\"stdout_find\":\"%s\","
+                     "\"stdout_replace\":\"%s\"}}]}", s, s);
+    struct exec_plan plan;
+    return config_load_from_json(json, (size_t)n, &plan) == 0;
+}
+
+static void test_rewrite_string_edge(void) {
+    assert(loads_rewrite(EXEC_RELAY_MAX_REWRITE_STR));
+    assert(!loads_rewrite(EXEC_RELAY_MAX_REWRITE_STR + 1));
+}
+
+static int loads_n_rules(int n) {
+    static char json[65536];
+    size_t off = (size_t)snprintf(json, sizeof(json), "{\"rules\":[");
+    for (int i = 0; i < n; i++) {
+        off += (size_t)snprintf(json + off, sizeof(json) - off,
+            "%s{\"name\":\"r%d\",\"match_argv\":{\"type\":\"argv0\",\"name\":\"x\"},"
+            "\"verb\":{\"type\":\"fabricate\",\"exit_code\":0,\"stdout\":\"\",\"stderr\":\"\"}}",
+            i ? "," : "", i);
+    }
+    off += (size_t)snprintf(json + off, sizeof(json) - off, "]}");
+    struct exec_plan plan;
+    return config_load_from_json(json, off, &plan) == 0;
+}
+
+static void test_rule_count_edge(void) {
+    assert(loads_n_rules(EXEC_RELAY_MAX_RULES));
+    assert(!loads_n_rules(EXEC_RELAY_MAX_RULES + 1));
+}
+
+static void test_timeout_precision_edge(void) {
+    /* This parser reads every JSON number as a `double` and json_as_int64 then
+     * rejects anything with a fractional part or outside int64 range. So the
+     * largest timeout_ms it can carry FAITHFULLY is 2^53, the largest integer a
+     * double represents exactly — and the failure past that is not a rejection,
+     * it is silent rounding to a different number than was configured. Both
+     * halves are asserted, because the host mirrors this limit and the
+     * interesting one is the half that does not error. */
+    const char *exact = "{\"rules\":[],\"timeout_ms\":9007199254740992}";   /* 2^53 */
+    const char *past  = "{\"rules\":[],\"timeout_ms\":9007199254740993}";   /* 2^53 + 1 */
+    const char *huge  = "{\"rules\":[],\"timeout_ms\":9223372036854775807}"; /* i64::MAX */
+    struct exec_plan plan;
+    assert(config_load_from_json(exact, strlen(exact), &plan) == 0);
+    assert(plan.timeout_ms == 9007199254740992ULL);
+    assert(config_load_from_json(past, strlen(past), &plan) == 0);
+    assert(plan.timeout_ms != 9007199254740993ULL);  /* silently rounded */
+    /* i64::MAX does not even survive the range check: as a double it rounds UP
+     * to 2^63, which json_as_int64 refuses outright. */
+    assert(config_load_from_json(huge, strlen(huge), &plan) == -1);
+}
+
 int main(void) {
     test_loads_empty_rules_with_defaults();
     test_loads_fabricate_rule();
@@ -131,6 +265,12 @@ int main(void) {
     test_rejects_exit_code_out_of_int32_range();
     test_rejects_max_concurrent_handlers_out_of_uint32_range();
     test_rejects_base64_with_invalid_character();
+    test_fabricate_payload_edge();
+    test_rule_name_edge();
+    test_argv_edges();
+    test_rewrite_string_edge();
+    test_rule_count_edge();
+    test_timeout_precision_edge();
     printf("test_config: all tests passed\n");
     return 0;
 }

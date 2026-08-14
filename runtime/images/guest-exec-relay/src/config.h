@@ -9,28 +9,65 @@
  * fire. Defined once, in protocol.h, and reused here. */
 #include "protocol.h"
 
+/* ---------------------------------------------------------------------------
+ * The size limits, every one of them named.
+ *
+ * These are the guest's half of a two-parser contract: chamber-capture's
+ * `exec_consequence.rs::validate()` checks the SAME limits host-side, so a plan
+ * that passes host validation is guaranteed to load here. They were previously
+ * implicit in the buffer declarations below (`char name[128]`, `char
+ * stdout_find[512]`, ...), which is how the two sides came to disagree about
+ * every one of them — and to disagree in the direction that matters: the host
+ * accepted a 2000-byte fabricate stdout that this parser rejects, so the plan
+ * was host-valid and the cell then refused to start with an error the host
+ * never anticipated.
+ *
+ * Naming them makes the contract quotable from Rust (which mirrors these
+ * values in `exec_consequence.rs` and has a test that re-reads THIS FILE and
+ * fails if the two ever drift apart), and sizing the buffers from the names
+ * below keeps the constant and the storage it describes from separating.
+ *
+ * The boundary conventions differ per limit and are deliberate, because
+ * `copy_str` rejects at `n >= dstsz` (it must leave room for the NUL) while the
+ * count checks reject at `n > MAX`:
+ *
+ *   MAX_RULES / MAX_ARGV      COUNTS      — the limit itself is VALID
+ *   MAX_RULE_NAME / _ARGV_ELEM / _REWRITE_STR   BYTE LENGTHS — limit is VALID
+ *   MAX_FABRICATE_BYTES       BYTE LENGTH — the limit itself is REJECTED
+ *                                            (`>=`, see load_verb)
+ * ------------------------------------------------------------------------- */
+
+/* Most rules one plan may carry. A plan with exactly this many loads. */
 #define EXEC_RELAY_MAX_RULES 64
+/* Longest rule name, in bytes, NOT counting the NUL. */
+#define EXEC_RELAY_MAX_RULE_NAME 127
+/* Longest single argv element in a matcher or a substitute replacement. */
+#define EXEC_RELAY_MAX_ARGV_ELEM 255
+/* Longest rewrite find/replace string, in bytes. */
+#define EXEC_RELAY_MAX_REWRITE_STR 511
+/* Fabricate stdout/stderr budget. Note this one is exclusive: load_verb
+ * rejects a payload of exactly this length (`outlen >= ...`). */
 #define EXEC_RELAY_MAX_FABRICATE_BYTES 2000
 
 typedef enum { MATCH_PREFIX, MATCH_EXACT, MATCH_ARGV0 } match_kind_t;
 typedef enum { VERB_SUBSTITUTE, VERB_REWRITE, VERB_FABRICATE } verb_kind_t;
 
 struct exec_rule {
-    char name[128];
+    char name[EXEC_RELAY_MAX_RULE_NAME + 1];
     match_kind_t match_kind;
-    char match_argv[EXEC_RELAY_MAX_ARGV][256];
+    char match_argv[EXEC_RELAY_MAX_ARGV][EXEC_RELAY_MAX_ARGV_ELEM + 1];
     int match_argv_len;      /* used by MATCH_PREFIX / MATCH_EXACT */
-    char match_argv0[256];   /* used by MATCH_ARGV0 */
+    char match_argv0[EXEC_RELAY_MAX_ARGV_ELEM + 1];   /* used by MATCH_ARGV0 */
 
     verb_kind_t verb;
     /* VERB_SUBSTITUTE */
-    char replacement_argv[EXEC_RELAY_MAX_ARGV][256];
+    char replacement_argv[EXEC_RELAY_MAX_ARGV][EXEC_RELAY_MAX_ARGV_ELEM + 1];
     int replacement_argv_len;
     /* VERB_REWRITE */
-    char stdout_find[512];
-    char stdout_replace[512];
-    char stderr_find[512];
-    char stderr_replace[512];
+    char stdout_find[EXEC_RELAY_MAX_REWRITE_STR + 1];
+    char stdout_replace[EXEC_RELAY_MAX_REWRITE_STR + 1];
+    char stderr_find[EXEC_RELAY_MAX_REWRITE_STR + 1];
+    char stderr_replace[EXEC_RELAY_MAX_REWRITE_STR + 1];
     int has_stdout_rewrite;
     int has_stderr_rewrite;
     /* VERB_FABRICATE */

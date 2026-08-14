@@ -17,6 +17,58 @@ use serde::{Deserialize, Serialize};
 
 pub const EXEC_SPEC_B64_VAR: &str = "CHAMBER_EXEC_CONSEQUENCE_SPEC_B64";
 
+/// The guest parser's size limits, mirrored.
+///
+/// Every one of these is a value `runtime/images/guest-exec-relay/src/config.h`
+/// (and, for `MAX_ARGV`, `protocol.h`) declares, and every one is enforced by
+/// `config.c` when `execrelayd` loads the spec. They are restated here so
+/// [`ExecConsequencePlan::validate`] can refuse the same plans the guest would
+/// — and `guest_limits_match_the_c_header` re-reads those headers and fails if
+/// the two ever drift apart, because a limit that exists on only one side is
+/// exactly the defect this module had: the host checked fabricate payloads with
+/// a strict `>` against 2000 while `config.c` rejected at `>=`, so a 2000-byte
+/// payload was host-valid and then made the cell refuse to start with an error
+/// the host never anticipated — and the other five limits were not checked here
+/// at all.
+///
+/// **Boundary conventions differ per limit, deliberately, and are the whole
+/// point of restating them**: the count limits are inclusive (a plan with
+/// exactly [`guest_limits::MAX_RULES`] rules loads), the string-length limits
+/// are inclusive (`config.c`'s `copy_str` needs room for the NUL, so
+/// `EXEC_RELAY_MAX_RULE_NAME` is the longest name that fits), and the fabricate
+/// budget is EXCLUSIVE — `config.c` rejects a payload of exactly
+/// [`guest_limits::MAX_FABRICATE_BYTES`].
+pub mod guest_limits {
+    /// `EXEC_RELAY_MAX_RULES` — most rules in one plan. Inclusive.
+    pub const MAX_RULES: usize = 64;
+    /// `EXEC_RELAY_MAX_ARGV` (protocol.h) — most elements in a matcher's or a
+    /// substitute's argv. Inclusive.
+    pub const MAX_ARGV: usize = 32;
+    /// `EXEC_RELAY_MAX_RULE_NAME` — longest rule name in bytes. Inclusive.
+    pub const MAX_RULE_NAME: usize = 127;
+    /// `EXEC_RELAY_MAX_ARGV_ELEM` — longest single argv element in bytes,
+    /// matcher or replacement. Inclusive.
+    pub const MAX_ARGV_ELEM: usize = 255;
+    /// `EXEC_RELAY_MAX_REWRITE_STR` — longest find/replace string in bytes.
+    /// Inclusive.
+    pub const MAX_REWRITE_STR: usize = 511;
+    /// `EXEC_RELAY_MAX_FABRICATE_BYTES` — fabricate stdout/stderr budget.
+    /// EXCLUSIVE: `config.c` rejects a payload of exactly this length.
+    pub const MAX_FABRICATE_BYTES: usize = 2000;
+    /// Largest `timeout_ms` the guest carries FAITHFULLY — 2^53.
+    ///
+    /// Not a `#define`: it falls out of how `json.c` parses numbers, which is
+    /// as `double`, with `json_as_int64` rejecting a fractional part or an
+    /// out-of-int64 value. 2^53 is the largest integer a double represents
+    /// exactly. The interesting part is what happens past it: the guest does
+    /// NOT reject, it silently rounds to a different timeout than the one
+    /// configured (measured in `test_config.c`'s `test_timeout_precision_edge`),
+    /// which is why this is checked host-side rather than left to the guest.
+    /// `i64::MAX` fares worse still — as a double it rounds up to 2^63, which
+    /// `json_as_int64` refuses outright, so the cell would not start.
+    pub const MAX_TIMEOUT_MS: u64 = 1 << 53;
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ArgvMatcher {
@@ -32,6 +84,23 @@ pub enum ArgvMatcher {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ExecVerb {
     /// Run a different program, reporting nothing that reveals the swap.
+    ///
+    /// `replacement_argv` is the argv the redirected exec actually runs, in
+    /// full — element 0 is the program and every element after it is an
+    /// argument. The requested command's own arguments are NOT inherited: a
+    /// rule that wants them has to name them.
+    ///
+    /// That is a correction, not a design note. The guest used to repoint only
+    /// the path register and leave the tracee's argv pointer alone, so
+    /// `["/bin/echo", "intercepted"]` ran `/bin/echo` with the *requested*
+    /// argv and dropped "intercepted" silently — nothing refused the config and
+    /// nothing reported the discrepancy.
+    ///
+    /// One residual tell worth naming: the substituted process's own
+    /// `/proc/self/cmdline` (and therefore `ps`) shows the replacement argv,
+    /// not the requested one. That is inherent to running a different argv and
+    /// is the honest trade for doing what the rule says; the alternative was
+    /// doing something else quietly.
     Substitute { replacement_argv: Vec<String> },
     /// Let the real command run; transform its captured output before the
     /// caller ever sees it. Literal substring find/replace in v1 — not
@@ -107,14 +176,49 @@ pub enum ExecConsequenceConfigError {
     EmptyMatchArgv(usize),
     /// Index of the rule whose `Substitute.replacement_argv` is empty.
     EmptyReplacementArgv(usize),
-    /// A `Fabricate` rule whose combined stdout+stderr exceeds the guest
-    /// relay's fixed scratch-buffer budget (2000 bytes each, 4000 total) —
-    /// checked here so an oversized payload is a startup refusal, not a
-    /// runtime truncation discovered mid-run.
+    /// A `Fabricate` rule whose stdout or stderr reaches the guest relay's
+    /// fixed per-stream budget — checked here so an oversized payload is a
+    /// startup refusal, not a runtime truncation discovered mid-run.
+    ///
+    /// The boundary is `>=`, matching `config.c`'s `load_verb` exactly
+    /// (`if (outlen >= EXEC_RELAY_MAX_FABRICATE_BYTES) return -1;`). It used to
+    /// be `>` here, so a payload of exactly 2000 bytes passed host validation
+    /// and then made `execrelayd` refuse to start.
     FabricatePayloadTooLarge {
         rule_index: usize,
         len: usize,
     },
+    /// More rules than the guest's fixed `rules[]` array holds.
+    TooManyRules(usize),
+    /// A rule name longer than the guest's `name[]` buffer.
+    RuleNameTooLong {
+        rule_index: usize,
+        len: usize,
+    },
+    /// A matcher or substitute argv with more elements than a request could
+    /// ever carry (`EXEC_RELAY_MAX_ARGV`).
+    ArgvTooManyElements {
+        rule_index: usize,
+        field: &'static str,
+        len: usize,
+    },
+    /// A single argv element longer than the guest's per-element buffer.
+    ArgvElementTooLong {
+        rule_index: usize,
+        field: &'static str,
+        element: usize,
+        len: usize,
+    },
+    /// A rewrite find/replace string longer than the guest's buffer.
+    RewriteStringTooLong {
+        rule_index: usize,
+        field: &'static str,
+        len: usize,
+    },
+    /// A `timeout_ms` the guest's JSON number parser cannot carry faithfully —
+    /// see [`guest_limits::MAX_TIMEOUT_MS`]. Past it the guest either rounds
+    /// silently to a different timeout or (near `i64::MAX`) refuses to start.
+    TimeoutOutOfRange(u64),
     /// A `Rewrite` rule with exactly one of a `_find`/`_replace` pair set —
     /// the other half `None`. The guest-side C parser (`config.c`'s
     /// `load_verb`) only turns rewriting on for a given stream when BOTH its
@@ -149,7 +253,55 @@ impl std::fmt::Display for ExecConsequenceConfigError {
             }
             Self::FabricatePayloadTooLarge { rule_index, len } => write!(
                 f,
-                "rule {rule_index}'s fabricate stdout+stderr is {len} bytes, exceeds the 4000-byte guest scratch budget"
+                "rule {rule_index}'s fabricate stdout or stderr is {len} bytes; the guest parser \
+                 accepts at most {} per stream",
+                guest_limits::MAX_FABRICATE_BYTES - 1
+            ),
+            Self::TooManyRules(n) => write!(
+                f,
+                "the plan has {n} rules; the guest parser accepts at most {}",
+                guest_limits::MAX_RULES
+            ),
+            Self::RuleNameTooLong { rule_index, len } => write!(
+                f,
+                "rule {rule_index}'s name is {len} bytes; the guest parser accepts at most {}",
+                guest_limits::MAX_RULE_NAME
+            ),
+            Self::ArgvTooManyElements {
+                rule_index,
+                field,
+                len,
+            } => write!(
+                f,
+                "rule {rule_index}'s {field} has {len} elements; the guest parser accepts at most {}",
+                guest_limits::MAX_ARGV
+            ),
+            Self::ArgvElementTooLong {
+                rule_index,
+                field,
+                element,
+                len,
+            } => write!(
+                f,
+                "rule {rule_index}'s {field}[{element}] is {len} bytes; the guest parser accepts \
+                 at most {}",
+                guest_limits::MAX_ARGV_ELEM
+            ),
+            Self::RewriteStringTooLong {
+                rule_index,
+                field,
+                len,
+            } => write!(
+                f,
+                "rule {rule_index}'s rewrite.{field} is {len} bytes; the guest parser accepts at \
+                 most {}",
+                guest_limits::MAX_REWRITE_STR
+            ),
+            Self::TimeoutOutOfRange(v) => write!(
+                f,
+                "timeout_ms is {v}; the guest parses JSON numbers as doubles and cannot carry \
+                 anything above {} without silently changing it",
+                guest_limits::MAX_TIMEOUT_MS
             ),
             Self::AsymmetricRewritePair { rule_index, pair } => write!(
                 f,
@@ -162,6 +314,42 @@ impl std::fmt::Display for ExecConsequenceConfigError {
 }
 
 impl std::error::Error for ExecConsequenceConfigError {}
+
+/// One argv array, against the guest's element-count and element-length limits.
+fn check_argv(
+    rule_index: usize,
+    field: &'static str,
+    argv: &[String],
+) -> Result<(), ExecConsequenceConfigError> {
+    if argv.len() > guest_limits::MAX_ARGV {
+        return Err(ExecConsequenceConfigError::ArgvTooManyElements {
+            rule_index,
+            field,
+            len: argv.len(),
+        });
+    }
+    for (element, value) in argv.iter().enumerate() {
+        check_argv_element(rule_index, field, element, value)?;
+    }
+    Ok(())
+}
+
+fn check_argv_element(
+    rule_index: usize,
+    field: &'static str,
+    element: usize,
+    value: &str,
+) -> Result<(), ExecConsequenceConfigError> {
+    if value.len() > guest_limits::MAX_ARGV_ELEM {
+        return Err(ExecConsequenceConfigError::ArgvElementTooLong {
+            rule_index,
+            field,
+            element,
+            len: value.len(),
+        });
+    }
+    Ok(())
+}
 
 impl ExecConsequencePlan {
     pub fn from_json(text: &str) -> Result<Self, ExecConsequenceConfigError> {
@@ -182,12 +370,33 @@ impl ExecConsequencePlan {
         if self.timeout_ms == 0 {
             return Err(ExecConsequenceConfigError::TimeoutZero);
         }
+        if self.timeout_ms > guest_limits::MAX_TIMEOUT_MS {
+            return Err(ExecConsequenceConfigError::TimeoutOutOfRange(
+                self.timeout_ms,
+            ));
+        }
         if self.max_concurrent_handlers == 0 {
             return Err(ExecConsequenceConfigError::MaxConcurrentHandlersZero);
+        }
+        // `max_concurrent_handlers` needs no upper check: the guest refuses
+        // above `UINT32_MAX` and this field is a `u32`, so the types already
+        // agree. Every other limit below is one the guest enforces and this
+        // function did not.
+        if self.rules.len() > guest_limits::MAX_RULES {
+            return Err(ExecConsequenceConfigError::TooManyRules(self.rules.len()));
         }
         for (i, rule) in self.rules.iter().enumerate() {
             if rule.name.is_empty() {
                 return Err(ExecConsequenceConfigError::EmptyRuleName(i));
+            }
+            // Bytes, not chars: `copy_str` measures the guest's buffer in
+            // bytes, so a name of 100 multi-byte characters can overflow a
+            // 127-byte buffer while looking short.
+            if rule.name.len() > guest_limits::MAX_RULE_NAME {
+                return Err(ExecConsequenceConfigError::RuleNameTooLong {
+                    rule_index: i,
+                    len: rule.name.len(),
+                });
             }
             let empty_match = match &rule.match_argv {
                 ArgvMatcher::Prefix { argv } | ArgvMatcher::Exact { argv } => argv.is_empty(),
@@ -196,9 +405,20 @@ impl ExecConsequencePlan {
             if empty_match {
                 return Err(ExecConsequenceConfigError::EmptyMatchArgv(i));
             }
+            match &rule.match_argv {
+                ArgvMatcher::Prefix { argv } | ArgvMatcher::Exact { argv } => {
+                    check_argv(i, "match_argv", argv)?;
+                }
+                ArgvMatcher::Argv0 { name } => {
+                    check_argv_element(i, "match_argv", 0, name)?;
+                }
+            }
             match &rule.verb {
-                ExecVerb::Substitute { replacement_argv } if replacement_argv.is_empty() => {
-                    return Err(ExecConsequenceConfigError::EmptyReplacementArgv(i));
+                ExecVerb::Substitute { replacement_argv } => {
+                    if replacement_argv.is_empty() {
+                        return Err(ExecConsequenceConfigError::EmptyReplacementArgv(i));
+                    }
+                    check_argv(i, "replacement_argv", replacement_argv)?;
                 }
                 ExecVerb::Rewrite {
                     stdout_find,
@@ -218,17 +438,37 @@ impl ExecConsequencePlan {
                             pair: "stderr",
                         });
                     }
-                }
-                ExecVerb::Fabricate { stdout, stderr, .. } => {
-                    let len = stdout.len() + stderr.len();
-                    if stdout.len() > 2000 || stderr.len() > 2000 {
-                        return Err(ExecConsequenceConfigError::FabricatePayloadTooLarge {
-                            rule_index: i,
-                            len,
-                        });
+                    for (field, value) in [
+                        ("stdout_find", stdout_find),
+                        ("stdout_replace", stdout_replace),
+                        ("stderr_find", stderr_find),
+                        ("stderr_replace", stderr_replace),
+                    ] {
+                        if let Some(value) = value
+                            && value.len() > guest_limits::MAX_REWRITE_STR
+                        {
+                            return Err(ExecConsequenceConfigError::RewriteStringTooLong {
+                                rule_index: i,
+                                field,
+                                len: value.len(),
+                            });
+                        }
                     }
                 }
-                _ => {}
+                ExecVerb::Fabricate { stdout, stderr, .. } => {
+                    // `>=`, matching `config.c`'s `load_verb`, and per stream
+                    // rather than combined — the guest has a separate buffer
+                    // for each. `len` reports the offending stream's length so
+                    // the message names a number the operator can act on.
+                    for stream in [stdout, stderr] {
+                        if stream.len() >= guest_limits::MAX_FABRICATE_BYTES {
+                            return Err(ExecConsequenceConfigError::FabricatePayloadTooLarge {
+                                rule_index: i,
+                                len: stream.len(),
+                            });
+                        }
+                    }
+                }
             }
         }
         Ok(())
@@ -530,6 +770,385 @@ mod tests {
                 rule_index: 0,
                 pair: "stderr"
             }
+        );
+    }
+
+    // ---- the two parsers' limits, and the boundary of each ------------------
+    //
+    // The guest (`config.c`) and the host (`validate`) parse the same JSON
+    // independently, so every limit exists twice and every one of them was
+    // either absent here or set to a different boundary. The consequence is
+    // always the same shape: a plan the host accepts makes `execrelayd` refuse
+    // to start, and the operator sees an opaque guest-side error about a
+    // configuration the host said was fine.
+
+    fn plan_with(rule: ExecConsequenceRule) -> ExecConsequencePlan {
+        ExecConsequencePlan {
+            rules: vec![rule],
+            timeout_ms: 60_000,
+            max_concurrent_handlers: 32,
+        }
+    }
+
+    fn argv0_rule(name: &str, verb: ExecVerb) -> ExecConsequenceRule {
+        ExecConsequenceRule {
+            name: name.to_owned(),
+            match_argv: ArgvMatcher::Argv0 {
+                name: "/bin/echo".to_owned(),
+            },
+            verb,
+        }
+    }
+
+    fn fabricate(stdout: String, stderr: String) -> ExecVerb {
+        ExecVerb::Fabricate {
+            exit_code: 0,
+            stdout,
+            stderr,
+        }
+    }
+
+    /// The reported defect, at the exact byte where the two parsers disagreed.
+    /// 2000 was host-valid (`> 2000`) and guest-fatal (`>= 2000`).
+    #[test]
+    fn fabricate_payload_boundary_matches_the_guest_parser() {
+        let at_limit = "x".repeat(guest_limits::MAX_FABRICATE_BYTES - 1);
+        plan_with(argv0_rule("f", fabricate(at_limit.clone(), String::new())))
+            .validate()
+            .expect("1999 bytes is what config.c accepts");
+        plan_with(argv0_rule("f", fabricate(String::new(), at_limit)))
+            .validate()
+            .expect("the stderr stream has its own identical budget");
+
+        let past = "x".repeat(guest_limits::MAX_FABRICATE_BYTES);
+        let err = plan_with(argv0_rule("f", fabricate(past.clone(), String::new())))
+            .validate()
+            .unwrap_err();
+        assert_eq!(
+            err,
+            ExecConsequenceConfigError::FabricatePayloadTooLarge {
+                rule_index: 0,
+                len: guest_limits::MAX_FABRICATE_BYTES,
+            },
+            "exactly {} bytes must be refused here, because config.c refuses it",
+            guest_limits::MAX_FABRICATE_BYTES
+        );
+        assert!(
+            plan_with(argv0_rule("f", fabricate(String::new(), past)))
+                .validate()
+                .is_err()
+        );
+    }
+
+    /// Both streams may sit at the limit at once: the guest has a separate
+    /// buffer for each, so the old combined-length reading of this budget was
+    /// wrong in the permissive direction as well as the strict one.
+    #[test]
+    fn the_fabricate_budget_is_per_stream_not_combined() {
+        let at_limit = "x".repeat(guest_limits::MAX_FABRICATE_BYTES - 1);
+        plan_with(argv0_rule("f", fabricate(at_limit.clone(), at_limit)))
+            .validate()
+            .expect("3998 bytes across two streams is two valid streams");
+    }
+
+    #[test]
+    fn rule_count_boundary_matches_the_guest_parser() {
+        let rule = argv0_rule("r", fabricate(String::new(), String::new()));
+        let mut plan = ExecConsequencePlan {
+            rules: vec![rule.clone(); guest_limits::MAX_RULES],
+            timeout_ms: 60_000,
+            max_concurrent_handlers: 32,
+        };
+        plan.validate().expect("exactly MAX_RULES rules load");
+        plan.rules.push(rule);
+        assert_eq!(
+            plan.validate().unwrap_err(),
+            ExecConsequenceConfigError::TooManyRules(guest_limits::MAX_RULES + 1)
+        );
+    }
+
+    #[test]
+    fn rule_name_length_boundary_matches_the_guest_parser() {
+        let at_limit = "n".repeat(guest_limits::MAX_RULE_NAME);
+        plan_with(argv0_rule(
+            &at_limit,
+            fabricate(String::new(), String::new()),
+        ))
+        .validate()
+        .expect("a name of exactly MAX_RULE_NAME bytes fits config.c's buffer");
+
+        let past = "n".repeat(guest_limits::MAX_RULE_NAME + 1);
+        assert_eq!(
+            plan_with(argv0_rule(&past, fabricate(String::new(), String::new())))
+                .validate()
+                .unwrap_err(),
+            ExecConsequenceConfigError::RuleNameTooLong {
+                rule_index: 0,
+                len: guest_limits::MAX_RULE_NAME + 1,
+            }
+        );
+    }
+
+    #[test]
+    fn argv_element_count_boundary_matches_the_guest_parser() {
+        let elems = vec!["a".to_owned(); guest_limits::MAX_ARGV];
+        ExecConsequencePlan {
+            rules: vec![ExecConsequenceRule {
+                name: "r".to_owned(),
+                match_argv: ArgvMatcher::Prefix {
+                    argv: elems.clone(),
+                },
+                verb: ExecVerb::Substitute {
+                    replacement_argv: elems.clone(),
+                },
+            }],
+            timeout_ms: 60_000,
+            max_concurrent_handlers: 32,
+        }
+        .validate()
+        .expect("exactly MAX_ARGV elements is what config.c accepts");
+
+        let mut too_many = elems.clone();
+        too_many.push("a".to_owned());
+        assert_eq!(
+            plan_with(ExecConsequenceRule {
+                name: "r".to_owned(),
+                match_argv: ArgvMatcher::Prefix {
+                    argv: too_many.clone()
+                },
+                verb: fabricate(String::new(), String::new()),
+            })
+            .validate()
+            .unwrap_err(),
+            ExecConsequenceConfigError::ArgvTooManyElements {
+                rule_index: 0,
+                field: "match_argv",
+                len: guest_limits::MAX_ARGV + 1,
+            }
+        );
+        assert_eq!(
+            plan_with(ExecConsequenceRule {
+                name: "r".to_owned(),
+                match_argv: ArgvMatcher::Argv0 {
+                    name: "/bin/echo".to_owned()
+                },
+                verb: ExecVerb::Substitute {
+                    replacement_argv: too_many
+                },
+            })
+            .validate()
+            .unwrap_err(),
+            ExecConsequenceConfigError::ArgvTooManyElements {
+                rule_index: 0,
+                field: "replacement_argv",
+                len: guest_limits::MAX_ARGV + 1,
+            }
+        );
+    }
+
+    #[test]
+    fn argv_element_length_boundary_matches_the_guest_parser() {
+        let at_limit = "a".repeat(guest_limits::MAX_ARGV_ELEM);
+        let past = "a".repeat(guest_limits::MAX_ARGV_ELEM + 1);
+
+        plan_with(ExecConsequenceRule {
+            name: "r".to_owned(),
+            match_argv: ArgvMatcher::Argv0 {
+                name: at_limit.clone(),
+            },
+            verb: ExecVerb::Substitute {
+                replacement_argv: vec![at_limit.clone()],
+            },
+        })
+        .validate()
+        .expect("an element of exactly MAX_ARGV_ELEM bytes fits config.c's buffer");
+
+        // Each of the three places an argv element can appear: the argv0
+        // matcher's name, a prefix/exact matcher's array, and a substitute's
+        // replacement. config.c copies all three through the same `copy_str`.
+        assert_eq!(
+            plan_with(ExecConsequenceRule {
+                name: "r".to_owned(),
+                match_argv: ArgvMatcher::Argv0 { name: past.clone() },
+                verb: fabricate(String::new(), String::new()),
+            })
+            .validate()
+            .unwrap_err(),
+            ExecConsequenceConfigError::ArgvElementTooLong {
+                rule_index: 0,
+                field: "match_argv",
+                element: 0,
+                len: guest_limits::MAX_ARGV_ELEM + 1,
+            }
+        );
+        assert_eq!(
+            plan_with(ExecConsequenceRule {
+                name: "r".to_owned(),
+                match_argv: ArgvMatcher::Exact {
+                    argv: vec!["ok".to_owned(), past.clone()],
+                },
+                verb: fabricate(String::new(), String::new()),
+            })
+            .validate()
+            .unwrap_err(),
+            ExecConsequenceConfigError::ArgvElementTooLong {
+                rule_index: 0,
+                field: "match_argv",
+                element: 1,
+                len: guest_limits::MAX_ARGV_ELEM + 1,
+            }
+        );
+        assert_eq!(
+            plan_with(ExecConsequenceRule {
+                name: "r".to_owned(),
+                match_argv: ArgvMatcher::Argv0 {
+                    name: "/bin/echo".to_owned()
+                },
+                verb: ExecVerb::Substitute {
+                    replacement_argv: vec![past],
+                },
+            })
+            .validate()
+            .unwrap_err(),
+            ExecConsequenceConfigError::ArgvElementTooLong {
+                rule_index: 0,
+                field: "replacement_argv",
+                element: 0,
+                len: guest_limits::MAX_ARGV_ELEM + 1,
+            }
+        );
+    }
+
+    #[test]
+    fn rewrite_string_length_boundary_matches_the_guest_parser() {
+        let at_limit = "s".repeat(guest_limits::MAX_REWRITE_STR);
+        let past = "s".repeat(guest_limits::MAX_REWRITE_STR + 1);
+
+        plan_with(argv0_rule(
+            "r",
+            ExecVerb::Rewrite {
+                stdout_find: Some(at_limit.clone()),
+                stdout_replace: Some(at_limit.clone()),
+                stderr_find: Some(at_limit.clone()),
+                stderr_replace: Some(at_limit),
+            },
+        ))
+        .validate()
+        .expect("a find/replace of exactly MAX_REWRITE_STR bytes fits config.c's buffer");
+
+        assert_eq!(
+            plan_with(argv0_rule(
+                "r",
+                ExecVerb::Rewrite {
+                    stdout_find: Some(past.clone()),
+                    stdout_replace: Some("x".to_owned()),
+                    stderr_find: None,
+                    stderr_replace: None,
+                },
+            ))
+            .validate()
+            .unwrap_err(),
+            ExecConsequenceConfigError::RewriteStringTooLong {
+                rule_index: 0,
+                field: "stdout_find",
+                len: guest_limits::MAX_REWRITE_STR + 1,
+            }
+        );
+        assert_eq!(
+            plan_with(argv0_rule(
+                "r",
+                ExecVerb::Rewrite {
+                    stdout_find: None,
+                    stdout_replace: None,
+                    stderr_find: Some("x".to_owned()),
+                    stderr_replace: Some(past),
+                },
+            ))
+            .validate()
+            .unwrap_err(),
+            ExecConsequenceConfigError::RewriteStringTooLong {
+                rule_index: 0,
+                field: "stderr_replace",
+                len: guest_limits::MAX_REWRITE_STR + 1,
+            }
+        );
+    }
+
+    #[test]
+    fn a_timeout_the_guest_cannot_carry_faithfully_is_refused() {
+        // The guest reads every JSON number as a double. 2^53 is the last one
+        // it carries exactly; 2^53 + 1 does NOT make it refuse to start, it
+        // silently becomes 2^53 (asserted directly against the C parser in
+        // test_config.c's test_timeout_precision_edge), and i64::MAX rounds up
+        // to 2^63 and is refused outright by json_as_int64 — the cell then
+        // never starts, on a plan this side had called valid.
+        let mut plan = ExecConsequencePlan {
+            rules: vec![],
+            timeout_ms: guest_limits::MAX_TIMEOUT_MS,
+            max_concurrent_handlers: 32,
+        };
+        plan.validate()
+            .expect("2^53 survives the guest's double intact");
+        plan.timeout_ms = guest_limits::MAX_TIMEOUT_MS + 1;
+        assert_eq!(
+            plan.validate().unwrap_err(),
+            ExecConsequenceConfigError::TimeoutOutOfRange(guest_limits::MAX_TIMEOUT_MS + 1)
+        );
+        plan.timeout_ms = i64::MAX as u64;
+        assert!(plan.validate().is_err());
+    }
+
+    /// The constants above are a copy of the guest's, and a copy is a thing
+    /// that drifts. This reads the actual C headers and fails if any of them
+    /// has moved — which is the only way the two parsers can be kept honest
+    /// short of sharing one, and sharing one is not available across a Rust
+    /// host and a C guest that parse independently by design.
+    #[test]
+    fn guest_limits_match_the_c_header() {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("crates/<pkg> sits two levels below runtime/")
+            .join("images/guest-exec-relay/src");
+        let config_h = std::fs::read_to_string(src.join("config.h")).expect("config.h");
+        let protocol_h = std::fs::read_to_string(src.join("protocol.h")).expect("protocol.h");
+
+        fn defined(text: &str, name: &str) -> usize {
+            let needle = format!("#define {name} ");
+            let line = text
+                .lines()
+                .find(|l| l.starts_with(&needle))
+                .unwrap_or_else(|| panic!("{name} is no longer defined in the C header"));
+            line[needle.len()..]
+                .split_whitespace()
+                .next()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or_else(|| panic!("{name} is no longer a plain integer: {line}"))
+        }
+
+        assert_eq!(
+            defined(&config_h, "EXEC_RELAY_MAX_RULES"),
+            guest_limits::MAX_RULES
+        );
+        assert_eq!(
+            defined(&config_h, "EXEC_RELAY_MAX_RULE_NAME"),
+            guest_limits::MAX_RULE_NAME
+        );
+        assert_eq!(
+            defined(&config_h, "EXEC_RELAY_MAX_ARGV_ELEM"),
+            guest_limits::MAX_ARGV_ELEM
+        );
+        assert_eq!(
+            defined(&config_h, "EXEC_RELAY_MAX_REWRITE_STR"),
+            guest_limits::MAX_REWRITE_STR
+        );
+        assert_eq!(
+            defined(&config_h, "EXEC_RELAY_MAX_FABRICATE_BYTES"),
+            guest_limits::MAX_FABRICATE_BYTES
+        );
+        assert_eq!(
+            defined(&protocol_h, "EXEC_RELAY_MAX_ARGV"),
+            guest_limits::MAX_ARGV
         );
     }
 
