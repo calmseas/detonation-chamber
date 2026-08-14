@@ -23,6 +23,15 @@
 //! attached. A refusal is recoverable; a chamber that believes it has no
 //! egress is not.
 //!
+//! Each of the three earns that differently. The routing and NAT checks are
+//! searches for a line that must be absent, so absence proves nothing on its
+//! own: each holds only if its command exited zero *and* printed something
+//! recognisable as the table it was asked for — see
+//! [`Preflight::judge_routing_table`] and [`Preflight::judge_nat_table`]. The
+//! `DOCKER-INTERNAL` check needs no such rule, because it is already a search
+//! for two rules that must be *present*, naming this network's own bridge; no
+//! inspection that failed to run can produce those.
+//!
 //! # These describe the chamber network, not any network
 //!
 //! [`Preflight::run`] is meaningful only against an `--internal` network. A
@@ -107,6 +116,20 @@ pub struct Preflight {
     outcomes: Vec<AssertOutcome>,
 }
 
+/// One inspection run: whether it ran, and what it printed.
+///
+/// The exit code travels with the output because separating them is exactly
+/// how a check comes to report a result it never obtained. An inspection that
+/// hands on only its stdout has already thrown away the one field that
+/// distinguishes "the table contains no such rule" from "there is no table
+/// here" — and the reader downstream cannot recover it.
+#[derive(Debug)]
+struct Inspection {
+    exit_code: i32,
+    stdout: String,
+    stderr: String,
+}
+
 impl Preflight {
     /// Measures all three against a live `--internal` network.
     ///
@@ -128,16 +151,33 @@ impl Preflight {
         outcomes.push(Self::check_no_default_route(network, guest_image)?);
 
         let nat = Self::inspect(inspector_image, "nat")?;
-        outcomes.push(Self::check_no_masquerade(network, &nat));
+        outcomes.push(Self::judge_nat_table(
+            network,
+            nat.exit_code,
+            &nat.stdout,
+            &nat.stderr,
+        ));
 
+        // The DROP-pair check is handed only the output, deliberately. It
+        // holds solely on two rules that name this network's own bridge, so an
+        // inspection that never ran cannot yield a `held` from it — absence is
+        // already failure there, which is the property the two searches above
+        // had to be given by hand.
         let filter = Self::inspect(inspector_image, "filter")?;
-        outcomes.push(Self::check_docker_internal(network, &filter));
+        outcomes.push(Self::check_docker_internal(network, &filter.stdout));
 
         Ok(Self { outcomes })
     }
 
     /// Runs `iptables-save -t <table>` in the engine host's namespace.
-    fn inspect(inspector_image: &str, table: &str) -> Result<String, EngineError> {
+    ///
+    /// Returns the container's own exit code alongside its streams. The engine
+    /// reporting that it ran a container successfully says nothing about
+    /// whether `iptables-save` inside it did anything: a missing binary, a
+    /// kernel without the table, or an entrypoint that swallowed the argv all
+    /// exit non-zero with an empty stdout, and the caller cannot tell that from
+    /// a clean table unless the code comes with it.
+    fn inspect(inspector_image: &str, table: &str) -> Result<Inspection, EngineError> {
         let container = Container::create(&ContainerSpec {
             image: inspector_image.to_owned(),
             attach: Attach::Host,
@@ -155,10 +195,15 @@ impl Preflight {
             volumes: vec![],
         })?;
         container.start()?;
-        container.wait(INSPECT_WINDOW)?;
+        let exit_code = container.wait(INSPECT_WINDOW)?;
         let logs = container.logs()?;
         container.destroy(INSPECT_WINDOW)?;
-        Ok(logs.stdout)
+
+        Ok(Inspection {
+            exit_code,
+            stdout: logs.stdout,
+            stderr: logs.stderr,
+        })
     }
 
     /// Runs `ip route` in the guest image on the chamber network.
@@ -251,20 +296,67 @@ impl Preflight {
         }
     }
 
-    fn check_no_masquerade(network: &Network, nat_table: &str) -> AssertOutcome {
-        let offending: Vec<&str> = nat_table
+    /// Decides what a NAT table — or the absence of one — proves.
+    ///
+    /// The same collapse as [`Preflight::judge_routing_table`], one assert
+    /// over. "No MASQUERADE line mentions our subnet" and "there was nothing to
+    /// search" are the same empty result, and only the first is evidence. The
+    /// ways to get the second are the neighbouring failures verbatim: an
+    /// inspector image without `iptables`, a kernel whose nat table will not
+    /// load, an engine that changed where it programs NAT, or an entrypoint
+    /// that received `iptables-save -t nat` as arguments and ignored them —
+    /// which is precisely how `execrelayd` defeated the routing check.
+    ///
+    /// # The envelope is the proof, not the rules
+    ///
+    /// The signal that separates the two is the dump's own framing.
+    /// `iptables-save` brackets each table with a `*<table>` header and a
+    /// `COMMIT` trailer — the format `iptables-restore` consumes, so both are
+    /// contractual rather than cosmetic — and it prints them **even for a table
+    /// holding no rules at all**. Measured on the inspector image (iptables
+    /// 1.8.10, nf_tables): `iptables-save -t raw`, against a table Docker never
+    /// touches, still printed `*raw`, two builtin chains and `COMMIT`, and
+    /// exited zero.
+    ///
+    /// That is what makes this checkable without being self-defeating. A host
+    /// carrying **no MASQUERADE for the chamber subnet is the state this assert
+    /// is looking for**, so requiring any particular rule to exist would refuse
+    /// exactly the chambers that are correct. Requiring the envelope demands
+    /// proof that the dump happened while demanding nothing of its contents.
+    ///
+    /// Requiring `COMMIT` and not the header alone additionally rejects a dump
+    /// cut short, where the MASQUERADE line could be among the lines that never
+    /// arrived.
+    fn judge_nat_table(
+        network: &Network,
+        exit_code: i32,
+        stdout: &str,
+        stderr: &str,
+    ) -> AssertOutcome {
+        let measured = exit_code == 0 && is_complete_dump(stdout, "nat");
+        let offending: Vec<&str> = stdout
             .lines()
             .filter(|line| line.contains("MASQUERADE") && line.contains(network.subnet()))
             .collect();
 
         AssertOutcome {
             which: StructuralAssert::NoMasqueradeForSubnet,
-            held: offending.is_empty(),
-            evidence: if offending.is_empty() {
+            held: measured && offending.is_empty(),
+            evidence: if !measured {
+                format!(
+                    "`iptables-save -t nat` printed no complete nat table and exited {exit_code}, \
+                     so it was not measured: the absence of a MASQUERADE line here is the absence \
+                     of a table to search, not evidence that {} is unmasqueraded.\n  stdout: \
+                     {}\n  stderr: {}",
+                    network.subnet(),
+                    excerpt(stdout),
+                    excerpt(stderr),
+                )
+            } else if offending.is_empty() {
                 format!(
                     "no MASQUERADE line mentions {}; nat table has {} rules",
                     network.subnet(),
-                    nat_table.lines().filter(|l| l.starts_with("-A")).count()
+                    stdout.lines().filter(|l| l.starts_with("-A")).count()
                 )
             } else {
                 offending.join("\n")
@@ -337,6 +429,23 @@ impl Preflight {
 fn bridge_name(network_id: &str) -> String {
     let short: String = network_id.chars().take(12).collect();
     format!("br-{short}")
+}
+
+/// Whether `stdout` holds a complete `iptables-save` dump of `table`.
+///
+/// One dump is a `*<table>` line, that table's chains and rules, then `COMMIT`.
+/// Looking for the trailer only *after* the header is what makes this a dump of
+/// the table that was asked for, rather than the word appearing somewhere in a
+/// stream — an error message naming the table, say, which is what an engine
+/// that cannot load it prints.
+fn is_complete_dump(stdout: &str, table: &str) -> bool {
+    let header = format!("*{table}");
+    let mut after_header = stdout
+        .lines()
+        .map(str::trim)
+        .skip_while(|line| *line != header);
+
+    after_header.next().is_some() && after_header.any(|line| line == "COMMIT")
 }
 
 /// Route types `ip route` may print ahead of the destination.
@@ -438,22 +547,129 @@ mod tests {
         Network::for_test(id.to_owned(), subnet.to_owned())
     }
 
+    /// A complete `iptables-save -t nat` dump wrapped around `rules`.
+    ///
+    /// Captured from the inspector image against Docker 29.5.2 (iptables
+    /// 1.8.10, nf_tables): the header, the builtin chain policies, the rules,
+    /// `COMMIT`. Feeding the checks bare rule lines instead would test a shape
+    /// the engine never emits — and would have hidden the collapse these tests
+    /// exist to pin, since bare rules carry no evidence that a dump happened.
+    fn nat_dump(rules: &str) -> String {
+        format!(
+            "# Generated by iptables-save v1.8.10 (nf_tables) on Fri Aug 14 19:12:11 2026\n\
+             *nat\n\
+             :PREROUTING ACCEPT [272:17446]\n\
+             :INPUT ACCEPT [0:0]\n\
+             :OUTPUT ACCEPT [766:67706]\n\
+             :POSTROUTING ACCEPT [766:67706]\n\
+             :DOCKER - [0:0]\n\
+             {rules}COMMIT\n\
+             # Completed on Fri Aug 14 19:12:11 2026\n"
+        )
+    }
+
+    fn judge_nat(exit_code: i32, stdout: &str, stderr: &str) -> AssertOutcome {
+        Preflight::judge_nat_table(
+            &network_evidence("10.66.0.0/24", "deadbeef"),
+            exit_code,
+            stdout,
+            stderr,
+        )
+    }
+
     #[test]
     fn masquerade_for_another_subnet_is_not_ours() {
         // The default docker0 bridge always has this rule. Reading it as the
         // chamber's would fail every preflight on every machine.
-        let nat = "-A POSTROUTING -s 172.17.0.0/16 ! -o docker0 -j MASQUERADE\n";
-        let out =
-            Preflight::check_no_masquerade(&network_evidence("10.66.0.0/24", "deadbeef"), nat);
+        let nat = nat_dump("-A POSTROUTING -s 172.17.0.0/16 ! -o docker0 -j MASQUERADE\n");
+        let out = judge_nat(0, &nat, "");
         assert!(out.held, "{}", out.evidence);
     }
 
     #[test]
     fn masquerade_for_our_subnet_fails_the_assert() {
-        let nat = "-A POSTROUTING -s 10.66.0.0/24 ! -o br-x -j MASQUERADE\n";
-        let out =
-            Preflight::check_no_masquerade(&network_evidence("10.66.0.0/24", "deadbeef"), nat);
+        let nat = nat_dump("-A POSTROUTING -s 10.66.0.0/24 ! -o br-x -j MASQUERADE\n");
+        let out = judge_nat(0, &nat, "");
         assert!(!out.held);
+    }
+
+    /// The nat table a correctly isolated chamber host prints: a real dump
+    /// with no MASQUERADE in it anywhere.
+    ///
+    /// This is the state the assert exists to *confirm*, and the one every
+    /// stricter reading of the output risks breaking — demanding a rule as
+    /// proof that the dump happened would refuse precisely the hosts that are
+    /// right. Only the envelope is required, so an empty table still holds.
+    #[test]
+    fn a_nat_table_with_no_rules_at_all_still_holds() {
+        let out = judge_nat(0, &nat_dump(""), "");
+        assert!(
+            out.held,
+            "a genuinely clean nat table was misread as unmeasured: {}",
+            out.evidence
+        );
+    }
+
+    /// The routing check's bug, one assert over — the reason this function was
+    /// rewritten.
+    ///
+    /// `held: offending.is_empty()` over an empty stdout reported "no
+    /// MASQUERADE for the chamber subnet" from a command that never produced a
+    /// nat table. It would have reported it just as confidently on a host that
+    /// *was* masquerading the subnet, because it was never looking at one.
+    /// This stderr is the engine's own, measured: `iptables-save` against a
+    /// table it cannot load exits 1 and says so.
+    #[test]
+    fn an_empty_nat_dump_from_a_failed_inspection_does_not_hold() {
+        let out = judge_nat(
+            1,
+            "",
+            "iptables-save v1.8.10 (nf_tables): Table `nat' does not exist\n",
+        );
+        assert!(
+            !out.held,
+            "a check that never ran was reported as no-NAT confirmed: {}",
+            out.evidence
+        );
+        assert!(
+            out.evidence.contains("does not exist"),
+            "the stderr that explains the empty dump is the whole diagnosis and must be kept: {}",
+            out.evidence
+        );
+        assert!(
+            out.evidence.contains("exited 1"),
+            "the exit status is what distinguishes this from a clean table: {}",
+            out.evidence
+        );
+    }
+
+    /// Exit zero is not enough on its own. An entrypoint that accepts any
+    /// arguments and prints nothing exits zero, and there is no nat table
+    /// behind that silence either.
+    #[test]
+    fn an_empty_nat_dump_does_not_hold_even_on_a_clean_exit() {
+        let out = judge_nat(0, "", "");
+        assert!(!out.held, "{}", out.evidence);
+    }
+
+    /// A dump cut short is not a dump. The MASQUERADE line could be one of the
+    /// lines that never arrived, and "nothing in the part that reached me" is
+    /// not the question this assert answers.
+    #[test]
+    fn a_truncated_nat_dump_does_not_hold() {
+        let out = judge_nat(
+            0,
+            "# Generated by iptables-save v1.8.10 (nf_tables)\n\
+             *nat\n\
+             :PREROUTING ACCEPT [272:17446]\n\
+             -A PREROUTING -m addrtype --dst-type LOCAL -j DOCKER\n",
+            "",
+        );
+        assert!(
+            !out.held,
+            "a dump with no COMMIT was accepted as complete: {}",
+            out.evidence
+        );
     }
 
     #[test]
