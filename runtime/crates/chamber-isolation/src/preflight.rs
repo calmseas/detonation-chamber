@@ -249,6 +249,7 @@ impl Preflight {
         container.destroy(INSPECT_WINDOW)?;
 
         Ok(Self::judge_routing_table(
+            network,
             exit_code,
             &logs.stdout,
             &logs.stderr,
@@ -264,26 +265,67 @@ impl Preflight {
     /// reading it as the second is a safety gate reporting a result it never
     /// obtained.
     ///
-    /// So two things must both be true before this assert may hold: `ip route`
-    /// exited zero, and its stdout contains at least one line that is
-    /// recognisably a route. Anything else is *not held* — fail-closed, in
-    /// line with the rest of the chamber. That also covers the neighbouring
-    /// failures: a guest image with no `ip`, an entrypoint that ignored its
-    /// arguments, a container that died before it printed.
+    /// So three things must all be true before this assert may hold: `ip route`
+    /// exited zero, its stdout contains at least one line that is recognisably
+    /// a route, and one of those routes names **this network's own subnet**.
+    /// Anything else is *not held* — fail-closed, in line with the rest of the
+    /// chamber. That also covers the neighbouring failures: a guest image with
+    /// no `ip`, an entrypoint that ignored its arguments, a container that died
+    /// before it printed.
+    ///
+    /// # Why the subnet, and not just "looks like a table"
+    ///
+    /// [`is_address_like`] is a shape test, and a deliberately loose one: any
+    /// token containing a dot or a colon passes it. That is enough to reject a
+    /// usage banner whose first word is `Usage:`, and not enough to reject a
+    /// clean-exiting entrypoint that happens to print `1.36.1` or a timestamp
+    /// like `12:34:56` — either of which would satisfy "measured" without a
+    /// routing table existing anywhere. Nothing in this project's current images
+    /// prints such a thing, which is why this was a hole rather than a live
+    /// defect; it is also exactly the vacuity class this file has now had fixed
+    /// twice, and "no image does that today" is not a property anyone is
+    /// checking on the next image.
+    ///
+    /// A cell attached to the chamber network has a link-scope route for its own
+    /// subnet — that is what being on the network means, and it is the one line
+    /// a genuine table here is guaranteed to contain. Requiring it turns the
+    /// question from "did something address-shaped get printed" into "did THIS
+    /// cell print ITS routing table", which is the thing the assert is actually
+    /// about.
     ///
     /// The cost of being wrong in this direction is a legible refusal to arm
     /// carrying the stderr that explains it. The cost of being wrong in the
     /// other direction is a chamber that believes it has no egress.
-    fn judge_routing_table(exit_code: i32, stdout: &str, stderr: &str) -> AssertOutcome {
+    fn judge_routing_table(
+        network: &Network,
+        exit_code: i32,
+        stdout: &str,
+        stderr: &str,
+    ) -> AssertOutcome {
         let destinations: Vec<&str> = stdout.lines().filter_map(route_destination).collect();
-        let measured = exit_code == 0 && !destinations.is_empty();
-        let has_default = destinations.contains(&"default");
+        let subnet = network.subnet();
+        // Compared as the whole destination token, not as a substring of the
+        // line: `10.66.0.0/24` must be a route's DESTINATION, so a MASQUERADE
+        // comment or a `src` address mentioning it elsewhere on the line proves
+        // nothing.
+        let saw_own_subnet = destinations.contains(&subnet);
+        let measured = exit_code == 0 && saw_own_subnet;
+        let has_default = destinations.iter().any(|d| is_default_destination(d));
 
         AssertOutcome {
             which: StructuralAssert::NoDefaultRoute,
             held: measured && !has_default,
             evidence: if measured {
                 stdout.to_owned()
+            } else if exit_code == 0 && !destinations.is_empty() {
+                format!(
+                    "`ip route` exited 0 and printed something, but no route in it is for this \
+                     chamber network's own subnet ({subnet}), so this is not the cell's routing \
+                     table and the absence of a default route in it proves nothing.\n  \
+                     stdout: {}\n  stderr: {}",
+                    excerpt(stdout),
+                    excerpt(stderr),
+                )
             } else {
                 format!(
                     "`ip route` printed no routing table and exited {exit_code}, so it was not \
@@ -483,7 +525,28 @@ fn route_destination(line: &str) -> Option<&str> {
         first
     };
 
-    (destination == "default" || is_address_like(destination)).then_some(destination)
+    (is_default_destination(destination) || is_address_like(destination)).then_some(destination)
+}
+
+/// Every spelling of "this route matches everything".
+///
+/// `ip route` normally prints the keyword `default`, and that is all this check
+/// looked for. It is not the only form: a route whose destination is the
+/// zero-length prefix is the same route, and `ip` prints it as `0.0.0.0/0` or
+/// `::/0` in several ordinary situations — `ip -4 route show table all`, output
+/// from a `netlink` dump another tool re-rendered, iproute2 builds and busybox
+/// applets that do not special-case the keyword, and any route added with the
+/// CIDR spelling and shown without `default` substitution. A cell with
+/// `0.0.0.0/0 via 10.66.0.1 dev eth0` in its table has full egress, and this
+/// assert reported `held = true` for it — a safety gate saying "isolated" about
+/// a cell that can reach anything.
+///
+/// A prefix-length check would be the general form, but it would mean parsing
+/// addresses properly here for the first time, and the two literal spellings are
+/// what `ip` actually emits. `0/0` is included because iproute2 accepts and
+/// prints the abbreviated form for IPv4.
+fn is_default_destination(destination: &str) -> bool {
+    matches!(destination, "default" | "0.0.0.0/0" | "::/0" | "0/0")
 }
 
 /// Whether a token could be an address or prefix, in either family.
@@ -493,6 +556,15 @@ fn route_destination(line: &str) -> Option<&str> {
 /// addresses properly here would buy nothing: the question is whether the
 /// guest printed a routing table, not whether the engine's addresses are
 /// well-formed.
+///
+/// Its looseness used to be load-bearing and is no longer, which is why it can
+/// stay loose. A version string (`1.36.1`) and a timestamp (`12:34:56`) both
+/// pass this, so a clean-exiting entrypoint printing either would once have
+/// satisfied [`Preflight::judge_routing_table`]'s "measured" condition with no
+/// routing table anywhere in sight. That condition now additionally requires a
+/// route for the chamber network's own subnet, so what this function decides is
+/// only which tokens are worth COMPARING against it — a job a shape test is
+/// adequate for, and the only job it now has.
 fn is_address_like(token: &str) -> bool {
     let host = token.split('/').next().unwrap_or(token);
     !host.is_empty()
@@ -703,6 +775,19 @@ mod tests {
         );
     }
 
+    /// Every routing-table judgement in this suite runs against the same
+    /// chamber network the production call passes: the assert is now about
+    /// whether THIS cell printed ITS table, so the network is part of the
+    /// question rather than context.
+    fn judge_routes(exit_code: i32, stdout: &str, stderr: &str) -> AssertOutcome {
+        Preflight::judge_routing_table(
+            &network_evidence("10.66.0.0/24", "deadbeef"),
+            exit_code,
+            stdout,
+            stderr,
+        )
+    }
+
     /// The routing table a genuinely isolated cell prints: its own subnet and
     /// nothing else. This is the case the assert exists to recognise, and the
     /// one every stricter reading of the output risks breaking.
@@ -710,11 +795,7 @@ mod tests {
     fn a_table_without_a_default_route_holds() {
         // Measured on a live `--internal` network, busybox `ip` in alpine
         // 3.20 — two spaces before `src` included, as it prints them.
-        let out = Preflight::judge_routing_table(
-            0,
-            "10.66.0.0/24 dev eth0 scope link  src 10.66.0.2\n",
-            "",
-        );
+        let out = judge_routes(0, "10.66.0.0/24 dev eth0 scope link  src 10.66.0.2\n", "");
         assert!(out.held, "{}", out.evidence);
         assert!(
             out.evidence.contains("10.66.0.0/24"),
@@ -725,12 +806,95 @@ mod tests {
 
     #[test]
     fn a_default_route_fails_the_assert() {
-        let out = Preflight::judge_routing_table(
+        let out = judge_routes(
             0,
             "default via 10.66.0.1 dev eth0 \n10.66.0.0/24 dev eth0 scope link  src 10.66.0.2\n",
             "",
         );
         assert!(!out.held);
+    }
+
+    /// A default route spelled as a zero-length prefix instead of the keyword.
+    ///
+    /// This is the same route and the same egress, and the check did not
+    /// recognise either form: `destinations.contains(&"default")` is a literal
+    /// string comparison, so a table containing `0.0.0.0/0 via 10.66.0.1`
+    /// reported `held = true` — the isolation assert affirming a cell that can
+    /// reach the whole internet. `ip` prints this spelling in several ordinary
+    /// situations (see `is_default_destination`), so it is not an exotic shape.
+    #[test]
+    fn an_ipv4_cidr_default_route_is_still_a_default_route() {
+        let out = judge_routes(
+            0,
+            "0.0.0.0/0 via 10.66.0.1 dev eth0 \n10.66.0.0/24 dev eth0 scope link  src 10.66.0.2\n",
+            "",
+        );
+        assert!(
+            !out.held,
+            "a default route spelled 0.0.0.0/0 was read as isolation: {}",
+            out.evidence
+        );
+    }
+
+    /// The v6 twin, which fails the same way for the same reason.
+    #[test]
+    fn an_ipv6_cidr_default_route_is_still_a_default_route() {
+        let out = judge_routes(
+            0,
+            "10.66.0.0/24 dev eth0 scope link  src 10.66.0.2\n\
+             ::/0 via fe80::1 dev eth0 metric 1024 pref medium\n",
+            "",
+        );
+        assert!(
+            !out.held,
+            "a default route spelled ::/0 was read as isolation: {}",
+            out.evidence
+        );
+    }
+
+    /// iproute2's abbreviated IPv4 form. It is additionally the one spelling
+    /// the old `is_address_like` did not even recognise as a destination — no
+    /// dot, no colon — so the line was not counted as a route at all and the
+    /// keyword search had nothing to find either way.
+    #[test]
+    fn the_abbreviated_zero_prefix_is_still_a_default_route() {
+        let out = judge_routes(
+            0,
+            "0/0 via 10.66.0.1 dev eth0\n10.66.0.0/24 dev eth0 scope link  src 10.66.0.2\n",
+            "",
+        );
+        assert!(!out.held, "{}", out.evidence);
+    }
+
+    /// Output that is address-SHAPED but is not this cell's routing table.
+    ///
+    /// `is_address_like` accepts any token with a dot or a colon in it, so a
+    /// clean-exiting entrypoint printing a version banner or a timestamp
+    /// satisfied "a routing table was printed" and the assert held on the
+    /// strength of it — measured nothing, reported isolation. Narrow (no image
+    /// here prints such a thing today) and exactly the vacuity class this file
+    /// has had fixed twice, which is why it is closed rather than noted.
+    #[test]
+    fn address_shaped_output_that_is_not_our_table_does_not_hold() {
+        for stdout in [
+            "1.36.1\n",
+            "12:34:56\n",
+            // A real routing table — for a DIFFERENT network. Proves the check
+            // is on this chamber's subnet rather than on any subnet at all.
+            "10.99.0.0/24 dev eth0 scope link  src 10.99.0.2\n",
+        ] {
+            let out = judge_routes(0, stdout, "");
+            assert!(
+                !out.held,
+                "output that is not this cell's routing table was accepted: {stdout:?} -> {}",
+                out.evidence
+            );
+            assert!(
+                out.evidence.contains("10.66.0.0/24"),
+                "the evidence must name the subnet that was looked for: {}",
+                out.evidence
+            );
+        }
     }
 
     /// The bug this whole path was rewritten for.
@@ -744,7 +908,7 @@ mod tests {
     /// default route, because it was never looking at a routing table.
     #[test]
     fn an_empty_table_from_a_refusing_entrypoint_does_not_hold() {
-        let out = Preflight::judge_routing_table(
+        let out = judge_routes(
             1,
             "",
             "execrelayd: refusing to start — CHAMBER_EXEC_CONSEQUENCE_SPEC_B64 is absent, \
@@ -772,7 +936,7 @@ mod tests {
     /// behind that silence either.
     #[test]
     fn an_empty_table_does_not_hold_even_on_a_clean_exit() {
-        let out = Preflight::judge_routing_table(0, "", "");
+        let out = judge_routes(0, "", "");
         assert!(!out.held, "{}", out.evidence);
     }
 
@@ -782,7 +946,7 @@ mod tests {
     /// image whose entrypoint greets and exits does so successfully.
     #[test]
     fn output_that_is_not_a_routing_table_does_not_hold() {
-        let out = Preflight::judge_routing_table(
+        let out = judge_routes(
             0,
             "BusyBox v1.36.1 (2024-01-01) multi-call binary.\nUsage: ip [OPTIONS] ...\n",
             "",
@@ -798,9 +962,11 @@ mod tests {
     /// the fail-closed rule above starts refusing genuinely isolated cells.
     #[test]
     fn typed_and_v6_routes_are_still_a_table() {
-        let out = Preflight::judge_routing_table(
+        let out = judge_routes(
             0,
-            "blackhole 10.1.0.0/24\nfe80::/64 dev eth0 proto kernel metric 256 pref medium\n",
+            "blackhole 10.1.0.0/24\n\
+             fe80::/64 dev eth0 proto kernel metric 256 pref medium\n\
+             10.66.0.0/24 dev eth0 scope link  src 10.66.0.2\n",
             "",
         );
         assert!(out.held, "{}", out.evidence);
@@ -810,7 +976,12 @@ mod tests {
     /// route. Matching only on the line's first token would miss it.
     #[test]
     fn a_typed_default_route_is_still_a_default_route() {
-        let out = Preflight::judge_routing_table(0, "unicast default via 10.66.0.1 dev eth0\n", "");
+        let out = judge_routes(
+            0,
+            "unicast default via 10.66.0.1 dev eth0\n\
+             10.66.0.0/24 dev eth0 scope link  src 10.66.0.2\n",
+            "",
+        );
         assert!(!out.held, "{}", out.evidence);
     }
 
