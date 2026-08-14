@@ -2499,6 +2499,7 @@ fn arm_detonation_plan(
         // NOT matched on role: both arms meet the same boundary, or the
         // subtraction attributes the environment's difference to the artefact.
         consequence: plan.consequence.clone(),
+        exec_consequence: None,
     }
 }
 

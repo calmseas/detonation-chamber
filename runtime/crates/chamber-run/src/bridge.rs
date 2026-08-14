@@ -14,6 +14,7 @@
 //! harness. Raising on it would abandon a run at exactly the moment the
 //! artefact started doing something unusual.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use chamber_isolation::{AgentCell, CellError, ExecOutcome};
@@ -93,6 +94,8 @@ impl CarriedTurn {
 #[derive(Debug)]
 pub struct ToolBridge {
     window: Duration,
+    exec_relay_enabled: bool,
+    turn_counter: AtomicU64,
 }
 
 impl Default for ToolBridge {
@@ -106,12 +109,44 @@ impl ToolBridge {
     pub fn new() -> Self {
         Self {
             window: TURN_WINDOW,
+            exec_relay_enabled: false,
+            turn_counter: AtomicU64::new(0),
         }
     }
 
     #[must_use]
     pub fn within(window: Duration) -> Self {
-        Self { window }
+        Self {
+            window,
+            exec_relay_enabled: false,
+            turn_counter: AtomicU64::new(0),
+        }
+    }
+
+    /// `enabled` should be `true` exactly when the run's `DetonationPlan` has
+    /// an `exec_consequence` configured — set once at arming time, not
+    /// per-turn, since the guest image itself (`execrelayd` as PID 1 vs. no
+    /// relay at all) is fixed for the whole run.
+    #[must_use]
+    pub fn new_with_exec_relay(enabled: bool) -> Self {
+        Self {
+            window: TURN_WINDOW,
+            exec_relay_enabled: enabled,
+            turn_counter: AtomicU64::new(0),
+        }
+    }
+
+    /// Builds the real argv for one directive: `stub --turn-id=<N> <real...>`
+    /// when the relay is enabled (each call gets a fresh, monotonically
+    /// increasing id), or just `<real...>` when it isn't.
+    fn prefixed_argv(&self, real_argv: impl IntoIterator<Item = String>) -> Vec<String> {
+        if !self.exec_relay_enabled {
+            return real_argv.into_iter().collect();
+        }
+        let turn_id = self.turn_counter.fetch_add(1, Ordering::Relaxed);
+        let mut full = vec!["stub".to_owned(), format!("--turn-id=turn-{turn_id}")];
+        full.extend(real_argv);
+        full
     }
 
     /// Carries out one directive, returning what happened.
@@ -150,7 +185,8 @@ impl ToolBridge {
     ) -> Result<CarriedTurn, CellError> {
         let outcome = match directive {
             TurnDirective::RunCommand { argv } => {
-                let borrowed: Vec<&str> = argv.iter().map(String::as_str).collect();
+                let full = self.prefixed_argv(argv.iter().cloned());
+                let borrowed: Vec<&str> = full.iter().map(String::as_str).collect();
                 Some(target.run(&borrowed, self.window)?)
             }
             // `cat`, not a bespoke read path. The artefact reading a file is a
@@ -159,7 +195,9 @@ impl ToolBridge {
             // happened to use.
             TurnDirective::ReadFile { at } => {
                 let path = at.display().to_string();
-                Some(target.run(&["cat", &path], self.window)?)
+                let full = self.prefixed_argv(["cat".to_owned(), path]);
+                let borrowed: Vec<&str> = full.iter().map(String::as_str).collect();
+                Some(target.run(&borrowed, self.window)?)
             }
             TurnDirective::Conclude => None,
         };
@@ -315,6 +353,87 @@ mod tests {
                     }
                 )
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn prefixes_stub_and_turn_id_when_exec_relay_enabled() {
+        let cell = FakeCell::default();
+        let bridge = ToolBridge::new_with_exec_relay(true);
+        bridge
+            .carry_out(
+                &cell,
+                &TurnDirective::RunCommand {
+                    argv: vec!["pip".to_owned(), "install".to_owned(), "x".to_owned()],
+                },
+            )
+            .expect("carry out");
+        assert_eq!(
+            cell.seen.borrow()[0],
+            vec![
+                "stub".to_owned(),
+                "--turn-id=turn-0".to_owned(),
+                "pip".to_owned(),
+                "install".to_owned(),
+                "x".to_owned(),
+            ],
+        );
+    }
+
+    #[test]
+    fn turn_id_increments_across_calls() {
+        let cell = FakeCell::default();
+        let bridge = ToolBridge::new_with_exec_relay(true);
+        for _ in 0..3 {
+            bridge
+                .carry_out(
+                    &cell,
+                    &TurnDirective::RunCommand {
+                        argv: vec!["echo".to_owned()],
+                    },
+                )
+                .expect("carry out");
+        }
+        assert_eq!(cell.seen.borrow()[0][1], "--turn-id=turn-0");
+        assert_eq!(cell.seen.borrow()[1][1], "--turn-id=turn-1");
+        assert_eq!(cell.seen.borrow()[2][1], "--turn-id=turn-2");
+    }
+
+    #[test]
+    fn does_not_prefix_stub_by_default() {
+        let cell = FakeCell::default();
+        let bridge = ToolBridge::new();
+        bridge
+            .carry_out(
+                &cell,
+                &TurnDirective::RunCommand {
+                    argv: vec!["echo".to_owned()],
+                },
+            )
+            .expect("carry out");
+        assert_eq!(cell.seen.borrow()[0], vec!["echo".to_owned()]);
+    }
+
+    #[test]
+    fn read_file_is_prefixed_too_when_enabled() {
+        let cell = FakeCell::default();
+        let bridge = ToolBridge::new_with_exec_relay(true);
+        bridge
+            .carry_out(
+                &cell,
+                &TurnDirective::ReadFile {
+                    at: PathBuf::from("/work/x.txt"),
+                },
+            )
+            .expect("carry out");
+        assert_eq!(
+            cell.seen.borrow()[0],
+            vec![
+                "stub".to_owned(),
+                "--turn-id=turn-0".to_owned(),
+                "cat".to_owned(),
+                "/work/x.txt".to_owned()
+            ],
         );
     }
 

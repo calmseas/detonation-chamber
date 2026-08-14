@@ -122,6 +122,7 @@ fn plan_with(evidence: std::path::PathBuf, canaries: Vec<PlantedCanary>) -> Deto
         // The matrix pins the default boundary's behaviour. A fixture row that
         // wanted a plausible answer would set this and say so.
         consequence: None,
+        exec_consequence: None,
     }
 }
 

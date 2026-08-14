@@ -508,6 +508,19 @@ impl SealedEnv {
         self.scratch_root.as_deref()
     }
 
+    /// Whether a variable of this name is bound, without exposing its value.
+    ///
+    /// For tests that need to assert a binding landed without reaching for the
+    /// value itself — `#[cfg(test)]` cannot do this: it would vanish from the
+    /// compiled rlib that other crates' test binaries link against, since
+    /// `cfg(test)` only takes effect for the crate being compiled as a test,
+    /// not for a downstream crate's own test build. Presence-only, so it stays
+    /// consistent with this type's redacted `Debug`.
+    #[must_use]
+    pub fn contains_binding(&self, name: &str) -> bool {
+        self.bindings.keys().any(|k| k.as_str() == name)
+    }
+
     /// Writes the 0600 file the engine reads with `--env-file`.
     ///
     /// Never `-e KEY=VALUE`: that puts every value, canaries included, in the

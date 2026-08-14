@@ -80,6 +80,7 @@ async fn main() -> ExitCode {
         // The scripted detonator refuses, as it always has. Consequence mode is
         // an instrument for live runs, and belongs to chamber-detonate-live.
         consequence: None,
+        exec_consequence: None,
     };
 
     match run_detonation(&plan, &mut turns).await {

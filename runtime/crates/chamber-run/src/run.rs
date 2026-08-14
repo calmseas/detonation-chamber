@@ -110,6 +110,7 @@ pub struct DetonationPlan {
     /// model. It grants no egress — the response is built inside the observer,
     /// and the request is discarded there exactly as a refused one is.
     pub consequence: Option<ConsequencePlan>,
+    pub exec_consequence: Option<chamber_capture::exec_consequence::ExecConsequencePlan>,
 }
 
 /// Why no run happened.
@@ -319,7 +320,13 @@ pub async fn run_detonation(
 
     let transcript = {
         let cell = arming.cell.as_ref().expect("armed");
-        drive_turns(turns, &ToolBridge::new(), cell, plan.max_turns).await
+        drive_turns(
+            turns,
+            &ToolBridge::new_with_exec_relay(plan.exec_consequence.is_some()),
+            cell,
+            plan.max_turns,
+        )
+        .await
     };
 
     // The closing snapshot, while the cell is still alive and before ownership
@@ -632,6 +639,31 @@ struct CellEnvironment {
     ca_pem: String,
 }
 
+/// Isolated from `seal_cell_environment` specifically so it's testable
+/// without a real `Container` — this function touches nothing but the draft.
+fn apply_exec_consequence_env(
+    draft: &mut EnvDraft,
+    exec_plan: Option<&chamber_capture::exec_consequence::ExecConsequencePlan>,
+) -> Result<(), String> {
+    let Some(exec_plan) = exec_plan else {
+        return Ok(());
+    };
+    let relay = Rationale {
+        reason: "configures the guest's exec-interception relay for this run",
+        required_by: "chamber-run::seal_cell_environment",
+    };
+    for (key, value) in exec_plan.to_env_pairs() {
+        draft
+            .set(
+                VarName::parse(&key).map_err(|e| e.to_string())?,
+                value,
+                relay,
+            )
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
 /// Builds the cell's environment: trust anchor first, then everything else.
 fn seal_cell_environment(
     plan: &DetonationPlan,
@@ -684,6 +716,8 @@ fn seal_cell_environment(
             .map_err(|e| e.to_string())?;
         placements.plant_env(canary.label.clone(), name);
     }
+
+    apply_exec_consequence_env(&mut draft, plan.exec_consequence.as_ref())?;
 
     // Refuses if a canary was declared for a variable that was never bound —
     // the failure that produces a run with nothing to find, reported as no
@@ -899,6 +933,7 @@ mod tests {
             max_turns: 4,
             skill_dir: None,
             consequence,
+            exec_consequence: None,
         }
     }
 
@@ -972,5 +1007,28 @@ mod tests {
                 "{key} carries a line break, which truncates the env file"
             );
         }
+    }
+
+    // ---- the cell's exec-consequence binding -------------------------------
+
+    #[test]
+    fn adds_exec_consequence_binding_when_configured() {
+        let plan = chamber_capture::exec_consequence::ExecConsequencePlan {
+            rules: vec![],
+            timeout_ms: 60_000,
+            max_concurrent_handlers: 32,
+        };
+        let mut draft = EnvDraft::empty();
+        apply_exec_consequence_env(&mut draft, Some(&plan)).unwrap();
+        let sealed = draft.seal(&CanaryPlacements::none()).unwrap();
+        assert!(sealed.contains_binding(chamber_capture::exec_consequence::EXEC_SPEC_B64_VAR));
+    }
+
+    #[test]
+    fn adds_no_binding_when_not_configured() {
+        let mut draft = EnvDraft::empty();
+        apply_exec_consequence_env(&mut draft, None).unwrap();
+        let sealed = draft.seal(&CanaryPlacements::none()).unwrap();
+        assert!(!sealed.contains_binding(chamber_capture::exec_consequence::EXEC_SPEC_B64_VAR));
     }
 }

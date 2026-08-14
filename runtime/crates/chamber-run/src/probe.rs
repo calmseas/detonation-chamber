@@ -226,6 +226,7 @@ pub async fn run_probe(
             // NOT varied per arm: every arm must meet the same boundary, or a
             // divergence is the environment's and not the agent's.
             consequence: plan.consequence.clone(),
+            exec_consequence: None,
         };
 
         let epilogue = crate::run::run_detonation(&arm_plan, driver.as_mut())

@@ -111,6 +111,7 @@ fn a_bundled_script_is_staged_and_detonates() {
         // The containment properties this suite asserts are the ones that must
         // hold on the DEFAULT boundary, which refuses.
         consequence: None,
+        exec_consequence: None,
     };
 
     let ep = block_on(run_detonation(&plan, &mut turns)).unwrap_or_else(|e| panic!("{e}"));
