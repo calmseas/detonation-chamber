@@ -11,4 +11,11 @@ cc -Wall -Wextra -std=c11 -g -o /tmp/test_config ../src/json.c ../src/config.c .
 # fields needed and did not have.
 cc -Wall -Wextra -std=c11 -g -o /tmp/test_record ../src/json.c ../src/record.c test_record.c
 /tmp/test_record
+# The request reader, over a real socketpair. Its own translation unit for the
+# same reason record.c is: relayd.c cannot be compiled anywhere but aarch64, so
+# a parser living inside it is a parser whose refusal paths — a mismatched
+# ARGC, a frame claiming more bytes than arrive, an over-long header line — can
+# only ever be checked by hand, once. Here CI checks them on every push.
+cc -Wall -Wextra -std=c11 -g -o /tmp/test_protocol ../src/protocol.c test_protocol.c
+/tmp/test_protocol
 echo "all C unit tests passed"

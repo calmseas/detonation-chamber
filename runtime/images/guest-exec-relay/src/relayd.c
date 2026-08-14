@@ -119,65 +119,12 @@ static void logline(const char *fmt, ...) {
     fflush(stdout);
 }
 
-static ssize_t write_full(int fd, const void *buf, size_t n) {
-    const char *p = buf; size_t left = n;
-    while (left) {
-        ssize_t w = write(fd, p, left);
-        if (w < 0) { if (errno == EINTR) continue; return -1; }
-        if (w == 0) return -1;
-        p += w; left -= w;
-    }
-    return (ssize_t)n;
-}
-
-static ssize_t read_full(int fd, void *buf, size_t n) {
-    char *p = buf; size_t left = n;
-    while (left) {
-        ssize_t r = read(fd, p, left);
-        if (r < 0) { if (errno == EINTR) continue; return -1; }
-        if (r == 0) return (ssize_t)(n - left);
-        p += r; left -= r;
-    }
-    return (ssize_t)n;
-}
-
-/* Read a '\n'-terminated HEADER line from a socket fd, byte at a time (every
- * line in this protocol is a short fixed-shape header — the variable-length
- * payloads are length-prefixed and read with read_full, never through here).
- *
- * Returns the line's length, or one of the negative codes below. It does NOT
- * truncate: the previous version silently dropped everything past the buffer
- * and still returned success, so an over-long line was indistinguishable from
- * a well-formed short one and the remainder was re-interpreted as the next
- * line. Refusing is the only safe answer — a request this side cannot read
- * exactly is a request it must not half-execute. */
-#define READ_LINE_EOF      (-1)
-#define READ_LINE_OVERFLOW (-2)
-static int read_line(int fd, char *buf, size_t bufsz) {
-    size_t i = 0;
-    for (;;) {
-        char c;
-        ssize_t r = read(fd, &c, 1);
-        if (r < 0 && errno == EINTR) continue;
-        if (r <= 0) return READ_LINE_EOF;
-        if (c == '\n') { buf[i] = 0; return (int)i; }
-        if (i + 1 >= bufsz) return READ_LINE_OVERFLOW;
-        buf[i++] = c;
-    }
-}
-
-/* Strict decimal parse of a frame length / count: the WHOLE token must be
- * digits. atoi() would read "12x" as 12 and "" as 0, both of which desync a
- * length-prefixed stream against the bytes that actually follow. */
-static int parse_count(const char *s, long *out) {
-    if (!s || !*s) return -1;
-    errno = 0;
-    char *end = NULL;
-    long v = strtol(s, &end, 10);
-    if (errno != 0 || end == s || *end != '\0' || v < 0) return -1;
-    *out = v;
-    return 0;
-}
+/* read_full/write_full, the request reader and its two parsing primitives all
+ * live in protocol.c now, and are used from here through protocol.h. They were
+ * moved out for exactly the reason record.c was: this file cannot be compiled
+ * anywhere but aarch64 (see the `#error` above), so nothing defined in it can
+ * be reached by the host-run C unit tests, and a parser nobody can test is a
+ * parser whose refusal paths get checked by hand once and never again. */
 
 /* frame tags for the response protocol */
 #define TAG_STDOUT 1
@@ -189,8 +136,8 @@ static void send_frame(int fd, uint8_t tag, const void *payload, uint32_t len) {
     hdr[0] = tag;
     hdr[1] = (len >> 24) & 0xff; hdr[2] = (len >> 16) & 0xff;
     hdr[3] = (len >> 8) & 0xff;  hdr[4] = len & 0xff;
-    write_full(fd, hdr, 5);
-    if (len) write_full(fd, payload, len);
+    proto_write_full(fd, hdr, 5);
+    if (len) proto_write_full(fd, payload, len);
 }
 
 /* Read tracee's NUL-terminated string at remote address via /proc/pid/mem */
@@ -300,11 +247,11 @@ static void disclosure_init(void) {
     static const char header[] =
         "{\"known_residual_tells\":[\"TracerPid nonzero in /proc/self/status "
         "\\u2014 structural to ptrace, not masked\"]}\n";
-    write_full(g_disclosure_fd, header, sizeof(header) - 1);
+    proto_write_full(g_disclosure_fd, header, sizeof(header) - 1);
 }
 
 /* Builds one complete JSON record in a local buffer and writes it with a
- * SINGLE write_full() call. This matters because g_disclosure_fd is opened
+ * SINGLE proto_write_full() call. This matters because g_disclosure_fd is opened
  * once in main() before run_server() forks any handlers, so every
  * concurrent handler process (Step 5) inherits and shares the same fd:
  * O_APPEND makes each individual write() atomic, but a record built from
@@ -328,7 +275,7 @@ static void disclosure_record(const char *turn_id, const char *requested_argv0,
                                           (long)ts.tv_sec, (long)(ts.tv_nsec / 1000000),
                                           turn_id, requested_argv0,
                                           matched_rule, verb_applied, detail);
-    write_full(g_disclosure_fd, buf, off);
+    proto_write_full(g_disclosure_fd, buf, off);
 }
 
 /* Will this trap's target actually load, or is it one of execvpe()'s PATH
@@ -505,7 +452,7 @@ static int run_traced(char *const argv[], char *const envp_extra[], int envp_ext
     close(outp[1]); close(errp[1]); close(syncr[1]); close(syncg[0]);
 
     char rbyte;
-    if (read_full(syncr[0], &rbyte, 1) != 1 || rbyte != 'R') {
+    if (proto_read_full(syncr[0], &rbyte, 1) != 1 || rbyte != 'R') {
         logline("req=%s pid=%d: child failed to signal ready", req_id?req_id:"-", pid);
         goto reap_and_fail;
     }
@@ -518,7 +465,7 @@ static int run_traced(char *const argv[], char *const envp_extra[], int envp_ext
         goto reap_and_fail;
     }
 
-    { char g = 'G'; write_full(syncg[1], &g, 1); }
+    { char g = 'G'; proto_write_full(syncg[1], &g, 1); }
     close(syncr[0]); close(syncg[1]);
 
     struct pollfd pfds[3];
@@ -785,112 +732,42 @@ static void protocol_error(int cfd, const char *id, const char *what) {
 }
 
 static void handle_conn(int cfd, const struct exec_plan *plan) {
-    char line[256];
-    char id[EXEC_RELAY_MAX_ID_LEN + 1] = "-";
-    long argc = -1;   /* -1 until an ARGC header has actually been seen */
-    int n_args = 0;
-    char *argv[EXEC_RELAY_MAX_ARGV];
-    for (int i = 0; i < EXEC_RELAY_MAX_ARGV; i++) argv[i] = NULL;
+    struct exec_request req;
+    const char *why = NULL;
+    int rc = protocol_read_request(cfd, &req, &why);
 
-    for (;;) {
-        int n = read_line(cfd, line, sizeof(line));
-        if (n == READ_LINE_OVERFLOW) {
-            protocol_error(cfd, id, "header line too long");
-            goto refuse;
-        }
-        if (n < 0) {
-            /* EOF before END: nothing to answer on, and nothing to run. */
-            logline("req id=%s REFUSED: connection closed mid-request", id);
-            close(cfd);
-            goto refuse;
-        }
-        if (strncmp(line, "ID ", 3) == 0) {
-            long len;
-            if (parse_count(line + 3, &len) != 0 || len > EXEC_RELAY_MAX_ID_LEN) {
-                protocol_error(cfd, id, "ID frame length out of range");
-                goto refuse;
-            }
-            if (len && read_full(cfd, id, (size_t)len) != (ssize_t)len) {
-                protocol_error(cfd, id, "short read on ID frame");
-                goto refuse;
-            }
-            id[len] = 0;
-        } else if (strncmp(line, "ARGC ", 5) == 0) {
-            if (argc >= 0) { protocol_error(cfd, id, "duplicate ARGC header"); goto refuse; }
-            if (parse_count(line + 5, &argc) != 0
-                || argc < 1 || argc > EXEC_RELAY_MAX_ARGV - 1) {
-                protocol_error(cfd, id, "ARGC out of range");
-                goto refuse;
-            }
-        } else if (strncmp(line, "ARG ", 4) == 0) {
-            if (argc < 0) { protocol_error(cfd, id, "ARG frame before ARGC"); goto refuse; }
-            if (n_args >= (int)argc) {
-                protocol_error(cfd, id, "more ARG frames than ARGC announced");
-                goto refuse;
-            }
-            long len;
-            if (parse_count(line + 4, &len) != 0 || len > EXEC_RELAY_MAX_ARG_LEN) {
-                protocol_error(cfd, id, "ARG frame length out of range");
-                goto refuse;
-            }
-            /* The payload is read as EXACTLY len bytes and is never scanned for
-             * a delimiter, which is the whole point of the length prefix: an
-             * argv element containing '\n' (a heredoc, a multi-line `python -c`
-             * script) arrives byte for byte instead of being split into a line
-             * that matched and a remainder that silently vanished. */
-            char *val = malloc((size_t)len + 1);
-            if (!val) { protocol_error(cfd, id, "out of memory"); goto refuse; }
-            if (len && read_full(cfd, val, (size_t)len) != (ssize_t)len) {
-                free(val);
-                protocol_error(cfd, id, "short read on ARG frame");
-                goto refuse;
-            }
-            val[len] = 0;
-            argv[n_args++] = val;
-        } else if (strcmp(line, "END") == 0) {
-            break;
-        } else {
-            /* The `else` that was missing. An unrecognised line used to be
-             * dropped on the floor without a word, which is exactly how the
-             * continuation of a split ARG line disappeared. */
-            protocol_error(cfd, id, "unrecognised request line");
-            goto refuse;
-        }
+    if (rc == PROTO_CLOSED) {
+        /* EOF before END: nothing to answer on, and nothing to run. */
+        logline("req id=%s REFUSED: connection closed mid-request", req.id);
+        close(cfd);
+        protocol_request_free(&req);
+        return;
+    }
+    if (rc != PROTO_OK) {
+        /* protocol_error closes cfd and says why at both ends. The handler
+         * process _exit()s straight after this returns, but freeing keeps the
+         * ownership story honest for anyone who later calls handle_conn twice
+         * in one process. */
+        protocol_error(cfd, req.id, why ? why : "malformed request");
+        protocol_request_free(&req);
+        return;
     }
 
-    /* Reconcile what was announced against what actually arrived. Neither side
-     * could previously detect a desync at all: argc was parsed, range-checked,
-     * and then never compared with the number of ARG frames received. */
-    if (argc < 0) { protocol_error(cfd, id, "END with no ARGC header"); goto refuse; }
-    if (n_args != (int)argc) {
-        protocol_error(cfd, id, "ARG frame count does not match ARGC");
-        goto refuse;
-    }
-    if (!argv[0]) { protocol_error(cfd, id, "no argv[0]"); goto refuse; }
-
-    logline("accepted req id=%s argv0=%s argc=%ld", id, argv[0], argc);
+    logline("accepted req id=%s argv0=%s argc=%d", req.id, req.argv[0], req.argc);
 
     char idenv[300];
-    snprintf(idenv, sizeof(idenv), "RELAY_REQ_ID=%s", id);
+    snprintf(idenv, sizeof(idenv), "RELAY_REQ_ID=%s", req.id);
     char *extra[1] = { idenv };
 
     int ecode = -1;
-    run_traced(argv, extra, 1, id, cfd, cfd, &ecode, plan, plan->timeout_ms);
+    run_traced(req.argv, extra, 1, req.id, cfd, cfd, &ecode, plan, plan->timeout_ms);
 
     uint32_t code_be = (uint32_t)ecode;
     uint8_t payload[4] = { (code_be>>24)&0xff, (code_be>>16)&0xff, (code_be>>8)&0xff, code_be&0xff };
     send_frame(cfd, TAG_EXIT, payload, 4);
-    logline("req id=%s done exit=%d", id, ecode);
+    logline("req id=%s done exit=%d", req.id, ecode);
     close(cfd);
-    for (int i = 0; i < EXEC_RELAY_MAX_ARGV; i++) free(argv[i]);
-    return;
-
-refuse:
-    /* Every refusal path lands here; protocol_error (or the EOF branch) has
-     * already closed cfd and said why. The handler process _exit()s straight
-     * after this returns, but freeing keeps the ownership story honest for
-     * anyone who later calls handle_conn twice in one process. */
-    for (int i = 0; i < EXEC_RELAY_MAX_ARGV; i++) free(argv[i]);
+    protocol_request_free(&req);
 }
 
 static volatile sig_atomic_t g_active_handlers = 0;
@@ -942,7 +819,7 @@ static int run_server(const struct exec_plan *plan) {
             logline("rejecting connection: %d handlers already active (cap %u)",
                     g_active_handlers, plan->max_concurrent_handlers);
             static const char msg[] = "relay: too many concurrent requests\n";
-            write_full(cfd, msg, sizeof(msg) - 1);
+            proto_write_full(cfd, msg, sizeof(msg) - 1);
             close(cfd);
             continue;
         }

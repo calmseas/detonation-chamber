@@ -1,4 +1,11 @@
 // runtime/images/guest-exec-relay/tests/test_config.c
+//
+// _GNU_SOURCE for setenv/unsetenv: this builds with -std=c11, which defines
+// __STRICT_ANSI__, under which glibc declares neither. It compiled anyway
+// because gcc 13 treats an implicit declaration as a warning — gcc 14 makes it
+// an error, so without this the C-test CI job breaks the day ubuntu-latest
+// moves up, taking every test in run_c_tests.sh with it.
+#define _GNU_SOURCE
 #include <assert.h>
 #include <string.h>
 #include <stdio.h>

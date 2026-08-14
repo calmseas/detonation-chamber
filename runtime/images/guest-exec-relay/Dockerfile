@@ -16,8 +16,8 @@ FROM alpine:3.20 AS builder
 RUN apk add --no-cache gcc musl-dev linux-headers
 RUN mkdir -p /out
 WORKDIR /src
-COPY src/json.h src/json.c src/base64.h src/base64.c src/config.h src/config.c src/protocol.h src/record.h src/record.c src/relayd.c src/stub.c src/fabricate-emit.c ./
-RUN gcc -O2 -Wall -Wextra -std=c11 -o /out/execrelayd relayd.c config.c json.c base64.c record.c \
+COPY src/json.h src/json.c src/base64.h src/base64.c src/config.h src/config.c src/protocol.h src/protocol.c src/record.h src/record.c src/relayd.c src/stub.c src/fabricate-emit.c ./
+RUN gcc -O2 -Wall -Wextra -std=c11 -o /out/execrelayd relayd.c config.c json.c base64.c record.c protocol.c \
  && gcc -O2 -Wall -Wextra -std=c11 -o /out/stub stub.c \
  && gcc -O2 -Wall -Wextra -std=c11 -o /out/fabricate-emit fabricate-emit.c base64.c
 

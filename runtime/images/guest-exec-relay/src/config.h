@@ -4,8 +4,12 @@
 #include <stddef.h>
 #include <stdint.h>
 
+/* EXEC_RELAY_MAX_ARGV is a wire limit, not a config one: a rule that matched
+ * or substituted more argv elements than a request can carry could never
+ * fire. Defined once, in protocol.h, and reused here. */
+#include "protocol.h"
+
 #define EXEC_RELAY_MAX_RULES 64
-#define EXEC_RELAY_MAX_ARGV 32
 #define EXEC_RELAY_MAX_FABRICATE_BYTES 2000
 
 typedef enum { MATCH_PREFIX, MATCH_EXACT, MATCH_ARGV0 } match_kind_t;
