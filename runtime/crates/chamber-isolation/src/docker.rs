@@ -81,6 +81,15 @@ pub enum EngineError {
     /// has been killed; whatever it was doing inside the guest may not have
     /// been.
     TimedOut { argv: Vec<String>, after: Duration },
+    /// A capture this process must hold in memory came back larger than the
+    /// caller is willing to read. Refused rather than truncated: a shortened
+    /// disclosure log that nothing says was shortened is the failure mode this
+    /// whole channel is built to avoid.
+    CaptureTooLarge {
+        argv: Vec<String>,
+        bytes: u64,
+        cap: u64,
+    },
 }
 
 impl fmt::Display for EngineError {
@@ -103,6 +112,13 @@ impl fmt::Display for EngineError {
                 "`docker {}` still running after {:?}; killed",
                 argv.join(" "),
                 after
+            ),
+            Self::CaptureTooLarge { argv, bytes, cap } => write!(
+                f,
+                "`docker {}` produced {bytes} bytes of stdout, over the {cap}-byte cap this \
+                 read holds in memory; refused rather than truncated, because a shortened \
+                 capture that nothing says was shortened is indistinguishable from a complete one",
+                argv.join(" "),
             ),
         }
     }
@@ -170,6 +186,26 @@ fn run_within(argv: &[&str], within: Duration) -> Result<ExecOutcome, EngineErro
 
 /// [`run_within`], stopping short of turning the output into text.
 fn run_within_raw(argv: &[&str], within: Duration) -> Result<RawOutcome, EngineError> {
+    run_within_raw_capped(argv, within, None)
+}
+
+/// [`run_within_raw`] with an optional ceiling on how much stdout it will read
+/// into memory.
+///
+/// The cap is checked against the capture FILE's size before a byte of it is
+/// read, which is what makes it a bound on this process's memory rather than an
+/// after-the-fact complaint about an allocation that already happened. Child
+/// output goes to a temporary file rather than a pipe (see the spawn below), so
+/// the size is there to be asked for.
+///
+/// One caller passes a cap — see [`Container::logs_bytes`] — and it is the only
+/// read whose length is chosen by the artefact under evaluation rather than by
+/// this harness.
+fn run_within_raw_capped(
+    argv: &[&str],
+    within: Duration,
+    stdout_cap: Option<u64>,
+) -> Result<RawOutcome, EngineError> {
     let (out_path, err_path) = (scratch_path("out"), scratch_path("err"));
     let mut child = Command::new("docker")
         .args(argv)
@@ -190,6 +226,21 @@ fn run_within_raw(argv: &[&str], within: Duration) -> Result<RawOutcome, EngineE
             None => std::thread::sleep(POLL_INTERVAL),
         }
     };
+
+    // Before the read, not after it: the whole point of the cap is that the
+    // oversized capture never becomes a `Vec<u8>` in this process.
+    if let Some(cap) = stdout_cap
+        && let Ok(meta) = std::fs::metadata(&out_path)
+        && meta.len() > cap
+    {
+        let _ = std::fs::remove_file(&out_path);
+        let _ = std::fs::remove_file(&err_path);
+        return Err(EngineError::CaptureTooLarge {
+            argv: argv.iter().map(|a| (*a).to_owned()).collect(),
+            bytes: meta.len(),
+            cap,
+        });
+    }
 
     let stdout = read_bytes_and_remove(&out_path);
     let stderr = read_bytes_and_remove(&err_path);
@@ -222,17 +273,7 @@ fn must_run(argv: &[&str], within: Duration) -> Result<String, EngineError> {
     }
 }
 
-/// [`must_run`] without the decode: a non-zero exit is an error, and the bytes
-/// come back undecoded.
-///
-/// For the one caller that needs both — reading the cell's captured disclosure
-/// stream, which must survive a non-UTF-8 byte (hence raw) and must never
-/// mistake a refused `docker logs` for an empty log (hence this).
-fn must_run_raw(argv: &[&str], within: Duration) -> Result<RawOutcome, EngineError> {
-    raw_or_failed(argv, run_within_raw(argv, within)?)
-}
-
-/// The exit-status half of [`must_run_raw`], split out so it is reachable from
+/// The exit-status half of the raw read, split out so it is reachable from
 /// a test without an engine.
 ///
 /// The condition it guards — the command exited non-zero having written NO
@@ -831,7 +872,27 @@ impl Container {
     /// [`EngineError::Failed`] if `docker logs` exits non-zero, and the other
     /// variants if it could not be run or outlived its window.
     pub fn logs_bytes(&self) -> Result<RawOutcome, EngineError> {
-        must_run_raw(&["logs", &self.id], Duration::from_secs(30))
+        // Bounded, unlike every other capture this module takes, and for a
+        // reason specific to this one. `docker logs` on the relay cell returns
+        // the disclosure stream, whose length is a function of how many execs
+        // the agent under evaluation performed — i.e. it is chosen by the thing
+        // being measured, not by this harness. A cell that spent its run in a
+        // loop, or a process inside it writing to /proc/1/fd/1 (which the
+        // relay's own notes acknowledge is reachable), produces a capture this
+        // process would otherwise read into memory in full, on a host already
+        // running several containers.
+        //
+        // Deliberately generous: 64 MiB is far more disclosure than any
+        // legitimate run produces (a record is a few hundred bytes, so this is
+        // on the order of a hundred thousand execs), so nothing real is at risk
+        // of tripping it, and a run that does trip it has something wrong with
+        // it that a reviewer should be told about rather than have papered over
+        // by a truncated read. Refused rather than truncated, for the reason
+        // everything in this subsystem is.
+        const LOGS_BYTES_CAP: u64 = 64 * 1024 * 1024;
+        let argv = ["logs", self.id.as_str()];
+        let outcome = run_within_raw_capped(&argv, Duration::from_secs(30), Some(LOGS_BYTES_CAP))?;
+        raw_or_failed(&argv, outcome)
     }
 
     /// Runs a command inside the container, feeding `input` to its stdin.
