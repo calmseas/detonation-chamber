@@ -75,7 +75,39 @@ pub enum ExecInterception {
     /// it. Since the capture lives engine-side rather than in the cell's own
     /// filesystem, "lost" now means the engine would not answer, not that
     /// something inside the cell removed the evidence.
-    Armed { disclosure_log_read: bool },
+    ///
+    /// `malformed_lines` is how many lines of that log
+    /// [`record_exec_consequence_log`] could not turn into an observation. It
+    /// is carried here rather than dropped at the parser because a record that
+    /// did not reach the bundle is a record that is missing from the sealed
+    /// evidence, and design §6 is explicit that absence "is not an acceptable
+    /// failure mode for anything short of a genuine hardware/OS-level fault".
+    /// A run with unparseable lines has strictly less disclosure than one
+    /// without, and must not report the same coverage — see [`coverage_for`].
+    Armed {
+        disclosure_log_read: bool,
+        malformed_lines: usize,
+    },
+}
+
+/// What [`record_exec_consequence_log`] made of a disclosure stream.
+///
+/// Returned rather than logged-and-forgotten so the caller can put the failure
+/// where a reader of the sealed bundle will find it. The producer side of this
+/// log has been hardened repeatedly — UTF-8-safe escaping, single atomic writes
+/// per record, a fail-closed startup header — precisely so that malformed lines
+/// do not happen in ordinary operation; a reader that silently swallows them
+/// anyway turns every one of those guarantees into something nobody would
+/// notice breaking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DisclosureParse {
+    /// Lines that became a `Channel::ExecConsequence` observation.
+    pub records: usize,
+    /// Lines that were neither blank, nor the header, nor a usable record:
+    /// not JSON at all, JSON that is not an object, or an object missing one
+    /// of the five fields every record carries. Each one is a disclosure the
+    /// relay made and the bundle does not have.
+    pub malformed_lines: usize,
 }
 
 /// What the run actually managed to observe.
@@ -208,6 +240,7 @@ pub fn coverage_for(observed: &Observed) -> CoverageMap {
             },
             ExecInterception::Armed {
                 disclosure_log_read: false,
+                ..
             } => ChannelCoverage::Absent {
                 cause: GapCause::ObserverFailed,
                 detail: "the exec-interception relay was armed but its disclosure \
@@ -215,13 +248,34 @@ pub fn coverage_for(observed: &Observed) -> CoverageMap {
                          the cell's stdout, so what it intercepted is unknown"
                     .into(),
             },
-            ExecInterception::Armed { .. } if observed.turns_driven > 0 => ChannelCoverage::Watched,
-            ExecInterception::Armed { .. } => ChannelCoverage::Absent {
+            ExecInterception::Armed { .. } if observed.turns_driven == 0 => {
+                ChannelCoverage::Absent {
+                    cause: GapCause::ObserverFailed,
+                    detail: "no turn was carried out, so the exec interception \
+                             relay never activated"
+                        .into(),
+                }
+            }
+            // The log came back and turns were driven, but some of it did not
+            // parse. Not `Watched`: every unparseable line is an exec the relay
+            // disclosed and this bundle does not contain, and a coverage map
+            // that reports the same thing for a torn log as for a clean one is
+            // the reader-side half of the failure §6 forbids. The count is in
+            // the detail because "how much is missing" is the whole question a
+            // reviewer has here, and it is the only place it survives.
+            ExecInterception::Armed {
+                malformed_lines, ..
+            } if malformed_lines > 0 => ChannelCoverage::Absent {
                 cause: GapCause::ObserverFailed,
-                detail: "no turn was carried out, so the exec interception \
-                         relay never activated"
-                    .into(),
+                detail: format!(
+                    "the exec-interception relay's disclosure log came back, but \
+                     {malformed_lines} line(s) of it could not be parsed into a \
+                     record; each one is an exec the relay disclosed and this \
+                     bundle does not carry, so what was intercepted is known \
+                     only in part"
+                ),
             },
+            ExecInterception::Armed { .. } => ChannelCoverage::Watched,
         },
 
         // Absent either way, and deliberately so: the transport from the
@@ -297,6 +351,7 @@ mod inference_coverage_tests {
             turns_driven: 2,
             exec_interception: ExecInterception::Armed {
                 disclosure_log_read: true,
+                malformed_lines: 0,
             },
             inference_calls,
         }
@@ -454,22 +509,46 @@ pub fn record_guest_commands(log: &mut RunLog, transcript: &Transcript, secrets:
 /// the command itself failing; nothing here needs to special-case that code,
 /// because the record beside it says the relay refused the request and why.
 /// Adding a Rust-side meaning for 112 would put the same fact in two places
-/// and let them disagree. Unparseable lines are silently skipped, not
-/// errored — the caller has no recovery available other than "this run has
-/// less exec-consequence disclosure than it should," which is a coverage
-/// gap the bundle's own gap-reporting machinery surfaces, not a reason to
-/// fail an entire run's evidence emission over one bad line in a log a
-/// separate C program wrote.
+/// and let them disagree.
+///
+/// # Unparseable lines are counted, not swallowed
+///
+/// An unparseable line is still skipped — there is nothing else to do with it,
+/// and failing a whole run's evidence emission over one bad line in a log a
+/// separate C program wrote would trade a small loss for a total one. What
+/// changed is that the skip is no longer silent. It used to be exactly
+/// `let Ok(value) = serde_json::from_str(line) else { continue; };`: no count,
+/// no observation, no effect on anything, so a run in which half the disclosure
+/// stream arrived torn was indistinguishable in the bundle from a clean one.
+/// That is out of conformance with the bar the producer side is now held to.
+/// Design §6 says a record's absence from the sealed bundle "is not an
+/// acceptable failure mode for anything short of a genuine hardware/OS-level
+/// fault", and every hardening of the writer — the escaping, the single atomic
+/// write per record, the PIPE_BUF-sized record buffer — was done to uphold it.
+/// A reader that discards the evidence of its own failure does not.
+///
+/// So the count comes back in a [`DisclosureParse`], reaches
+/// [`ExecInterception::Armed`], and moves the channel's coverage off `Watched`
+/// — the one place a reader deciding what a bundle is worth will actually look.
+///
+/// Blank lines are not malformed and are not counted: a trailing newline is
+/// not a lost record.
 pub fn record_exec_consequence_log(
     log: &mut RunLog,
     disclosure_log_text: &str,
     secrets: &[String],
-) {
+) -> DisclosureParse {
+    let mut parsed = DisclosureParse::default();
     for line in disclosure_log_text.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
         let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            parsed.malformed_lines += 1;
             continue;
         };
         let Some(obj) = value.as_object() else {
+            parsed.malformed_lines += 1;
             continue;
         };
         if obj.contains_key(DISCLOSURE_HEADER_KEY) {
@@ -482,6 +561,11 @@ pub fn record_exec_consequence_log(
             obj.get("verb_applied").and_then(|v| v.as_str()),
             obj.get("detail").and_then(|v| v.as_str()),
         ) else {
+            // Well-formed JSON that is not a record. Counted with the rest:
+            // from the bundle's point of view it is the same loss, and the
+            // relay emits nothing of this shape, so seeing one means something
+            // upstream is wrong in a way a reader should be told about.
+            parsed.malformed_lines += 1;
             continue;
         };
         let kind = ObservationKind::ExecConsequence {
@@ -492,7 +576,9 @@ pub fn record_exec_consequence_log(
             detail: redact_secrets(detail.to_owned(), secrets),
         };
         log.note(0, Channel::ExecConsequence, kind, vec![]);
+        parsed.records += 1;
     }
+    parsed
 }
 
 /// Replaces any canary value found inside an argument with a marker.
@@ -567,6 +653,7 @@ mod tests {
             // where nothing is unexpectedly absent.
             exec_interception: ExecInterception::Armed {
                 disclosure_log_read: true,
+                malformed_lines: 0,
             },
             inference_calls: 0,
         }
@@ -709,6 +796,7 @@ mod tests {
         let observed = Observed {
             exec_interception: ExecInterception::Armed {
                 disclosure_log_read: false,
+                malformed_lines: 0,
             },
             ..healthy()
         };
@@ -1016,8 +1104,17 @@ mod tests {
             "{\"turn_id\":\"t1\",\"timestamp\":1.0,\"requested_argv0\":\"pip\",",
             "\"matched_rule\":\"fake-pip\",\"verb_applied\":\"fabricate\",\"detail\":\"exit=0\"}\n",
         );
-        record_exec_consequence_log(&mut log, text, &[]);
+        let parsed = record_exec_consequence_log(&mut log, text, &[]);
         assert_eq!(log.len(), 1);
+        assert_eq!(
+            parsed,
+            DisclosureParse {
+                records: 1,
+                malformed_lines: 0
+            },
+            "a clean stream must report zero malformed lines, or every run would \
+             report degraded coverage"
+        );
         let entry = &log.entries()[0];
         assert_eq!(entry.channel(), Channel::ExecConsequence);
         match entry.kind() {
@@ -1035,11 +1132,86 @@ mod tests {
         }
     }
 
+    /// Malformed lines still produce no observation — there is nothing to
+    /// observe — but they are no longer invisible.
+    ///
+    /// The whole of the old behaviour was `let Ok(value) = ... else {
+    /// continue; }`: no count, no signal, no consequence anywhere. A run whose
+    /// disclosure stream arrived torn sealed a bundle indistinguishable from a
+    /// clean one, which is the read-side half of the failure design §6 forbids.
+    /// Three shapes are covered because the parser has three ways to give up on
+    /// a line and all three lose a record: not JSON at all, JSON that is not an
+    /// object, and an object without the fields a record carries.
     #[test]
-    fn record_exec_consequence_log_ignores_malformed_lines() {
+    fn record_exec_consequence_log_counts_malformed_lines_rather_than_swallowing_them() {
         let mut log = RunLog::open();
-        record_exec_consequence_log(&mut log, "not json\n{}\n", &[]);
+        let parsed = record_exec_consequence_log(
+            &mut log,
+            concat!(
+                "not json\n",
+                "[1,2,3]\n",
+                "{\"turn_id\":\"t1\"}\n",
+                "{\"turn_id\":\"t2\",\"requested_argv0\":\"pip\",\"matched_rule\":\"r\",",
+                "\"verb_applied\":\"fabricate\",\"detail\":\"-\"}\n",
+            ),
+            &[],
+        );
+        assert_eq!(log.len(), 1, "the one good record must still be recorded");
+        assert_eq!(
+            parsed,
+            DisclosureParse {
+                records: 1,
+                malformed_lines: 3
+            }
+        );
+    }
+
+    /// A trailing newline is not a lost record, and neither is a blank line.
+    /// Counting them would put every run permanently into degraded coverage,
+    /// which would make the signal worthless.
+    #[test]
+    fn blank_lines_are_not_malformed() {
+        let mut log = RunLog::open();
+        let parsed =
+            record_exec_consequence_log(&mut log, "{\"known_residual_tells\":[]}\n\n   \n", &[]);
         assert_eq!(log.len(), 0);
+        assert_eq!(parsed.malformed_lines, 0);
+    }
+
+    /// The count has to REACH somewhere a reader looks, which is the coverage
+    /// map. A run whose log came back with unparseable lines in it has less
+    /// disclosure than one without and must not claim the same `Watched`.
+    #[test]
+    fn malformed_disclosure_lines_cost_the_channel_its_watched_status() {
+        let clean = coverage_for(&Observed {
+            exec_interception: ExecInterception::Armed {
+                disclosure_log_read: true,
+                malformed_lines: 0,
+            },
+            ..healthy()
+        });
+        assert_eq!(
+            clean.status(Channel::ExecConsequence),
+            &ChannelCoverage::Watched
+        );
+
+        let torn = coverage_for(&Observed {
+            exec_interception: ExecInterception::Armed {
+                disclosure_log_read: true,
+                malformed_lines: 4,
+            },
+            ..healthy()
+        });
+        match torn.status(Channel::ExecConsequence) {
+            ChannelCoverage::Absent { cause, detail } => {
+                assert_eq!(*cause, GapCause::ObserverFailed);
+                assert!(
+                    detail.contains('4'),
+                    "the count is the only thing that says HOW MUCH is missing: {detail}"
+                );
+            }
+            other => panic!("a torn disclosure log still reported {other:?}"),
+        }
     }
 
     #[test]

@@ -104,27 +104,49 @@ fn guest_image_carries_exec_relay(tag: &str) -> bool {
     repo == EXEC_RELAY_GUEST_IMAGE || repo.ends_with(&format!("/{EXEC_RELAY_GUEST_IMAGE}"))
 }
 
-/// Refuses a plan that arms exec-consequence against an image with no relay in
-/// it.
+/// Refuses a plan whose `exec_consequence` and guest image do not agree — in
+/// EITHER direction.
 ///
-/// The bridge prefixes every turn with `stub` the moment `exec_consequence` is
-/// `Some` — that is the only condition it has ever consulted. Point that at the
-/// ordinary guest image and every turn of the run becomes
-/// `docker exec <cell> stub <argv>` -> `stub: not found`, exit 127: a whole run
-/// of nothing but 127s, recorded as though the artefact's own commands had
-/// failed. The evidence would be entirely fictitious and nothing anywhere would
-/// say so, which is precisely the failure an [`ArmingRefusal`] exists for — a
-/// run that cannot mean what it claims should not happen at all.
+/// The two halves are a matched pair, and each one alone is a broken run:
+///
+/// - **`exec_consequence: Some` against a non-relay image.** The bridge
+///   prefixes every turn with `stub` the moment `exec_consequence` is `Some` —
+///   that is the only condition it has ever consulted. Point that at the
+///   ordinary guest image and every turn of the run becomes
+///   `docker exec <cell> stub <argv>` -> `stub: not found`, exit 127: a whole
+///   run of nothing but 127s, recorded as though the artefact's own commands
+///   had failed. The evidence would be entirely fictitious and nothing anywhere
+///   would say so.
+///
+/// - **The relay image with `exec_consequence: None`.** This was the direction
+///   nothing checked. The relay image's `ENTRYPOINT` is `execrelayd`, and
+///   `execrelayd` refuses to start without `CHAMBER_EXEC_CONSEQUENCE_SPEC_B64`
+///   in its environment — deliberately, since a relay that silently ran with an
+///   empty plan would record nothing while claiming to supervise. So selecting
+///   that image without configuring an `exec_consequence` does not produce a
+///   plain cell with the relay dormant; it produces a cell whose PID 1 exits
+///   immediately, and the harness meets that as a container that will not stay
+///   up, with no `ArmingRefusal` and nothing naming the cause.
+///
+///   It also breaks the design's own §3 invariant — "config env var absent =>
+///   falls back to plain docker exec, zero new failure surface" — which holds
+///   only while the entrypoint is something that can fall back. Once
+///   `execrelayd` IS the entrypoint there is no plain-docker-exec path left to
+///   fall back TO, so the invariant has to be enforced at arming instead: this
+///   image and this plan field are selected together or not at all.
 fn check_exec_relay_capability(plan: &DetonationPlan) -> Result<(), ArmingRefusal> {
-    if plan.exec_consequence.is_none() {
-        return Ok(());
+    match (
+        plan.exec_consequence.is_some(),
+        guest_image_carries_exec_relay(&plan.images.guest),
+    ) {
+        (true, true) | (false, false) => Ok(()),
+        (true, false) => Err(ArmingRefusal::ExecRelayImage {
+            guest: plan.images.guest.clone(),
+        }),
+        (false, true) => Err(ArmingRefusal::ExecRelayImageWithoutPlan {
+            guest: plan.images.guest.clone(),
+        }),
     }
-    if guest_image_carries_exec_relay(&plan.images.guest) {
-        return Ok(());
-    }
-    Err(ArmingRefusal::ExecRelayImage {
-        guest: plan.images.guest.clone(),
-    })
 }
 
 /// A token to plant, and where.
@@ -178,11 +200,19 @@ pub enum ArmingRefusal {
     ExecRelayImage {
         guest: String,
     },
+    /// The relay guest image with no `exec_consequence` plan to configure it —
+    /// the inverse of [`ArmingRefusal::ExecRelayImage`], and the direction that
+    /// went unchecked. `execrelayd` is that image's entrypoint and refuses to
+    /// start unconfigured, so the cell would not come up at all.
+    ExecRelayImageWithoutPlan {
+        guest: String,
+    },
 }
 
 impl std::fmt::Display for ArmingRefusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let relay_detail;
+        let unconfigured_detail;
         let (what, detail) = match self {
             Self::NoEngine(d) => ("no usable container engine", d),
             Self::Preflight(d) => ("the host's structural asserts did not hold", d),
@@ -199,6 +229,23 @@ impl std::fmt::Display for ArmingRefusal {
                 (
                     "the guest image has no exec-interception relay",
                     &relay_detail,
+                )
+            }
+            Self::ExecRelayImageWithoutPlan { guest } => {
+                unconfigured_detail = format!(
+                    "the guest image is {guest}, whose ENTRYPOINT is `execrelayd`, but the \
+                     plan configures no exec_consequence. `execrelayd` refuses to start \
+                     without {} in its environment — by design, since a relay running an \
+                     empty plan would record nothing while appearing to supervise — so the \
+                     cell's PID 1 would exit immediately and the run would fail as a \
+                     container that never came up, naming no cause. The image and the plan \
+                     field are selected together or not at all: a run with no \
+                     exec_consequence wants the ordinary guest image, not {EXEC_RELAY_GUEST_IMAGE}",
+                    chamber_capture::exec_consequence::EXEC_SPEC_B64_VAR,
+                );
+                (
+                    "the relay guest image was selected with nothing to configure it",
+                    &unconfigured_detail,
                 )
             }
         };
@@ -551,9 +598,13 @@ pub async fn run_detonation(
             // could never ride into the artefact.
             let secrets: Vec<String> = plan.canaries.iter().map(|c| c.value.clone()).collect();
             bundle::record_guest_commands(&mut log, &transcript, &secrets);
-            if let Some(text) = exec_consequence_log.as_deref() {
-                bundle::record_exec_consequence_log(&mut log, text, &secrets);
-            }
+            // The parse's own outcome, kept rather than discarded: a line of
+            // the disclosure log that could not be turned into a record is a
+            // record the sealed bundle does not have, and the coverage map is
+            // where that has to be visible. See `record_exec_consequence_log`.
+            let disclosure_parse = exec_consequence_log
+                .as_deref()
+                .map(|text| bundle::record_exec_consequence_log(&mut log, text, &secrets));
             // The model's side of the run, beside the agent's. Digests only —
             // see `record_inference_calls`.
             crate::liveturns::record_inference_calls(&mut log, &inference_calls);
@@ -568,6 +619,8 @@ pub async fn run_detonation(
                 exec_interception: if plan.exec_consequence.is_some() {
                     bundle::ExecInterception::Armed {
                         disclosure_log_read: exec_consequence_log.is_some(),
+                        malformed_lines: disclosure_parse
+                            .map_or(0, |parsed| parsed.malformed_lines),
                     }
                 } else {
                     bundle::ExecInterception::NotConfigured
@@ -1229,13 +1282,81 @@ mod tests {
         assert!(check_exec_relay_capability(&plan).is_ok());
     }
 
-    /// And a run WITHOUT an exec_consequence is unaffected on any image — the
-    /// check must not turn every ordinary detonation into a refusal.
+    /// And a run without an exec_consequence on an ORDINARY image is
+    /// unaffected — the check must not turn every ordinary detonation into a
+    /// refusal.
     #[test]
-    fn a_plan_without_an_exec_consequence_is_never_refused_for_its_image() {
+    fn a_plan_without_an_exec_consequence_is_never_refused_for_an_ordinary_image() {
         let plan = bare_plan(None);
         assert_eq!(plan.images.guest, "g");
         assert!(check_exec_relay_capability(&plan).is_ok());
+    }
+
+    /// The direction nothing checked: the relay IMAGE with no plan to
+    /// configure it.
+    ///
+    /// The coupling was one-directional. `exec_consequence: Some` against a
+    /// plain image was refused; the relay image with `exec_consequence: None`
+    /// was armed happily, and then the cell did not come up — `execrelayd` is
+    /// that image's ENTRYPOINT and refuses to start without
+    /// `CHAMBER_EXEC_CONSEQUENCE_SPEC_B64`, so PID 1 exits at once and the
+    /// harness meets a container that will not stay running, with no
+    /// `ArmingRefusal` and nothing naming the cause.
+    ///
+    /// Driven through `run_detonation` rather than the check function, for the
+    /// same reason its opposite number is: it proves the check is wired in, and
+    /// it gets there without a Docker daemon.
+    #[tokio::test]
+    async fn refuses_to_arm_the_relay_image_with_no_exec_consequence() {
+        let mut plan = bare_plan(None);
+        plan.images.guest = "chamber-guest-exec-relay:test".to_owned();
+        plan.exec_consequence = None;
+        let mut source = DeafSource::default();
+
+        let refusal = run_detonation(&plan, &mut source)
+            .await
+            .expect_err("the relay image with nothing to configure it must not arm");
+
+        match &refusal {
+            ArmingRefusal::ExecRelayImageWithoutPlan { guest } => {
+                assert_eq!(guest, "chamber-guest-exec-relay:test");
+            }
+            other => panic!("wrong refusal: {other:?}"),
+        }
+        let printed = refusal.to_string();
+        assert!(
+            printed.contains(chamber_capture::exec_consequence::EXEC_SPEC_B64_VAR),
+            "the message must name the variable whose absence is fatal: {printed}"
+        );
+        assert!(
+            printed.contains("execrelayd"),
+            "the message must name what refuses to start: {printed}"
+        );
+        assert_eq!(
+            source.turns_asked, 0,
+            "the refusal must happen before any turn is driven"
+        );
+    }
+
+    /// Both halves of the coupling, as a table — the property is "these two
+    /// are selected together or not at all", and a table is what says that.
+    #[test]
+    fn the_image_and_the_exec_consequence_plan_are_coupled_in_both_directions() {
+        for (guest, has_plan, ok) in [
+            ("chamber-guest:test", false, true),
+            ("chamber-guest:test", true, false),
+            ("chamber-guest-exec-relay:test", true, true),
+            ("chamber-guest-exec-relay:test", false, false),
+        ] {
+            let mut plan = bare_plan(None);
+            plan.images.guest = guest.to_owned();
+            plan.exec_consequence = has_plan.then(empty_exec_plan);
+            assert_eq!(
+                check_exec_relay_capability(&plan).is_ok(),
+                ok,
+                "guest={guest} exec_consequence={has_plan}"
+            );
+        }
     }
 
     #[test]
