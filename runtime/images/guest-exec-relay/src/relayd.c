@@ -379,7 +379,21 @@ static void disclosure_record(const char *turn_id, const char *requested_argv0,
                                           (long)ts.tv_sec, (long)(ts.tv_nsec / 1000000),
                                           turn_id, requested_argv0,
                                           matched_rule, verb_applied, detail);
-    proto_write_full(DISCLOSURE_FD, buf, off);
+    /* The return value is checked, and that is new with the transport. When the
+     * log was a file opened O_APPEND on a tmpfs, a failed write here was close
+     * to unimaginable; now it is a PIPE the container runtime owns, and EPIPE
+     * (the runtime's reader gone) or a hard EAGAIN are both reachable. A write
+     * that fails is a record that does not exist, and silence about it is the
+     * exact failure disclosure_init refuses to start over — with the difference
+     * that this one happens mid-run, where refusing to start is no longer
+     * available. Saying so on stderr is what is left: the operator sees the
+     * bundle is short and, beside it, why. */
+    if (proto_write_full(DISCLOSURE_FD, buf, off) < 0) {
+        logline("DISCLOSURE RECORD LOST: req=%s verb=%s: the record stream could not be "
+                "written: %s. Everything from here on may be missing from the sealed "
+                "evidence.",
+                turn_id ? turn_id : "-", verb_applied ? verb_applied : "-", strerror(errno));
+    }
 }
 
 /* Will this trap's target actually load, or is it one of execvpe()'s PATH
@@ -405,7 +419,22 @@ static void disclosure_record(const char *turn_id, const char *requested_argv0,
  * Returns 1 for "will load" AND for "cannot tell" — a record that this code is
  * unsure about must stay in the log, because silently dropping a real exec is
  * the one failure the disclosure log must never have. Returns 0 only when the
- * target is definitively not loadable. */
+ * target is definitively not loadable.
+ *
+ * A note on access(X_OK) and `noexec`, examined in round 2 and deliberately
+ * left as it is. There is no syscall that answers "would execve() succeed"
+ * without performing it, so this gate is an approximation whichever primitive
+ * it uses, and the question is only which way it errs. access/faccessat test
+ * the file's mode bits and do not consult the mount's MS_NOEXEC flag, so a
+ * mode-0755 file on the cell's `noexec /work` answers "executable" here while
+ * execve() would return EACCES. That is the FAIL-OPEN direction: the record is
+ * kept for an exec attempt that then fails, which is the outcome this function's
+ * whole contract prefers — a real, nameable exec attempt appearing in the log
+ * with an unhelpful outcome beats it not appearing at all. The other input,
+ * access()'s use of the REAL rather than effective uid, is a non-issue here:
+ * execrelayd runs as root and nothing in this image is setuid, so the two are
+ * the same. Nothing about noexec makes the gate drop a record it should keep,
+ * and no small change makes the approximation exact, so it stands. */
 static int trap_target_is_loadable(pid_t pid, int is_execveat,
                                     unsigned long long dirfd_reg, const char *path) {
     if (!path || !path[0]) return 1;              /* execveat AT_EMPTY_PATH: nothing to check */
@@ -437,10 +466,15 @@ static int trap_target_is_loadable(pid_t pid, int is_execveat,
  * why it is owned by run_traced and threaded through here rather than being a
  * local.
  *
- * `rule_find`/`rule_replace` are NULL when no rewrite applies. Switching from a
- * rewriting to a non-rewriting rule mid-stream (a nested exec that matches
- * nothing) flushes what the old rule was holding before the raw bytes resume,
- * so no byte is ever dropped or reordered by the switch. */
+ * `rule_find`/`rule_replace` are NULL when no rewrite applies. Once a rewrite
+ * IS in force for a request it stays in force to the end of that request's
+ * output — see `active_rewrite`'s declaration in run_traced for why the
+ * alternative (recomputing it per trap) leaked the very content the rule
+ * strips. So the only transition this sees in practice is the arming one, from
+ * no transform to one; the flush-and-retire below still handles the reverse and
+ * still must, because it is what keeps the held-back tail from being dropped if
+ * a transition ever does occur, and a silently-dropped tail is not a failure
+ * this file is willing to leave available. */
 static void forward_stream(int fd, uint8_t tag, struct rewrite_stream *rs,
                             const char *rule_find, const char *rule_replace,
                             const char *buf, size_t len, const char *req_id) {
@@ -517,6 +551,28 @@ static void finish_stream(int fd, uint8_t tag, struct rewrite_stream *rs) {
 static int run_traced(char *const argv[],
                        const char *req_id, int out_fd, int err_fd, int *exit_code_out,
                        const struct exec_plan *plan, uint64_t timeout_ms) {
+    /* The rewrite transform in force for THIS REQUEST's output stream — scoped
+     * to the request, which is the whole point and was the defect.
+     *
+     * It used to be reassigned unconditionally after every seccomp trap:
+     * `active_rewrite = (rule && rule->verb == VERB_REWRITE) ? rule : NULL;`.
+     * PTRACE_O_TRACEFORK/VFORK/CLONE make every descendant a tracee of this
+     * same tracer, so a nested exec — `sh -c 'printf SECRET; /bin/date'`, a
+     * script calling a helper, anything at all — traps here too. Matching no
+     * rule (the ordinary case for a nested exec) set that pointer to NULL, and
+     * from that instant the rest of the outer command's stdout was forwarded
+     * UNTRANSFORMED: the rule was still legitimately in force for the stream,
+     * and the one thing it existed to strip went straight to the caller. Round
+     * 1 fixed the chunk-straddling and truncation halves of the rewrite bug and
+     * left this one, because no test combined a rewrite rule with a nested
+     * exec.
+     *
+     * The stream belongs to the request, not to the most recent trap: every
+     * process under this request shares the worker's stdout/stderr pipes (they
+     * are inherited across fork and execve), so there is exactly one transform
+     * per request and it is armed once, by the first rewrite rule to match. The
+     * arming happens in the VERB_REWRITE branch of the dispatch below; nothing
+     * clears it. */
     const struct exec_rule *active_rewrite = NULL;
     /* Persist across reads: a find string split across two read()s is only
      * matchable if the transform remembers the tail of the previous chunk. */
@@ -943,9 +999,34 @@ static int run_traced(char *const argv[],
                             free(b64_stdout);
                             free(b64_stderr);
                         } else if (rule->verb == VERB_REWRITE) {
-                            verb_name = "rewrite";
-                            snprintf(detail, sizeof(detail), "stdout_find=%s",
-                                      rule->has_stdout_rewrite ? rule->stdout_find : "(none)");
+                            /* Arms the transform for the REQUEST, here, rather
+                             * than leaving it to a single assignment after the
+                             * dispatch that every later trap re-evaluated. See
+                             * the note on `active_rewrite`'s declaration for
+                             * what that cost.
+                             *
+                             * First rewrite rule to match wins for the rest of
+                             * the request. A second, DIFFERENT one arriving
+                             * mid-stream cannot be honoured — one output stream
+                             * carries one transform, and swapping it would
+                             * restart the sliding window and release the tail
+                             * the old rule was holding back — so it is recorded
+                             * as not applied rather than silently ignored or
+                             * silently swapped in. Named in the
+                             * substitute-failed-* / fabricate-failed-*
+                             * convention: the verb, then the reason. */
+                            if (active_rewrite && active_rewrite != rule) {
+                                verb_name = "rewrite-not-applied-stream-already-transformed";
+                                snprintf(detail, sizeof(detail),
+                                         "rule %s is already transforming this request's output; "
+                                         "one stream carries one transform",
+                                         active_rewrite->name);
+                            } else {
+                                verb_name = "rewrite";
+                                active_rewrite = rule;
+                                snprintf(detail, sizeof(detail), "stdout_find=%s",
+                                          rule->has_stdout_rewrite ? rule->stdout_find : "(none)");
+                            }
                         }
 
                         logline("req=%s pid=%d syscall=%s requested=%s verb=%s rule=%s detail=%s%s",
@@ -966,7 +1047,11 @@ static int run_traced(char *const argv[],
                             disclosure_record(req_id, reqpath, rule_name, verb_name, detail);
                             recorded_any = 1;
                         }
-                        active_rewrite = (rule && rule->verb == VERB_REWRITE) ? rule : NULL;
+                        /* `active_rewrite` is NOT recomputed here. It used to
+                         * be — `active_rewrite = (rule && rule->verb ==
+                         * VERB_REWRITE) ? rule : NULL;` ran on EVERY trap — and
+                         * that assignment is the whole of the defect this
+                         * scoping fixes. See its declaration. */
                         ptrace(PTRACE_CONT, w, 0, 0);
                     } else if (sig == SIGTRAP && event != 0) {
                         ptrace(PTRACE_CONT, w, 0, 0);
@@ -1043,6 +1128,57 @@ reap_and_fail:
 
 /* ------------------------- socket-relay server path ------------------------- */
 
+/* Ends a refused connection without yanking it out from under a peer that is
+ * still writing.
+ *
+ * A bare close() on a socket the stub has not finished sending into destroys
+ * the refusal it was just handed: the stub's next write() gets EPIPE (and,
+ * before this round's stub fix, SIGPIPE — signal 13, `docker exec` exit 141),
+ * so it dies mid-request having never read the TAG_STDERR/TAG_EXIT frames
+ * sitting in its own receive buffer. The caller then sees 141 instead of the
+ * framed exit 112, i.e. the refusal machinery round 1 built is silently skipped
+ * exactly when the relay is under the conditions that trigger refusals. The
+ * over-cap path is the sharpest case: it fires before a single byte of the
+ * request has been read, so the stub is guaranteed to still be writing whenever
+ * the request is bigger than the socket buffer.
+ *
+ * shutdown(SHUT_WR) first — the frames already written stay queued and the peer
+ * gets a clean EOF after them, rather than a socket that has ceased to exist —
+ * then discard whatever the peer is still pushing, so its writes complete
+ * instead of failing. BOUNDED, because this also runs on the accept loop's own
+ * refusal paths (the cap, and the reserve failure), where an unbounded drain
+ * would let one slow client stall every other connection: past the byte or time
+ * budget it simply closes, and the stub's `signal(SIGPIPE, SIG_IGN)` plus its
+ * write-failure fallthrough are what make that outcome survivable. Neither half
+ * alone is enough — this one narrows the window, the stub's one removes the
+ * fatality. */
+#define REFUSAL_DRAIN_BYTES (1u << 20)   /* 1 MiB */
+#define REFUSAL_DRAIN_MS    500
+static void shutdown_and_close(int cfd) {
+    shutdown(cfd, SHUT_WR);
+    size_t drained = 0;
+    struct timespec started;
+    clock_gettime(CLOCK_MONOTONIC, &started);
+    for (;;) {
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        long elapsed_ms = (long)(now.tv_sec - started.tv_sec) * 1000
+                         + (now.tv_nsec - started.tv_nsec) / 1000000;
+        if (elapsed_ms >= REFUSAL_DRAIN_MS) break;
+        struct pollfd pfd = { .fd = cfd, .events = POLLIN, .revents = 0 };
+        int pr = poll(&pfd, 1, (int)(REFUSAL_DRAIN_MS - elapsed_ms));
+        if (pr < 0) { if (errno == EINTR) continue; break; }
+        if (pr == 0) break;
+        char scrap[4096];
+        ssize_t r = read(cfd, scrap, sizeof(scrap));
+        if (r < 0) { if (errno == EINTR) continue; break; }
+        if (r == 0) break;                       /* peer is done: the clean end */
+        drained += (size_t)r;
+        if (drained >= REFUSAL_DRAIN_BYTES) break;
+    }
+    close(cfd);
+}
+
 /* Refuses one request, loudly, at both ends: a TAG_STDERR frame the stub
  * relays onto ITS stderr, then a TAG_EXIT frame carrying
  * EXIT_PROTOCOL_ERROR, then the close. The alternative — the previous
@@ -1071,7 +1207,7 @@ static void protocol_error(int cfd, const char *id, const char *what) {
     }
     uint8_t payload[4] = { 0, 0, 0, (uint8_t)EXIT_PROTOCOL_ERROR };
     proto_send_frame(cfd, TAG_EXIT, payload, 4);
-    close(cfd);
+    shutdown_and_close(cfd);
 }
 
 static void handle_conn(int cfd, const struct exec_plan *plan) {
@@ -1223,8 +1359,6 @@ static int run_server(const struct exec_plan *plan) {
     signal(SIGPIPE, SIG_IGN);
 
     for (;;) {
-        reap_finished_handlers();
-
         /* accept4(SOCK_CLOEXEC), not accept(): a plain accept() returns a
          * descriptor with no close-on-exec flag, and this one is the live
          * connection to the stub. Inherited across the worker's execve it
@@ -1234,6 +1368,29 @@ static int run_server(const struct exec_plan *plan) {
          * forks, so a set-the-flag-afterwards fix leaves a window. */
         int cfd = accept4(sfd, NULL, NULL, SOCK_CLOEXEC);
         if (cfd < 0) { if (errno == EINTR) continue; perror("accept4"); continue; }
+
+        /* AFTER accept4 returned, not before it blocked. The position is the
+         * whole fix.
+         *
+         * This reap used to sit at the top of the loop, so the count the cap
+         * was checked against was a full accept() cycle stale: it was taken
+         * BEFORE the loop parked in accept4, and accept4 parks for as long as
+         * it takes the next request to arrive — which is exactly the interval
+         * in which the previous request finishes and its handler exits. With
+         * max_concurrent_handlers=1 the effect was deterministic and absurd:
+         * request 1 forks a handler and the count goes to 1; the loop reaps
+         * (handler 1 is still running, so nothing) and blocks; request 1
+         * completes and handler 1 becomes a zombie; request 2 arrives and is
+         * refused "too many concurrent requests" against a count of 1 while
+         * ZERO handlers are running. Every second strictly-sequential request,
+         * refused by a cap nothing was violating.
+         *
+         * Distinct from — and not fixed by — the reaper's tracked-pid set: that
+         * stopped the count drifting DOWNWARD when PID 1 reaped an orphan it
+         * never spawned. This is the count being read at the wrong moment. Both
+         * had to be wrong for the cap to be right, which is why the first fix
+         * did not surface the second. */
+        reap_finished_handlers();
 
         if (g_active_handlers >= plan->max_concurrent_handlers) {
             /* Through protocol_error, like every other wire-level refusal.

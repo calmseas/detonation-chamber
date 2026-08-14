@@ -1172,6 +1172,216 @@ fn a_request_over_the_cap_is_refused_in_frame_and_disclosed() {
     );
 }
 
+/// The cap must count handlers that are RUNNING, not handlers that once were.
+///
+/// The count was checked against a value one full `accept()` cycle stale: the
+/// reap ran at the top of the loop, immediately before `accept4` parked, and
+/// `accept4` parks for exactly as long as it takes the next request to arrive —
+/// which is precisely the interval in which the previous request finishes and
+/// its handler exits. With `max_concurrent_handlers: 1` that made every SECOND
+/// strictly-sequential request fail: request 1 forks a handler and the count
+/// goes to 1; nothing reaps it before request 2 is accepted; request 2 is
+/// refused "too many concurrent requests (cap 1)" with zero handlers actually
+/// running.
+///
+/// Five sequential requests, not two, and each one's output asserted: a fix
+/// that merely moved the failure to every third request would pass a two-request
+/// test. Nothing here overlaps — `cell.exec` waits for `docker exec` to return,
+/// which is after the stub has read its `TAG_EXIT` frame and exited — so the
+/// correct answer is five successes, and any refusal at all is the bug.
+///
+/// Distinct from `an_orphan_reaped_by_pid_one_does_not_loosen_the_cap`, which
+/// pins the opposite direction: that one is the count drifting DOWN and the cap
+/// failing open, this one is the count read at the wrong MOMENT and the cap
+/// failing closed on requests that were never concurrent.
+#[test]
+fn strictly_sequential_requests_are_never_refused_by_the_cap() {
+    let Some(_engine) = require_containers() else {
+        return;
+    };
+    let _serialised = chamber_subnet_lock();
+
+    let plan = ExecConsequencePlan {
+        rules: vec![],
+        timeout_ms: 60_000,
+        max_concurrent_handlers: 1,
+    };
+    let cell = start_cell(&plan);
+    cell.start().expect("start");
+    std::thread::sleep(Duration::from_millis(300));
+
+    for i in 0..5 {
+        let marker = format!("seq-{i}");
+        let out = cell
+            .exec(&["stub", "/bin/echo", &marker], OP_WINDOW)
+            .expect("exec");
+        assert_eq!(
+            out.status,
+            Some(0),
+            "sequential request {i} was refused by a cap nothing was violating \
+             (stderr: {})",
+            out.stderr.trim()
+        );
+        assert_eq!(out.stdout, format!("{marker}\n"));
+    }
+
+    // And the cap really is 1 — otherwise the loop above would pass on a build
+    // that simply never enforces it.
+    let records = disclosure_records(&cell);
+    assert!(
+        records_with_verb(&records, "protocol-refused").is_empty(),
+        "a sequential run left refusals in the sealed evidence:\n{records:#?}"
+    );
+}
+
+/// A refusal that fires BEFORE the request is read must still reach the caller
+/// as a framed refusal, not as a dead client.
+///
+/// The over-cap check runs the instant `accept4` returns, before a single byte
+/// of the request has been read, and the old refusal path wrote its frames and
+/// then closed the socket outright. For a small request that is harmless: the
+/// stub has already pushed its few hundred bytes into the socket buffer and
+/// moved on to reading. For a request larger than the socket buffer it is not —
+/// the stub is still blocked in `write()`, the close lands, and with no SIGPIPE
+/// disposition (stub.c installed none) the kernel kills it with signal 13. The
+/// caller sees `docker exec` exit 141 and an empty stderr; the TAG_STDERR frame
+/// explaining the refusal and the TAG_EXIT frame carrying 112 are sitting unread
+/// in its own receive buffer.
+///
+/// The existing small-request test above cannot see this — it wins the race
+/// essentially always. This one cannot lose it: eight arguments at the
+/// protocol's own per-argument ceiling is 512 KiB, comfortably past any default
+/// AF_UNIX socket buffer, so the stub is guaranteed to still be writing when the
+/// refusal lands. Both halves of the fix are load-bearing here and neither alone
+/// suffices: the relay's shutdown-and-drain lets the write complete when the
+/// request fits inside the drain budget, and the stub's `SIGPIPE` handling plus
+/// its read-anyway fallthrough are what make the outcome survivable when it does
+/// not.
+#[test]
+fn an_over_cap_refusal_of_a_large_request_arrives_framed_rather_than_killing_the_caller() {
+    let Some(_engine) = require_containers() else {
+        return;
+    };
+    let _serialised = chamber_subnet_lock();
+
+    let plan = ExecConsequencePlan {
+        rules: vec![],
+        timeout_ms: 60_000,
+        max_concurrent_handlers: 1,
+    };
+    let cell = start_cell(&plan);
+    cell.start().expect("start");
+    std::thread::sleep(Duration::from_millis(300));
+
+    cell.exec_detached(&["stub", "/bin/sleep", "5"], OP_WINDOW)
+        .expect("hold the single handler slot");
+    std::thread::sleep(Duration::from_millis(500));
+
+    // EXEC_RELAY_MAX_ARG_LEN is 65536 and the wire accepts up to 31 elements, so
+    // this is a request the protocol is perfectly happy with and that no socket
+    // buffer can absorb in one go.
+    const BIG_ARGS: usize = 8;
+    const ARG_LEN: usize = 65_536;
+    let big = "x".repeat(ARG_LEN);
+    let mut argv: Vec<&str> = vec!["stub", "/bin/echo"];
+    argv.extend(std::iter::repeat_n(big.as_str(), BIG_ARGS));
+
+    let refused = cell.exec(&argv, OP_WINDOW).expect("exec");
+    assert_eq!(
+        refused.status,
+        Some(112),
+        "a refusal that landed mid-write did not arrive as the framed protocol \
+         error; 141 here is death by SIGPIPE with the refusal never read: {:?}",
+        (refused.status, refused.stderr.trim()),
+    );
+    assert!(
+        refused.stderr.contains("too many concurrent requests"),
+        "the refusal reached the caller with nothing readable in it: {:?}",
+        refused.stderr
+    );
+
+    let records = disclosure_records(&cell);
+    assert_eq!(
+        records_with_verb(&records, "protocol-refused").len(),
+        1,
+        "a refused request left nothing in the sealed evidence:\n{records:#?}"
+    );
+}
+
+/// A request with more argv elements than the protocol carries is refused by
+/// the stub, before it opens a socket.
+///
+/// `EXEC_RELAY_MAX_ARGV` is 32 and one slot belongs to the NULL terminator, so
+/// 32 or more elements is a request the relay's `ARGC` range check will refuse.
+/// The stub bounded its per-argument LENGTH and its turn-id length but never its
+/// own argc, so it wrote the whole oversized request into the socket and met the
+/// refusal partway through — which is the deterministic form of the
+/// write-into-a-closed-socket race above, reachable by any caller with a long
+/// argument list (`find -exec`, a `sh -c` with many words) and needing no
+/// concurrency at all.
+///
+/// Refused client-side it costs no connection and no handler slot, and the
+/// message names the actual limit rather than arriving as a bare protocol-error
+/// frame. Exit 2 is the stub's own usage-error code — deliberately not 112,
+/// which means "the relay refused this", and not 141, which is what it used to
+/// be.
+#[test]
+fn an_argv_longer_than_the_protocol_carries_is_refused_by_the_stub() {
+    let Some(_engine) = require_containers() else {
+        return;
+    };
+    let _serialised = chamber_subnet_lock();
+
+    let plan = ExecConsequencePlan {
+        rules: vec![],
+        timeout_ms: 60_000,
+        max_concurrent_handlers: 32,
+    };
+    let cell = start_cell(&plan);
+    cell.start().expect("start");
+    std::thread::sleep(Duration::from_millis(300));
+
+    let filler: Vec<String> = (0..40).map(|i| format!("a{i}")).collect();
+    let mut argv: Vec<&str> = vec!["stub", "/bin/echo"];
+    argv.extend(filler.iter().map(String::as_str));
+
+    let refused = cell.exec(&argv, OP_WINDOW).expect("exec");
+    assert_eq!(
+        refused.status,
+        Some(2),
+        "an over-long argv was not refused client-side: {:?}",
+        (refused.status, refused.stderr.trim())
+    );
+    assert!(
+        refused.stderr.contains("relay protocol carries"),
+        "the refusal must name what was wrong: {:?}",
+        refused.stderr
+    );
+    assert!(refused.stdout.is_empty());
+
+    // Nothing reached the relay at all: no connection, no refusal record. That
+    // is the point of checking client-side rather than letting the relay do it.
+    let records = disclosure_records(&cell);
+    assert!(
+        records_with_verb(&records, "protocol-refused").is_empty(),
+        "the oversized request reached the relay after all:\n{records:#?}"
+    );
+
+    // And a request sitting exactly ON the limit still works — 31 elements,
+    // `/bin/echo` plus 30 arguments — so the bound is where it says it is and
+    // not merely somewhere below it.
+    let ok_filler: Vec<String> = (0..30).map(|i| format!("a{i}")).collect();
+    let mut ok_argv: Vec<&str> = vec!["stub", "/bin/echo"];
+    ok_argv.extend(ok_filler.iter().map(String::as_str));
+    let out = cell.exec(&ok_argv, OP_WINDOW).expect("exec");
+    assert_eq!(
+        out.status,
+        Some(0),
+        "a request at the limit was refused: {:?}",
+        out.stderr.trim()
+    );
+}
+
 #[test]
 fn an_orphan_reaped_by_pid_one_does_not_loosen_the_cap() {
     let Some(_engine) = require_containers() else {
@@ -1529,6 +1739,127 @@ fn rewrite_transforms_output_of_a_real_run() {
         .expect("exec");
     assert_eq!(out.status, Some(0));
     assert_eq!(out.stdout.trim(), "the REDACTED value");
+}
+
+/// A nested exec must not end a rewrite that is still in force.
+///
+/// This is the half of the rewrite defect round 1 did not close, and it is the
+/// one with teeth: the fixes there addressed a find string split across two
+/// reads and an expanding replacement truncated in the transform's own buffer,
+/// both of which lose or mangle output. This one LEAKS — it emits, untouched,
+/// the exact string the rule exists to remove.
+///
+/// The mechanism is one line. `active_rewrite` was reassigned after EVERY
+/// seccomp trap, not only the ones belonging to the command that armed it:
+///
+/// ```c
+/// active_rewrite = (rule && rule->verb == VERB_REWRITE) ? rule : NULL;
+/// ```
+///
+/// `PTRACE_O_TRACEFORK`/`VFORK`/`CLONE` make every descendant a tracee of the
+/// same tracer, so a shell script's child processes trap here too. A nested exec
+/// that matches no rule — the ordinary case, since rules match the top-level
+/// command — evaluated that ternary to NULL, and from that instant the rest of
+/// the OUTER command's stdout was forwarded raw. The rule was still legitimately
+/// in force for the stream; nothing had ended it.
+///
+/// Every rewrite test in this suite happens to avoid nested execs, which is why
+/// nothing caught it: `rewrite_transforms_output_of_a_real_run` runs a single
+/// `/bin/echo`, and the two frame-limit tests are written with shell builtins
+/// only, one of them saying so in a comment ("no nested exec clears
+/// `active_rewrite` mid-stream"). The shape below is the one that was missing.
+///
+/// The ordering is deterministic rather than raced: the tracee is STOPPED at its
+/// seccomp trap until the tracer resumes it, and `sh` waits for `/bin/echo`, so
+/// the third `printf` cannot run until the nested trap has been fully processed.
+/// Pre-fix this test reads `SECRET-after` in the output; post-fix all three
+/// markers are transformed.
+#[test]
+fn a_nested_exec_does_not_end_a_rewrite_mid_stream() {
+    let Some(_engine) = require_containers() else {
+        return;
+    };
+    let _serialised = chamber_subnet_lock();
+
+    let plan = ExecConsequencePlan {
+        rules: vec![ExecConsequenceRule {
+            name: "rw-outer".to_owned(),
+            match_argv: ArgvMatcher::Argv0 {
+                name: "/bin/sh".to_owned(),
+            },
+            verb: ExecVerb::Rewrite {
+                stdout_find: Some("SECRET".to_owned()),
+                stdout_replace: Some("[REDACTED]".to_owned()),
+                stderr_find: None,
+                stderr_replace: None,
+            },
+        }],
+        timeout_ms: 60_000,
+        max_concurrent_handlers: 32,
+    };
+    let cell = start_cell(&plan);
+    cell.start().expect("start");
+    std::thread::sleep(Duration::from_millis(300));
+
+    // Every marker is written by a separate `/bin/echo`, not by a `printf`
+    // builtin, and that is deliberate on two counts. An absolute path cannot be
+    // resolved to a builtin, so each one is a genuine fork+exec that traps and
+    // matches nothing — five nested execs, so a fix that survived only the first
+    // would still fail here. And each `echo` writes its own bytes directly to
+    // the shared pipe and exits, so nothing depends on when the shell would
+    // have flushed a buffer.
+    //
+    // Pre-fix the very first nested trap (for `SECRET-before` itself) clears
+    // `active_rewrite` before a single byte is written, so the whole stream
+    // arrives verbatim. Post-fix the rule armed by `sh`'s own exec stays in
+    // force for all of it.
+    let script = "/bin/echo SECRET-before; \
+                  /bin/echo nested-one; \
+                  /bin/echo SECRET-middle; \
+                  /bin/echo nested-two; \
+                  /bin/echo SECRET-after";
+    let out = cell
+        .exec(&["stub", "/bin/sh", "-c", script], OP_WINDOW)
+        .expect("exec");
+
+    assert_eq!(out.status, Some(0), "stderr: {}", out.stderr);
+    assert!(
+        !out.stdout.contains("SECRET"),
+        "a nested exec ended the rewrite and the rest of the stream was forwarded \
+         verbatim:\n{}",
+        out.stdout
+    );
+    assert_eq!(
+        out.stdout,
+        "[REDACTED]-before\nnested-one\n[REDACTED]-middle\nnested-two\n[REDACTED]-after\n",
+        "every marker across every nested exec must be transformed, and the \
+         nested commands' own output must pass through untouched"
+    );
+
+    // The evidence side of the same claim: the nested execs are disclosed as
+    // passthroughs (they matched nothing, which is true and is what the record
+    // should say), and exactly one rewrite rule armed the stream.
+    let records = disclosure_records(&cell);
+    let rewrites = records_with_verb(&records, "rewrite");
+    assert_eq!(
+        rewrites.len(),
+        1,
+        "the outer command's rewrite must be recorded once:\n{records:#?}"
+    );
+    assert_eq!(rewrites[0]["matched_rule"].as_str(), Some("rw-outer"));
+    let nested: Vec<_> = records
+        .iter()
+        .filter(|r| r["requested_argv0"].as_str() == Some("/bin/echo"))
+        .collect();
+    assert_eq!(
+        nested.len(),
+        5,
+        "every nested exec must still be disclosed:\n{records:#?}"
+    );
+    for record in nested {
+        assert_eq!(record["verb_applied"].as_str(), Some("passthrough"));
+        assert_eq!(record["matched_rule"].as_str(), Some("fallback"));
+    }
 }
 
 /// `Exact` and `Prefix` are different matchers, and only a longer argv can tell

@@ -219,6 +219,113 @@ static void test_a_frame_claiming_more_bytes_than_are_sent_is_refused(void) {
     assert_str_refused("ID 100\n" "abc", "short read on ID frame");
 }
 
+/* A truncated ID frame must not leave the tracer's own stack readable as a turn
+ * id.
+ *
+ * The refusal above (`short read on ID frame`) was already correct; what was not
+ * is the state of `req->id` on the way out of it. The reader used to write the
+ * NUL only on the success path — `if (proto_read_full(...) != len) return
+ * refuse(...); req->id[len] = 0;` — so a frame declaring `ID 200` and delivering
+ * 3 bytes returned with `req->id` holding those 3 bytes and then whatever the
+ * caller's stack frame contained, with no terminator anywhere before the end of
+ * the buffer. Both of the relay's refusal paths read that as a C string:
+ * `logline("req id=%s ...")`, and — the one that matters — `disclosure_record`,
+ * which composes it into a `protocol-refused` record and writes it to the
+ * sealed disclosure stream. Uninitialised stack, sealed into the evidence
+ * bundle as a turn id. Memory-safety bug and evidence-integrity bug, same line.
+ *
+ * `req` is deliberately POISONED before the call rather than left to chance:
+ * `struct exec_request req;` in handle_conn is an uninitialised local, and a
+ * test that happened to get a zeroed frame would pass against the broken reader
+ * too. 0xAA is not NUL and is not a plausible id byte, so any of it surviving is
+ * unambiguous.
+ *
+ * The assertion is not merely "terminated somewhere" but "every byte past what
+ * actually arrived is zero" — a terminator with poison behind it would still be
+ * a buffer that a future `memcpy(dst, req->id, sizeof(req->id))` copies stack
+ * residue out of, and this reader is the only place that can promise otherwise. */
+static void test_a_truncated_id_frame_leaves_no_uninitialised_stack_in_the_id(void) {
+    static const char wire[] = "ID 200\n" "abc";
+
+    int sv[2];
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    assert(proto_write_full(sv[0], wire, sizeof(wire) - 1) == (ssize_t)(sizeof(wire) - 1));
+    assert(shutdown(sv[0], SHUT_WR) == 0);
+
+    struct exec_request req;
+    memset(&req, 0xAA, sizeof(req));
+    const char *why = NULL;
+    int rc = protocol_read_request(sv[1], &req, &why);
+    close(sv[0]);
+    close(sv[1]);
+
+    assert(rc == PROTO_REFUSED);
+    assert(why != NULL && strcmp(why, "short read on ID frame") == 0);
+
+    /* Exactly the three bytes that arrived, terminated. */
+    assert(strlen(req.id) == 3);
+    assert(memcmp(req.id, "abc", 3) == 0);
+    /* And nothing but zeroes behind them, all the way to the end of the
+     * buffer — no poison anywhere a consumer could reach. */
+    for (size_t i = 3; i < sizeof(req.id); i++) {
+        if (req.id[i] != 0) {
+            fprintf(stderr, "req.id[%zu] = 0x%02x survived a truncated ID frame\n",
+                    i, (unsigned char)req.id[i]);
+        }
+        assert(req.id[i] == 0);
+    }
+
+    protocol_request_free(&req);
+}
+
+/* The same guarantee for the frame that never arrives at all: an `ID <len>`
+ * header whose payload is zero bytes long, and an id read that meets EOF
+ * immediately. Neither can leave a partially-written buffer behind either. */
+static void test_an_id_frame_with_no_payload_at_all_is_still_terminated(void) {
+    int sv[2];
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    static const char wire[] = "ID 12\n";
+    assert(proto_write_full(sv[0], wire, sizeof(wire) - 1) == (ssize_t)(sizeof(wire) - 1));
+    assert(shutdown(sv[0], SHUT_WR) == 0);
+
+    struct exec_request req;
+    memset(&req, 0xAA, sizeof(req));
+    const char *why = NULL;
+    int rc = protocol_read_request(sv[1], &req, &why);
+    close(sv[0]);
+    close(sv[1]);
+
+    assert(rc == PROTO_REFUSED);
+    assert(why != NULL && strcmp(why, "short read on ID frame") == 0);
+    assert(req.id[0] == '\0');
+    for (size_t i = 0; i < sizeof(req.id); i++) assert(req.id[i] == 0);
+    protocol_request_free(&req);
+}
+
+/* A refusal reached BEFORE any ID frame arrives must leave the placeholder, not
+ * poison: the same disclosure_record and logline read req->id on that path too,
+ * and `handle_conn` additionally compares it against "-" to decide whether the
+ * turn is identifiable enough to file a `protocol-abandoned` record against. */
+static void test_a_refusal_before_any_id_frame_leaves_the_placeholder(void) {
+    int sv[2];
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    static const char wire[] = "ARGC 1\n" "ARGC 2\n" "END\n";
+    assert(proto_write_full(sv[0], wire, sizeof(wire) - 1) == (ssize_t)(sizeof(wire) - 1));
+    assert(shutdown(sv[0], SHUT_WR) == 0);
+
+    struct exec_request req;
+    memset(&req, 0xAA, sizeof(req));
+    const char *why = NULL;
+    int rc = protocol_read_request(sv[1], &req, &why);
+    close(sv[0]);
+    close(sv[1]);
+
+    assert(rc == PROTO_REFUSED);
+    assert(strcmp(req.id, "-") == 0);
+    for (size_t i = 2; i < sizeof(req.id); i++) assert(req.id[i] == 0);
+    protocol_request_free(&req);
+}
+
 static void test_an_oversize_frame_length_is_refused(void) {
     /* Refused on the header alone, before a single payload byte is read and
      * before malloc is asked for it — the bound exists to cap what one
@@ -550,6 +657,9 @@ int main(void) {
     test_fewer_arg_frames_than_argc_is_refused();
     test_more_arg_frames_than_argc_is_refused();
     test_a_frame_claiming_more_bytes_than_are_sent_is_refused();
+    test_a_truncated_id_frame_leaves_no_uninitialised_stack_in_the_id();
+    test_an_id_frame_with_no_payload_at_all_is_still_terminated();
+    test_a_refusal_before_any_id_frame_leaves_the_placeholder();
     test_an_oversize_frame_length_is_refused();
     test_an_arg_frame_before_argc_is_refused();
     test_a_duplicate_argc_is_refused();

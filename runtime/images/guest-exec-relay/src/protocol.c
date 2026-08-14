@@ -115,6 +115,18 @@ int protocol_read_request(int fd, struct exec_request *req, const char **why) {
     char line[256];
     long argc = -1;   /* -1 until an ARGC header has actually been seen */
 
+    /* The WHOLE id buffer, zeroed, before anything can write a partial value
+     * into it. `req` is an uninitialised stack local in every caller
+     * (handle_conn declares `struct exec_request req;` and hands it straight
+     * here), so every byte of req->id past whatever arrives is otherwise
+     * whatever the caller's frame happened to contain — and req->id is read as
+     * a C string by the refusal paths, which put it in a log line and, worse,
+     * in a disclosure record that is sealed into the evidence bundle. A
+     * truncated ID frame is enough to reach that: see the short-read path
+     * below. Uninitialised stack in the sealed log is both a memory-safety bug
+     * and an evidence-integrity one, and zeroing here closes it for every
+     * field of req->id on every path at once rather than one path at a time. */
+    memset(req->id, 0, sizeof(req->id));
     memcpy(req->id, "-", 2);
     req->argc = 0;
     for (int i = 0; i < EXEC_RELAY_MAX_ARGV; i++) req->argv[i] = NULL;
@@ -129,9 +141,30 @@ int protocol_read_request(int fd, struct exec_request *req, const char **why) {
             long len;
             if (proto_parse_count(line + 3, &len) != 0 || len > EXEC_RELAY_MAX_ID_LEN)
                 return refuse(why, "ID frame length out of range");
-            if (len && proto_read_full(fd, req->id, (size_t)len) != (ssize_t)len)
-                return refuse(why, "short read on ID frame");
-            req->id[len] = 0;
+            /* Terminated from the count of bytes that ACTUALLY arrived, and
+             * terminated before the refusal can return.
+             *
+             * The old shape was `if (len && proto_read_full(...) != len) return
+             * refuse(...); req->id[len] = 0;` — so on a truncated frame (the
+             * peer declares `ID 200` and sends 10 bytes, then hangs up;
+             * proto_read_full returns the short count by design) the refusal
+             * returned with the terminator never written. req->id then held 10
+             * bytes of id followed by whatever was on the stack, and
+             * handle_conn's refusal path reads it as a C string straight into
+             * `protocol-refused`'s disclosure record. Garbage from the tracer's
+             * own stack, sealed into the evidence bundle as a turn id.
+             *
+             * `got` is a short count or -1 (a hard read error); the index is
+             * clamped to 0 for the negative case, and cannot exceed
+             * EXEC_RELAY_MAX_ID_LEN because `len` was range-checked above and
+             * `got <= len`. The zeroing at the top of this function already
+             * covers the buffer, so this is the belt to that pair of braces,
+             * kept because the invariant "req->id is NUL-terminated on every
+             * exit" should hold locally rather than by reference to an
+             * initialisation forty lines away. */
+            ssize_t got = len ? proto_read_full(fd, req->id, (size_t)len) : 0;
+            req->id[got > 0 ? (size_t)got : 0] = '\0';
+            if (got != (ssize_t)len) return refuse(why, "short read on ID frame");
         } else if (strncmp(line, "ARGC ", 5) == 0) {
             if (argc >= 0) return refuse(why, "duplicate ARGC header");
             if (proto_parse_count(line + 5, &argc) != 0
