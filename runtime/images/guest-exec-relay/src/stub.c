@@ -9,6 +9,7 @@
 #include <errno.h>
 #include <sys/socket.h>
 #include <sys/un.h>
+#include "protocol.h"
 
 /* Must match relayd.c's SOCK_ABSTRACT_NAME byte for byte — the two are a
  * matched pair with no filesystem artefact to discover the name from.
@@ -83,25 +84,45 @@ int main(int argc, char **argv) {
         return 111;
     }
 
-    char line[2048];
-    int n = snprintf(line, sizeof(line), "ID %s\nARGC %d\n", id, real_argc);
-    if (n < 0 || (size_t)n >= sizeof(line)) {
-        fprintf(stderr, "stub: ID line truncated\n");
+    /* Length-prefixed values, per protocol.h. The header line is formatted into
+     * this small buffer; the VALUE is then written raw, straight from argv,
+     * with no formatting step that could reinterpret any byte in it. That is
+     * what makes an argv element containing a newline survive: it is never
+     * spelled out as a line, so nothing downstream can split it back into two.
+     */
+    char hdr[64];
+    size_t idlen = strlen(id);
+    if (idlen > EXEC_RELAY_MAX_ID_LEN) {
+        fprintf(stderr, "stub: turn id is too long (%zu bytes, limit %d)\n",
+                idlen, EXEC_RELAY_MAX_ID_LEN);
         close(sfd);
         return 2;
     }
-    if (write_full(sfd, line, (size_t)n) < 0) {
+    int n = snprintf(hdr, sizeof(hdr), "ID %zu\n", idlen);
+    if (n < 0 || write_full(sfd, hdr, (size_t)n) < 0
+        || (idlen && write_full(sfd, id, idlen) < 0)) {
+        close(sfd);
+        return 1;
+    }
+    n = snprintf(hdr, sizeof(hdr), "ARGC %d\n", real_argc);
+    if (n < 0 || write_full(sfd, hdr, (size_t)n) < 0) {
         close(sfd);
         return 1;
     }
     for (int i = 0; i < real_argc; i++) {
-        n = snprintf(line, sizeof(line), "ARG %s\n", real_argv[i]);
-        if (n < 0 || (size_t)n >= sizeof(line)) {
-            fprintf(stderr, "stub: ARG line truncated\n");
+        size_t len = strlen(real_argv[i]);
+        /* Refused here as well as at the relay, so an over-long argument gets
+         * a message naming which argument it was rather than a bare
+         * protocol-error frame. */
+        if (len > EXEC_RELAY_MAX_ARG_LEN) {
+            fprintf(stderr, "stub: argument %d is too long (%zu bytes, limit %d)\n",
+                    i, len, EXEC_RELAY_MAX_ARG_LEN);
             close(sfd);
             return 2;
         }
-        if (write_full(sfd, line, (size_t)n) < 0) {
+        n = snprintf(hdr, sizeof(hdr), "ARG %zu\n", len);
+        if (n < 0 || write_full(sfd, hdr, (size_t)n) < 0
+            || (len && write_full(sfd, real_argv[i], len) < 0)) {
             close(sfd);
             return 1;
         }

@@ -106,6 +106,54 @@ static void test_rejects_2_63_boundary(void) {
     json_free(v);
 }
 
+static void test_escapes_control_characters_rfc8259_forbids(void) {
+    /* RFC 8259 forbids 0x00-0x1F raw inside a string, and the escaper's callers
+     * can all supply them: `requested_argv0` is read out of tracee memory and
+     * `detail` can carry a fixture's configured stdout_find. (The composition
+     * of a whole disclosure record is tested separately, in test_record.c.)
+     * \001 is octal — three digits max — rather than \x01, which would greedily
+     * absorb the following 'f'. */
+    const char *detail = "one\ntwo\tthree\rfour\001five\\six\"seven";
+    char buf[4096];
+    const char *open_key = "{\"detail\":\"";
+    size_t off = strlen(open_key);
+    memcpy(buf, open_key, off);
+    off = json_append_escaped(buf, off, sizeof(buf), detail);
+    buf[off++] = '"';
+    buf[off++] = '}';
+
+    /* Not one raw control byte survives into the record. */
+    for (size_t i = 0; i < off; i++) {
+        assert((unsigned char)buf[i] >= 0x20);
+    }
+    json_value_t *v = json_parse(buf, off);
+    assert(v != NULL);
+    /* And the value is preserved, not merely made safe. */
+    assert(strcmp(json_as_string(json_object_get(v, "detail")), detail) == 0);
+    json_free(v);
+}
+
+static void test_truncation_never_splits_an_escape(void) {
+    /* disclosure_record closes the string and the object after the escaper
+     * returns. If a value that does not fit could leave a lone trailing
+     * backslash, that backslash would escape the closing quote and lose the
+     * whole record to the same silent skip — so a value must be cut on a
+     * character boundary, never mid-escape. */
+    char buf[64];
+    memset(buf, 'Z', sizeof(buf));
+    /* Cap 4: "aaa" fits, the two-byte \" escape does not. */
+    size_t off = json_append_escaped(buf, 0, 4, "aaa\"bbb");
+    assert(off == 3);
+    assert(memcmp(buf, "aaa", 3) == 0);
+    assert(buf[3] == 'Z'); /* nothing written past the cut */
+
+    /* Same for the six-byte \u00XX form. */
+    memset(buf, 'Z', sizeof(buf));
+    off = json_append_escaped(buf, 0, 8, "aaa\001bbb");
+    assert(off == 3);
+    assert(buf[3] == 'Z');
+}
+
 int main(void) {
     test_parses_flat_object();
     test_parses_nested_array_of_objects();
@@ -116,6 +164,8 @@ int main(void) {
     test_rejects_truncated_nested_object();
     test_rejects_out_of_range_numbers();
     test_rejects_2_63_boundary();
+    test_escapes_control_characters_rfc8259_forbids();
+    test_truncation_never_splits_an_escape();
     printf("test_json: all tests passed\n");
     return 0;
 }

@@ -263,6 +263,46 @@ const char *json_as_string(json_value_t *v) {
     return v->u.string;
 }
 
+size_t json_append_escaped(char *buf, size_t off, size_t bufcap, const char *s) {
+    if (!s) return off;
+    for (; *s; s++) {
+        unsigned char c = (unsigned char)*s;
+        char esc[8];
+        size_t n;
+        switch (c) {
+            case '"':  esc[0] = '\\'; esc[1] = '"';  n = 2; break;
+            case '\\': esc[0] = '\\'; esc[1] = '\\'; n = 2; break;
+            case '\n': esc[0] = '\\'; esc[1] = 'n';  n = 2; break;
+            case '\r': esc[0] = '\\'; esc[1] = 'r';  n = 2; break;
+            case '\t': esc[0] = '\\'; esc[1] = 't';  n = 2; break;
+            case '\b': esc[0] = '\\'; esc[1] = 'b';  n = 2; break;
+            case '\f': esc[0] = '\\'; esc[1] = 'f';  n = 2; break;
+            default:
+                if (c < 0x20) {
+                    /* Everything else in the control range has no short escape
+                     * (NUL cannot appear — these are C strings — but 0x01-0x1f
+                     * minus the five above can, e.g. ESC from a terminal
+                     * sequence in a command's own argv). \u00XX is the only
+                     * legal spelling RFC 8259 leaves. */
+                    static const char HEX[] = "0123456789abcdef";
+                    esc[0] = '\\'; esc[1] = 'u'; esc[2] = '0'; esc[3] = '0';
+                    esc[4] = HEX[(c >> 4) & 0xf]; esc[5] = HEX[c & 0xf];
+                    n = 6;
+                } else {
+                    /* Bytes >= 0x80 pass through unchanged: a value that was
+                     * valid UTF-8 stays valid UTF-8, and one that was not is
+                     * not this function's to repair. */
+                    esc[0] = (char)c;
+                    n = 1;
+                }
+        }
+        if (off + n > bufcap) break;
+        memcpy(buf + off, esc, n);
+        off += n;
+    }
+    return off;
+}
+
 int json_as_int64(json_value_t *v, int64_t *out) {
     if (!v || v->type != JSON_NUMBER) return -1;
     double d = v->u.number;

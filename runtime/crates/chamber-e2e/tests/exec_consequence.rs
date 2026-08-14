@@ -111,6 +111,140 @@ fn passthrough_is_byte_identical_to_no_interception() {
 }
 
 #[test]
+fn a_relayed_command_inherits_no_relay_private_descriptors() {
+    let Some(_engine) = require_containers() else {
+        return;
+    };
+    let _serialised = chamber_subnet_lock();
+
+    let plan = ExecConsequencePlan {
+        rules: vec![],
+        timeout_ms: 60_000,
+        max_concurrent_handlers: 32,
+    };
+    let cell = start_cell(&plan);
+    cell.start().expect("start");
+    std::thread::sleep(Duration::from_millis(300));
+
+    // Not one descriptor the relay opens for itself may survive the worker's
+    // execve into the agent's own command. Before the fix, /proc/self/fd inside
+    // a relayed command listed nine entries against plain docker exec's four:
+    // the disclosure log (writable), the live control socket, a signalfd, and
+    // both sync pipes.
+    let via_relay = cell
+        .exec(&["stub", "/bin/ls", "-l", "/proc/self/fd"], OP_WINDOW)
+        .expect("exec via relay");
+    let direct = cell
+        .exec(&["/bin/ls", "-l", "/proc/self/fd"], OP_WINDOW)
+        .expect("exec direct");
+    assert_eq!(
+        via_relay.stdout.lines().count(),
+        direct.stdout.lines().count(),
+        "a relayed command sees a different fd table than plain docker exec:\n\
+         via relay:\n{}\ndirect:\n{}",
+        via_relay.stdout,
+        direct.stdout
+    );
+    for tell in ["disclosure.log", "signalfd", "socket:"] {
+        assert!(
+            !via_relay.stdout.contains(tell),
+            "a relayed command can see {tell} in its own /proc/self/fd:\n{}",
+            via_relay.stdout
+        );
+    }
+
+    // The consequence that made this Critical rather than cosmetic: the
+    // inherited log descriptor was opened O_WRONLY|O_APPEND, so the agent's own
+    // command could append forged records to the sealed evidence with a plain
+    // shell redirection. Measured on the pre-fix image, this call succeeded and
+    // the forged line was in the log.
+    let forge = cell
+        .exec(
+            &["stub", "/bin/sh", "-c", "echo FORGED-RECORD >&3"],
+            OP_WINDOW,
+        )
+        .expect("exec");
+    assert_ne!(
+        forge.status,
+        Some(0),
+        "writing to fd 3 from a relayed command should fail — it should not be open"
+    );
+    let log = cell
+        .exec(&["cat", "/work/.exec-relay/disclosure.log"], OP_WINDOW)
+        .expect("cat log");
+    assert!(
+        !log.stdout.contains("FORGED-RECORD"),
+        "the agent's own command injected a record into the sealed evidence log:\n{}",
+        log.stdout
+    );
+}
+
+#[test]
+fn an_argv_element_containing_a_newline_round_trips_byte_for_byte() {
+    let Some(_engine) = require_containers() else {
+        return;
+    };
+    let _serialised = chamber_subnet_lock();
+
+    let plan = ExecConsequencePlan {
+        rules: vec![],
+        timeout_ms: 60_000,
+        max_concurrent_handlers: 32,
+    };
+    let cell = start_cell(&plan);
+    cell.start().expect("start");
+    std::thread::sleep(Duration::from_millis(300));
+
+    // The stub -> relayd wire format used to put each argv element on its own
+    // `ARG <value>\n` line. An element containing a newline therefore arrived
+    // as two lines: the first matched `ARG ` and was taken as a complete (but
+    // truncated) argument, and the second matched none of the expected
+    // prefixes and was silently discarded — there was no `else` branch to
+    // report it, and `argc` was never reconciled against the number of `ARG`
+    // lines actually received, so neither end could detect the desync. The
+    // command simply ran with a quietly different argv than the caller asked
+    // for. Measured on the pre-fix image: this exact call printed `line1` and
+    // nothing else.
+    //
+    // These are not exotic inputs. A heredoc, a `python -c` script, a `sh -c`
+    // with two statements — all routine for a live driving agent, and all
+    // silently corrupted.
+    let multiline = "line1\nline2";
+
+    // `printf %s` writes its argument with nothing added and nothing
+    // interpreted, so stdout IS the argument as the relay delivered it — a
+    // byte-for-byte comparison, not an approximation of one.
+    let via_relay = cell
+        .exec(&["stub", "/usr/bin/printf", "%s", multiline], OP_WINDOW)
+        .expect("exec via relay");
+    assert_eq!(via_relay.status, Some(0));
+    assert_eq!(
+        via_relay.stdout, multiline,
+        "the argv element did not survive the wire intact"
+    );
+
+    // The same command WITHOUT the relay, in the same cell: the relayed result
+    // has to equal the un-relayed one, which is the property the whole feature
+    // rests on (passthrough is indistinguishable from no interception).
+    let direct = cell
+        .exec(&["/usr/bin/printf", "%s", multiline], OP_WINDOW)
+        .expect("exec direct");
+    assert_eq!(via_relay.stdout, direct.stdout);
+
+    // And the realistic shape, end to end: a two-statement shell script passed
+    // as one `-c` argument. Pre-fix this ran only the first statement.
+    let script = "echo first\necho second";
+    let scripted = cell
+        .exec(&["stub", "/bin/sh", "-c", script], OP_WINDOW)
+        .expect("exec script via relay");
+    assert_eq!(scripted.status, Some(0));
+    assert_eq!(
+        scripted.stdout, "first\nsecond\n",
+        "the second statement of a multi-line script did not run"
+    );
+}
+
+#[test]
 fn substitute_runs_the_replacement_binary() {
     let Some(_engine) = require_containers() else {
         return;

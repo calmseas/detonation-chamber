@@ -481,6 +481,36 @@ pub fn build_image(context_dir: &std::path::Path, tag: &str) -> Result<(), Engin
     Ok(())
 }
 
+/// Builds an image for one explicitly named platform (`linux/arm64`,
+/// `linux/amd64`, …) rather than for whatever the engine's host happens to be.
+///
+/// Only for images whose *contents* are architecture-bound, where the host's
+/// default is not a preference but a wrong answer. The guest-exec-relay image
+/// is the one such image: `execrelayd` intercepts execs with a seccomp filter
+/// gated on `AUDIT_ARCH_AARCH64` and arm64 register plumbing, so on any other
+/// architecture the filter's arch check fails and every worker is killed by
+/// `SECCOMP_RET_KILL_PROCESS` before its `execve` completes. Keeping it
+/// aarch64-only is a decision, not an oversight (design artefact
+/// `agenticpractices:artefact:2rau75fl5jsg3c4c8pla` section 7); this is where
+/// the decision is made explicit at the build, instead of being inherited
+/// silently from whichever machine happens to run it.
+///
+/// # Errors
+/// [`EngineError`] if the build fails, carrying the builder's stderr — which
+/// on a platform the image refuses is `relayd.c`'s own `#error` line.
+pub fn build_image_for_platform(
+    context_dir: &std::path::Path,
+    tag: &str,
+    platform: &str,
+) -> Result<(), EngineError> {
+    let dir = context_dir.to_string_lossy().into_owned();
+    must_run(
+        &["build", "--platform", platform, "-t", tag, &dir],
+        BUILD_WINDOW,
+    )?;
+    Ok(())
+}
+
 /// Builds an image whose Dockerfile lives outside its build context.
 ///
 /// The capture image needs this: its Dockerfile sits in `images/capture/` but

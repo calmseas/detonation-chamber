@@ -93,7 +93,14 @@ jobs:
   # not that egress containment is. Without this job the whole exec_consequence
   # suite ran in no CI at all.
   exec-consequence:
-    runs-on: ubuntu-latest
+    # MUST stay on an ARM64 runner. execrelayd's interception is aarch64-only by
+    # decision, not omission: its seccomp filter admits only AUDIT_ARCH_AARCH64
+    # and its register plumbing is arm64's. On an x86_64 runner the arch check
+    # fails and SECCOMP_RET_KILL_PROCESS kills every worker before its execve
+    # completes, so this job cannot pass on ubuntu-latest -- do not "fix" it
+    # back. See design artefact agenticpractices:artefact:2rau75fl5jsg3c4c8pla
+    # section 7; relayd.c and the image build both refuse other architectures.
+    runs-on: ubuntu-24.04-arm
     defaults:
       run:
         working-directory: runtime

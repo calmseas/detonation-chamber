@@ -11,9 +11,23 @@ use std::process::Command;
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 
-use chamber_isolation::{Docker, build_image, build_image_with_dockerfile};
+use chamber_isolation::{
+    Docker, build_image, build_image_for_platform, build_image_with_dockerfile,
+};
 
 pub const OP_WINDOW: Duration = Duration::from_secs(90);
+
+/// The one platform `execrelayd` can be built for.
+///
+/// Its exec interception is a seccomp filter gated on `AUDIT_ARCH_AARCH64`
+/// plus arm64 register plumbing (`NT_PRSTATUS`, `regs[0]`/`regs[1]` as the
+/// `execve` argument registers) — aarch64-only by decision, not by omission
+/// (design artefact `agenticpractices:artefact:2rau75fl5jsg3c4c8pla` section
+/// 7). Named here rather than left to the engine's default so that what gets
+/// built does not depend on which machine builds it; on a non-arm64 host this
+/// requires the engine's arm64 emulation, and the build fails loudly at
+/// `relayd.c`'s `#error` if the platform is wrong.
+pub const EXEC_RELAY_PLATFORM: &str = "linux/arm64";
 
 /// The engine, or a decision about what its absence means.
 ///
@@ -141,8 +155,12 @@ pub fn ensure_images_including(extra: &[&str]) {
             continue;
         }
         if tag == "chamber-guest-exec-relay:test" {
-            build_image(&images_dir().join("guest-exec-relay"), tag)
-                .expect("could not build the guest-exec-relay image");
+            build_image_for_platform(
+                &images_dir().join("guest-exec-relay"),
+                tag,
+                EXEC_RELAY_PLATFORM,
+            )
+            .expect("could not build the guest-exec-relay image");
         }
         built.insert(tag.to_owned());
     }

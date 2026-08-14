@@ -1,5 +1,24 @@
 // runtime/images/guest-exec-relay/src/relayd.c
 #define _GNU_SOURCE
+
+/* execrelayd is aarch64-only, by decision rather than by omission — see the
+ * design artefact agenticpractices:artefact:2rau75fl5jsg3c4c8pla §7. Everything
+ * below that touches the tracee's registers is arm64-shaped: the seccomp
+ * filter admits only AUDIT_ARCH_AARCH64 (anything else is KILL_PROCESS),
+ * `struct arm64_regs` mirrors the kernel's user_pt_regs, and the verb dispatch
+ * reads and writes regs[0]/regs[1]/regs[2] as the execve/execveat argument
+ * registers. On any other architecture that is not a degraded mode: it is a
+ * relay that kills every worker it supervises before the worker's execve
+ * completes, which is what the CI job added alongside this file would have
+ * done on its x86_64 runner. Fail at build time, where the cause is legible.
+ *
+ * Deliberately ABOVE the includes: this must be the first thing a wrong-arch
+ * build reports, rather than the reader having to work back to it from
+ * whichever Linux header happened to break first. */
+#if !defined(__aarch64__)
+#error "execrelayd is aarch64-only (seccomp arch gate + arm64 register plumbing); see design artefact agenticpractices:artefact:2rau75fl5jsg3c4c8pla section 7. Build this image with --platform linux/arm64."
+#endif
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -29,6 +48,8 @@
 #include "config.h"
 #include "json.h"
 #include "base64.h"
+#include "protocol.h"
+#include "record.h"
 
 /* ---- aarch64 register set (matches kernel struct user_pt_regs / NT_PRSTATUS) ---- */
 struct arm64_regs {
@@ -120,16 +141,42 @@ static ssize_t read_full(int fd, void *buf, size_t n) {
     return (ssize_t)n;
 }
 
-/* Read a '\n'-terminated line from a socket fd, byte at a time (protocol is small). */
+/* Read a '\n'-terminated HEADER line from a socket fd, byte at a time (every
+ * line in this protocol is a short fixed-shape header — the variable-length
+ * payloads are length-prefixed and read with read_full, never through here).
+ *
+ * Returns the line's length, or one of the negative codes below. It does NOT
+ * truncate: the previous version silently dropped everything past the buffer
+ * and still returned success, so an over-long line was indistinguishable from
+ * a well-formed short one and the remainder was re-interpreted as the next
+ * line. Refusing is the only safe answer — a request this side cannot read
+ * exactly is a request it must not half-execute. */
+#define READ_LINE_EOF      (-1)
+#define READ_LINE_OVERFLOW (-2)
 static int read_line(int fd, char *buf, size_t bufsz) {
     size_t i = 0;
     for (;;) {
         char c;
         ssize_t r = read(fd, &c, 1);
-        if (r <= 0) return -1;
+        if (r < 0 && errno == EINTR) continue;
+        if (r <= 0) return READ_LINE_EOF;
         if (c == '\n') { buf[i] = 0; return (int)i; }
-        if (i + 1 < bufsz) buf[i++] = c;
+        if (i + 1 >= bufsz) return READ_LINE_OVERFLOW;
+        buf[i++] = c;
     }
+}
+
+/* Strict decimal parse of a frame length / count: the WHOLE token must be
+ * digits. atoi() would read "12x" as 12 and "" as 0, both of which desync a
+ * length-prefixed stream against the bytes that actually follow. */
+static int parse_count(const char *s, long *out) {
+    if (!s || !*s) return -1;
+    errno = 0;
+    char *end = NULL;
+    long v = strtol(s, &end, 10);
+    if (errno != 0 || end == s || *end != '\0' || v < 0) return -1;
+    *out = v;
+    return 0;
 }
 
 /* frame tags for the response protocol */
@@ -150,7 +197,7 @@ static void send_frame(int fd, uint8_t tag, const void *payload, uint32_t len) {
 static int read_tracee_str(int pid, unsigned long long addr, char *out, size_t outsz) {
     char path[64];
     snprintf(path, sizeof(path), "/proc/%d/mem", pid);
-    int fd = open(path, O_RDONLY);
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
     if (fd < 0) return -1;
     size_t got = 0;
     while (got < outsz - 1) {
@@ -168,7 +215,7 @@ static int read_tracee_str(int pid, unsigned long long addr, char *out, size_t o
 static int write_tracee_mem(int pid, unsigned long long addr, const void *buf, size_t n) {
     char path[64];
     snprintf(path, sizeof(path), "/proc/%d/mem", pid);
-    int fd = open(path, O_RDWR);
+    int fd = open(path, O_RDWR | O_CLOEXEC);
     if (fd < 0) return -1;
     ssize_t w = pwrite(fd, buf, n, (off_t)addr);
     close(fd);
@@ -215,7 +262,7 @@ static int install_seccomp_filter(void) {
 static int read_tracee_argv(int pid, unsigned long long argv_addr, char out[][256], int max_n) {
     char path[64];
     snprintf(path, sizeof(path), "/proc/%d/mem", pid);
-    int fd = open(path, O_RDONLY);
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
     if (fd < 0) return 0;
     int n = 0;
     while (n < max_n) {
@@ -239,42 +286,21 @@ static int read_tracee_argv(int pid, unsigned long long argv_addr, char out[][25
 static int g_disclosure_fd = -1;
 
 static void disclosure_init(void) {
-    g_disclosure_fd = open(DISCLOSURE_LOG_PATH, O_CREAT | O_WRONLY | O_APPEND, 0600);
+    /* O_CLOEXEC is load-bearing, not hygiene. Without it this WRITABLE,
+     * O_APPEND descriptor to the sealed evidence log survives the worker
+     * child's execve into the agent's own command, which can then append
+     * whatever records it likes with a plain shell redirection to the
+     * inherited fd number (`echo '{...}' >&3`) — forging or corrupting the
+     * very evidence it is the subject of. Verified before the fix: fd 3 in a
+     * relayed command's /proc/self/fd read
+     * `l-wx------ 3 -> /work/.exec-relay/disclosure.log`, and a forged record
+     * written through it landed in the log. */
+    g_disclosure_fd = open(DISCLOSURE_LOG_PATH, O_CREAT | O_WRONLY | O_APPEND | O_CLOEXEC, 0600);
     if (g_disclosure_fd < 0) { perror("disclosure: open"); return; }
     static const char header[] =
         "{\"known_residual_tells\":[\"TracerPid nonzero in /proc/self/status "
         "\\u2014 structural to ptrace, not masked\"]}\n";
     write_full(g_disclosure_fd, header, sizeof(header) - 1);
-}
-
-/* Minimal, allocation-free JSON string escaping for the handful of fields we
- * emit here (argv entries, rule names, free-form `detail` text) — backslash
- * and double-quote are the only bytes this schema's own values can contain
- * that would break JSON (argv/name/detail never carry control characters in
- * practice; this only needs to not corrupt the log, not be a general escaper).
- * Appends into `buf` at offset `off` (bounded by `bufcap`) and returns the
- * new offset — a building block for assembling one full record in memory
- * before it ever touches the fd (see disclosure_record). */
-static size_t append_json_escaped(char *buf, size_t off, size_t bufcap, const char *s) {
-    for (; *s && off + 2 <= bufcap; s++) {
-        if (*s == '"' || *s == '\\') buf[off++] = '\\';
-        buf[off++] = *s;
-    }
-    return off;
-}
-
-/* vsnprintf-and-advance: formats into `buf` at offset `off` (bounded by
- * `bufcap`), returns the new offset. Truncates safely (never past bufcap)
- * rather than overflowing if a record ever runs long. */
-static size_t append_fmt(char *buf, size_t off, size_t bufcap, const char *fmt, ...) {
-    if (off >= bufcap) return off;
-    va_list ap;
-    va_start(ap, fmt);
-    int n = vsnprintf(buf + off, bufcap - off, fmt, ap);
-    va_end(ap);
-    if (n <= 0) return off;
-    size_t written = (size_t)n < bufcap - off ? (size_t)n : bufcap - off - 1;
-    return off + written;
 }
 
 /* Builds one complete JSON record in a local buffer and writes it with a
@@ -286,31 +312,22 @@ static size_t append_fmt(char *buf, size_t off, size_t bufcap, const char *fmt, 
  * interleave their writes into one corrupted, unparseable line. Composing
  * the whole line first and issuing one write() (comfortably under any
  * filesystem's atomic-write block size at this record's bounded size)
- * keeps concurrent records from ever interleaving. */
+ * keeps concurrent records from ever interleaving.
+ *
+ * The composition itself is record.c's, not this file's, so that it can be
+ * unit-tested: nothing in relayd.c compiles anywhere but aarch64 Linux, and
+ * an untestable record builder is how two of the five fields came to be
+ * interpolated with a raw %s. See record.h. */
 static void disclosure_record(const char *turn_id, const char *requested_argv0,
                                const char *matched_rule, const char *verb_applied,
                                const char *detail) {
     if (g_disclosure_fd < 0) return;
     struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
     char buf[8192];
-    size_t off = 0;
-    /* turn_id is guest-controlled (it arrives verbatim from `stub --turn-id=`),
-     * so it MUST go through the same escaper as requested_argv0/detail — not a
-     * raw %s. A crafted turn_id could otherwise close the JSON string early and
-     * inject its own keys (e.g. a fake "known_residual_tells"), making the whole
-     * record either fail to parse or be misread as the header and silently
-     * dropped from the sealed bundle (see bundle.rs record_exec_consequence_log). */
-    off = append_fmt(buf, off, sizeof(buf), "{\"turn_id\":\"");
-    off = append_json_escaped(buf, off, sizeof(buf), turn_id ? turn_id : "-");
-    off = append_fmt(buf, off, sizeof(buf),
-        "\",\"timestamp\":%ld.%03ld,\"requested_argv0\":\"",
-        (long)ts.tv_sec, ts.tv_nsec / 1000000);
-    off = append_json_escaped(buf, off, sizeof(buf), requested_argv0);
-    off = append_fmt(buf, off, sizeof(buf),
-                      "\",\"matched_rule\":\"%s\",\"verb_applied\":\"%s\",\"detail\":\"",
-                      matched_rule, verb_applied);
-    off = append_json_escaped(buf, off, sizeof(buf), detail);
-    off = append_fmt(buf, off, sizeof(buf), "\"}\n");
+    size_t off = disclosure_format_record(buf, sizeof(buf),
+                                          (long)ts.tv_sec, (long)(ts.tv_nsec / 1000000),
+                                          turn_id, requested_argv0,
+                                          matched_rule, verb_applied, detail);
     write_full(g_disclosure_fd, buf, off);
 }
 
@@ -350,7 +367,7 @@ static int trap_target_is_loadable(pid_t pid, int is_execveat,
     } else {
         snprintf(base, sizeof(base), "/proc/%d/cwd", (int)pid);
     }
-    int dfd = open(base, O_RDONLY | O_DIRECTORY);
+    int dfd = open(base, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     if (dfd < 0) return 1;                        /* cannot resolve — keep the record */
     int ok = faccessat(dfd, path, X_OK, 0) == 0;
     close(dfd);
@@ -386,7 +403,17 @@ static int run_traced(char *const argv[], char *const envp_extra[], int envp_ext
                        const struct exec_plan *plan, uint64_t timeout_ms) {
     const struct exec_rule *active_rewrite = NULL;
     int outp[2], errp[2], syncr[2], syncg[2];
-    if (pipe(outp) || pipe(errp) || pipe(syncr) || pipe(syncg)) { perror("pipe"); return -1; }
+    /* pipe2(O_CLOEXEC), not pipe(): every one of these eight descriptors is
+     * relay-private and none may survive into the agent's own command. The two
+     * the worker actually needs on the far side of execve — its stdout and
+     * stderr — get there via dup2(), which CLEARS the flag on the new
+     * descriptor, so marking the originals costs the worker nothing. The sync
+     * pipes are both used strictly before execve. Setting the flag at creation
+     * rather than after is what makes it safe under the concurrent forks in
+     * run_server: there is no window in which a fork could inherit an
+     * unmarked copy. */
+    if (pipe2(outp, O_CLOEXEC) || pipe2(errp, O_CLOEXEC)
+        || pipe2(syncr, O_CLOEXEC) || pipe2(syncg, O_CLOEXEC)) { perror("pipe2"); return -1; }
 
     /* Block SIGCHLD and open the signalfd BEFORE forking. If this happened
      * after PTRACE_SEIZE/release instead, there is a window where the child
@@ -398,7 +425,10 @@ static int run_traced(char *const argv[], char *const envp_extra[], int envp_ext
      * the window entirely; the mask is inherited across fork() harmlessly. */
     sigset_t mask; sigemptyset(&mask); sigaddset(&mask, SIGCHLD);
     sigprocmask(SIG_BLOCK, &mask, NULL);
-    int sfd = signalfd(-1, &mask, SFD_NONBLOCK);
+    /* SFD_CLOEXEC alongside SFD_NONBLOCK: this fd is the tracer's, and an
+     * `anon_inode:[signalfd]` in the agent command's own /proc/self/fd is a
+     * fully legible tell that something is supervising it. */
+    int sfd = signalfd(-1, &mask, SFD_NONBLOCK | SFD_CLOEXEC);
     if (sfd < 0) { perror("signalfd"); return -1; }
 
     pid_t pid = fork();
@@ -424,6 +454,25 @@ static int run_traced(char *const argv[], char *const envp_extra[], int envp_ext
         /* wait for parent's go-ahead (parent has SEIZEd us by now) */
         char go;
         if (read(syncg[0], &go, 1) != 1) _exit(125);
+
+        /* Every remaining relay-private descriptor, closed BY NAME now that the
+         * handshake is done and nothing below needs any of them. The O_CLOEXEC/
+         * SOCK_CLOEXEC flags set at creation would already drop all of these at
+         * execve; this second pass exists because CLOEXEC is a promise about a
+         * call that has not happened yet, and the window between here and
+         * execvpe() runs arbitrary code (malloc, and the PATH walk inside
+         * execvpe itself). Closing explicitly also covers the case that has no
+         * atomic-CLOEXEC form at creation: `cfd`, which arrives here as out_fd/
+         * err_fd. What must NOT be closed is stdin/stdout/stderr — in the
+         * --self-test path out_fd/err_fd ARE fds 1 and 2, which by now name the
+         * output pipes via dup2, so the guard is on the fd number, not on the
+         * variable. */
+        close(syncr[1]);
+        close(syncg[0]);
+        close(sfd);                                     /* the tracer's signalfd */
+        if (g_disclosure_fd >= 0) close(g_disclosure_fd);  /* the sealed evidence log */
+        if (out_fd > STDERR_FILENO) close(out_fd);         /* the stub's connection */
+        if (err_fd > STDERR_FILENO && err_fd != out_fd) close(err_fd);
 
         /* build envp: inherited environ + any extras (e.g. RELAY_REQ_ID) */
         extern char **environ;
@@ -719,32 +768,107 @@ reap_and_fail:
 
 /* ------------------------- socket-relay server path ------------------------- */
 
+/* Refuses one request, loudly, at both ends: a TAG_STDERR frame the stub
+ * relays onto ITS stderr, then a TAG_EXIT frame carrying
+ * EXIT_PROTOCOL_ERROR, then the close. The alternative — the previous
+ * behaviour — was to close the socket and let the caller infer something from
+ * a bare EOF, which is how a desynchronised request became a partial-argv exec
+ * that neither side could see had happened. */
+static void protocol_error(int cfd, const char *id, const char *what) {
+    logline("req id=%s REFUSED: protocol error: %s", id ? id : "-", what);
+    char msg[256];
+    int n = snprintf(msg, sizeof(msg), "relay: protocol error: %s\n", what);
+    if (n > 0) send_frame(cfd, TAG_STDERR, msg, (uint32_t)n);
+    uint8_t payload[4] = { 0, 0, 0, (uint8_t)EXIT_PROTOCOL_ERROR };
+    send_frame(cfd, TAG_EXIT, payload, 4);
+    close(cfd);
+}
+
 static void handle_conn(int cfd, const struct exec_plan *plan) {
-    char line[2048];
-    char id[256] = "-";
-    int argc = 0;
+    char line[256];
+    char id[EXEC_RELAY_MAX_ID_LEN + 1] = "-";
+    long argc = -1;   /* -1 until an ARGC header has actually been seen */
+    int n_args = 0;
     char *argv[EXEC_RELAY_MAX_ARGV];
     for (int i = 0; i < EXEC_RELAY_MAX_ARGV; i++) argv[i] = NULL;
 
     for (;;) {
         int n = read_line(cfd, line, sizeof(line));
-        if (n < 0) { close(cfd); return; }
+        if (n == READ_LINE_OVERFLOW) {
+            protocol_error(cfd, id, "header line too long");
+            goto refuse;
+        }
+        if (n < 0) {
+            /* EOF before END: nothing to answer on, and nothing to run. */
+            logline("req id=%s REFUSED: connection closed mid-request", id);
+            close(cfd);
+            goto refuse;
+        }
         if (strncmp(line, "ID ", 3) == 0) {
-            strncpy(id, line + 3, sizeof(id) - 1);
-        } else if (strncmp(line, "ARGC ", 5) == 0) {
-            argc = atoi(line + 5);
-            if (argc < 1 || argc > EXEC_RELAY_MAX_ARGV - 1) { close(cfd); return; }
-        } else if (strncmp(line, "ARG ", 4) == 0) {
-            for (int i = 0; i < EXEC_RELAY_MAX_ARGV - 1; i++) {
-                if (argv[i] == NULL) { argv[i] = strdup(line + 4); break; }
+            long len;
+            if (parse_count(line + 3, &len) != 0 || len > EXEC_RELAY_MAX_ID_LEN) {
+                protocol_error(cfd, id, "ID frame length out of range");
+                goto refuse;
             }
+            if (len && read_full(cfd, id, (size_t)len) != (ssize_t)len) {
+                protocol_error(cfd, id, "short read on ID frame");
+                goto refuse;
+            }
+            id[len] = 0;
+        } else if (strncmp(line, "ARGC ", 5) == 0) {
+            if (argc >= 0) { protocol_error(cfd, id, "duplicate ARGC header"); goto refuse; }
+            if (parse_count(line + 5, &argc) != 0
+                || argc < 1 || argc > EXEC_RELAY_MAX_ARGV - 1) {
+                protocol_error(cfd, id, "ARGC out of range");
+                goto refuse;
+            }
+        } else if (strncmp(line, "ARG ", 4) == 0) {
+            if (argc < 0) { protocol_error(cfd, id, "ARG frame before ARGC"); goto refuse; }
+            if (n_args >= (int)argc) {
+                protocol_error(cfd, id, "more ARG frames than ARGC announced");
+                goto refuse;
+            }
+            long len;
+            if (parse_count(line + 4, &len) != 0 || len > EXEC_RELAY_MAX_ARG_LEN) {
+                protocol_error(cfd, id, "ARG frame length out of range");
+                goto refuse;
+            }
+            /* The payload is read as EXACTLY len bytes and is never scanned for
+             * a delimiter, which is the whole point of the length prefix: an
+             * argv element containing '\n' (a heredoc, a multi-line `python -c`
+             * script) arrives byte for byte instead of being split into a line
+             * that matched and a remainder that silently vanished. */
+            char *val = malloc((size_t)len + 1);
+            if (!val) { protocol_error(cfd, id, "out of memory"); goto refuse; }
+            if (len && read_full(cfd, val, (size_t)len) != (ssize_t)len) {
+                free(val);
+                protocol_error(cfd, id, "short read on ARG frame");
+                goto refuse;
+            }
+            val[len] = 0;
+            argv[n_args++] = val;
         } else if (strcmp(line, "END") == 0) {
             break;
+        } else {
+            /* The `else` that was missing. An unrecognised line used to be
+             * dropped on the floor without a word, which is exactly how the
+             * continuation of a split ARG line disappeared. */
+            protocol_error(cfd, id, "unrecognised request line");
+            goto refuse;
         }
     }
-    if (!argv[0]) { close(cfd); return; }
 
-    logline("accepted req id=%s argv0=%s argc=%d", id, argv[0], argc);
+    /* Reconcile what was announced against what actually arrived. Neither side
+     * could previously detect a desync at all: argc was parsed, range-checked,
+     * and then never compared with the number of ARG frames received. */
+    if (argc < 0) { protocol_error(cfd, id, "END with no ARGC header"); goto refuse; }
+    if (n_args != (int)argc) {
+        protocol_error(cfd, id, "ARG frame count does not match ARGC");
+        goto refuse;
+    }
+    if (!argv[0]) { protocol_error(cfd, id, "no argv[0]"); goto refuse; }
+
+    logline("accepted req id=%s argv0=%s argc=%ld", id, argv[0], argc);
 
     char idenv[300];
     snprintf(idenv, sizeof(idenv), "RELAY_REQ_ID=%s", id);
@@ -758,6 +882,15 @@ static void handle_conn(int cfd, const struct exec_plan *plan) {
     send_frame(cfd, TAG_EXIT, payload, 4);
     logline("req id=%s done exit=%d", id, ecode);
     close(cfd);
+    for (int i = 0; i < EXEC_RELAY_MAX_ARGV; i++) free(argv[i]);
+    return;
+
+refuse:
+    /* Every refusal path lands here; protocol_error (or the EOF branch) has
+     * already closed cfd and said why. The handler process _exit()s straight
+     * after this returns, but freeing keeps the ownership story honest for
+     * anyone who later calls handle_conn twice in one process. */
+    for (int i = 0; i < EXEC_RELAY_MAX_ARGV; i++) free(argv[i]);
 }
 
 static volatile sig_atomic_t g_active_handlers = 0;
@@ -772,7 +905,10 @@ static void reap_finished_handlers(void) {
 }
 
 static int run_server(const struct exec_plan *plan) {
-    int sfd = socket(AF_UNIX, SOCK_STREAM, 0);
+    /* SOCK_CLOEXEC on the listener for the same reason accept4 carries it
+     * below: nothing this process opens may reach an agent command's fd table.
+     * The handler child closes it explicitly too — both, deliberately. */
+    int sfd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (sfd < 0) { perror("socket"); return 1; }
     /* No unlink() and no chmod() before/after bind: an abstract address has no
      * directory entry to clear away or to set a mode on. Reachability is
@@ -792,8 +928,15 @@ static int run_server(const struct exec_plan *plan) {
     for (;;) {
         reap_finished_handlers();
 
-        int cfd = accept(sfd, NULL, NULL);
-        if (cfd < 0) { if (errno == EINTR) continue; perror("accept"); continue; }
+        /* accept4(SOCK_CLOEXEC), not accept(): a plain accept() returns a
+         * descriptor with no close-on-exec flag, and this one is the live
+         * connection to the stub. Inherited across the worker's execve it
+         * showed up in the agent command's own /proc/self/fd as
+         * `socket:[...]` — a control channel it can both name and write to.
+         * There is no non-atomic version of this that is safe: the accept loop
+         * forks, so a set-the-flag-afterwards fix leaves a window. */
+        int cfd = accept4(sfd, NULL, NULL, SOCK_CLOEXEC);
+        if (cfd < 0) { if (errno == EINTR) continue; perror("accept4"); continue; }
 
         if ((uint32_t)g_active_handlers >= plan->max_concurrent_handlers) {
             logline("rejecting connection: %d handlers already active (cap %u)",
