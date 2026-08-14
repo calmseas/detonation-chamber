@@ -129,10 +129,13 @@ static void test_rejects_base64_with_invalid_character(void) {
  * Every other bound in config.h caps one value, and a plan can satisfy all of
  * them at once and still be undeliverable — 64 rules each near its own limits
  * base64s to well over a megabyte. Nothing refused that, on either side, and
- * the failure it produced was the worst-shaped one available: execve() rejects
- * an over-long environment string with E2BIG before this program's first
- * instruction runs, so the cell simply never started, with no message from
- * anything that knew why.
+ * without a host-side check the failure would instead surface downstream, as
+ * a real but unhelpful error: a docker- or containerd-level failure on the
+ * `--env-file` this value becomes, or, at worst, the kernel's own execve()
+ * rejecting an over-long environment string with E2BIG before this program's
+ * first instruction runs. Either way the host sees a typed error (chamber-
+ * isolation's EngineError::Failed) — not nothing — but one naming a transport
+ * failure rather than the plan that caused it.
  *
  * Built here as valid, decodable base64 of valid JSON, one character past the
  * limit — so what is measured is the length check and not a decode or parse

@@ -66,18 +66,34 @@ pub mod guest_limits {
     /// once base64'd, and every per-field check passes.
     ///
     /// The guest-side ceiling is NOT a buffer (the decode mallocs and the JSON
-    /// parser allocates as it goes) — it is the kernel's. The spec travels as
-    /// one environment variable, the runtime hands it to `execrelayd` through
-    /// `execve`, and Linux caps each individual argv/envp string at
-    /// `MAX_ARG_STRLEN` = `32 * PAGE_SIZE`. At the smallest page size in use
-    /// that is 131072 bytes including the NUL, less the 34 characters of
-    /// `CHAMBER_EXEC_CONSEQUENCE_SPEC_B64=`, rounded down to a multiple of 4
-    /// because padded base64 has no other length. Past it `execve` fails
-    /// `E2BIG` and the cell never starts — no message, no `ArmingRefusal`, just
-    /// a container that will not come up. Checked here so that is a legible
-    /// host-side refusal instead, and restated in `config.h` (and enforced by
-    /// `config_load_from_env`) so the two parsers agree on a stated number
-    /// rather than on a kernel behaviour only one of them can observe.
+    /// parser allocates as it goes) — it is a chain of transport hops, and this
+    /// number is the tightest one we can actually name from this codebase. The
+    /// value does not reach the guest via a host-performed `execve`: it flows
+    /// `to_env_pairs()` → `seal_cell_environment` → `SealedEnv::to_env_file`
+    /// (a 0600 `--env-file`, never `-e KEY=VALUE`, so it never sits in the host
+    /// process table) → `ContainerSpec.env_file` → `docker create --env-file
+    /// <path>` → the docker daemon → containerd → runc's `execve` of the guest
+    /// entrypoint with that envp. The kernel's `MAX_ARG_STRLEN` = `32 *
+    /// PAGE_SIZE` ceiling on that final `execve` is real — at the smallest page
+    /// size in use that is 131072 bytes including the NUL, less the 34
+    /// characters of `CHAMBER_EXEC_CONSEQUENCE_SPEC_B64=`, rounded down to a
+    /// multiple of 4 because padded base64 has no other length — but it is the
+    /// LAST of several hops, not the only one: the docker CLI's own
+    /// `--env-file` line parser is a plausible tighter ceiling that would fail
+    /// first (unverified in this codebase, but worth naming as the more likely
+    /// actual failure point). Whichever hop actually refuses it, the failure
+    /// DOES surface as a real, typed error — `EngineError::Failed { stderr,
+    /// .. }`, via `must_run` — not silently. The value of checking here is
+    /// catching it EARLY, before ever attempting the container operation, with
+    /// a clear host-side refusal (`ArmingRefusal`/`SpecTooLarge`) that names
+    /// the total instead of a docker or containerd error message about a line
+    /// it could not parse. This number is chosen as a bound that fails closed:
+    /// it is tighter than the kernel's own ceiling, and even though the exact
+    /// tightest real ceiling among the several hops is not independently
+    /// verified in this codebase, erring on the tighter side is safe. Restated
+    /// in `config.h` (and enforced by `config_load_from_env`) so the two
+    /// parsers agree on a stated number rather than on a hop-chain behaviour
+    /// only one of them can observe.
     pub const MAX_SPEC_B64: usize = 131_036;
     /// Largest `timeout_ms` the guest carries FAITHFULLY — 2^53.
     ///
@@ -262,9 +278,12 @@ pub enum ExecConsequenceConfigError {
     /// property of one field: a plan can pass every per-field check and still
     /// combine into a document that cannot be delivered, which is the exact
     /// host-accepts/guest-refuses shape the other limits were aligned to close.
-    /// It is also the worst-presenting one, because the refusal happens in
-    /// `execve` before `execrelayd` runs: without this check the operator sees
-    /// a cell that will not start and nothing at all about why.
+    /// Without this check the refusal would instead surface downstream — as a
+    /// docker- or containerd-level `EngineError::Failed` on the `--env-file`
+    /// this value becomes, or, at worst, the kernel's own `execve` `E2BIG` on
+    /// `execrelayd`'s entrypoint — a real error either way, but one that names
+    /// a transport failure rather than the plan that caused it. Checked here
+    /// so the operator instead gets a legible, typed refusal naming the total.
     SpecTooLarge {
         encoded_len: usize,
     },
@@ -345,10 +364,13 @@ impl std::fmt::Display for ExecConsequenceConfigError {
             Self::SpecTooLarge { encoded_len } => write!(
                 f,
                 "the plan encodes to {encoded_len} base64 characters; {EXEC_SPEC_B64_VAR} \
-                 travels to the guest as one environment variable and the kernel accepts at \
-                 most {} for it, past which execve fails E2BIG and the cell never starts. \
-                 Every individual field is within its own limit — it is the total that is \
-                 not, so the fix is fewer or smaller rules rather than a shorter single value",
+                 travels to the guest as one environment variable through docker create \
+                 --env-file and on to the guest entrypoint's execve, and this host-side check \
+                 accepts at most {} for it — a bound chosen tighter than the kernel's own \
+                 MAX_ARG_STRLEN ceiling so this refusal fires before any hop downstream (docker, \
+                 containerd, or the kernel) has a chance to fail on it instead. Every individual \
+                 field is within its own limit — it is the total that is not, so the fix is \
+                 fewer or smaller rules rather than a shorter single value",
                 guest_limits::MAX_SPEC_B64
             ),
             Self::TimeoutZero => write!(f, "timeout_ms must be nonzero"),
@@ -1172,10 +1194,14 @@ mod tests {
     /// was carefully matched to `config.c`, boundary conventions and all — and
     /// none of them says anything about the TOTAL. `MAX_RULES` rules, each
     /// individually valid and each near its own ceilings, encodes to well over
-    /// a megabyte, and the failure it produces is the worst-presenting one in
-    /// this whole system: `execve` refuses the environment string with `E2BIG`
-    /// before `execrelayd` runs, so there is no guest-side error message, no
-    /// `ArmingRefusal`, and no bundle — only a cell that will not come up.
+    /// a megabyte, and without this check the failure would surface downstream
+    /// instead of here: as a docker- or containerd-level error from the
+    /// `--env-file` this value ultimately becomes, or, at worst, the kernel's
+    /// own `execve` `E2BIG` on the guest entrypoint. That failure would still
+    /// be a real, typed `EngineError::Failed`, not a silent one — but it would
+    /// name a line docker could not parse, not the plan that produced it. This
+    /// check turns it into a legible host-side `ArmingRefusal`/`SpecTooLarge`
+    /// before any container operation is attempted at all.
     ///
     /// Built out of `Fabricate` payloads because they are the largest per-rule
     /// field, so the plan stays small in rule count and obviously legitimate:

@@ -139,9 +139,10 @@ int config_load_from_env(struct exec_plan *out) {
     if (!b64) return -1;
 
     /* The whole spec's size, which no per-field limit bounds. See
-     * EXEC_RELAY_MAX_SPEC_B64 for why the real ceiling is the kernel's
-     * MAX_ARG_STRLEN rather than any buffer in this file, and why it is
-     * nonetheless restated and enforced here. */
+     * EXEC_RELAY_MAX_SPEC_B64 for why the ceiling is not a buffer in this
+     * file but a chain of transport hops (docker's --env-file parser, then
+     * the kernel's MAX_ARG_STRLEN, among others), and why it is nonetheless
+     * restated and enforced here. */
     if (strlen(b64) > EXEC_RELAY_MAX_SPEC_B64) return -1;
 
     char *decoded = NULL;

@@ -14,10 +14,14 @@ cd "$(dirname "$0")"
 # first (test_protocol.c's
 # test_a_truncated_id_frame_leaves_no_uninitialised_stack_in_the_id).
 #
-# `detect_leaks` is deliberately NOT forced on: LeakSanitizer is unavailable on
-# the macOS hosts this script is also run from, and a flag that fails there but
-# not on CI would push people to stop running it locally. What is enabled is
-# identical on both.
+# `detect_leaks` is not set here either way, and that is NOT the same thing on
+# both hosts this script runs on: under -fsanitize=address on Linux (CI's
+# ubuntu-latest), LeakSanitizer is enabled BY DEFAULT unless explicitly turned
+# off with ASAN_OPTIONS=detect_leaks=0, whereas LSan is unavailable on macOS
+# entirely. So a green run locally exercises ASan/UBSan only — it does not
+# confirm CI's leak check, which runs for real. If a leak ever shows up here
+# only on CI, that is expected, not flaky: check `ASAN_OPTIONS` first before
+# assuming the run is unreliable.
 #
 # UBSAN_OPTIONS makes undefined behaviour FAIL rather than print and continue —
 # without it a signed-overflow or misaligned-load report scrolls past a green

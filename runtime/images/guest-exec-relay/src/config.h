@@ -60,23 +60,35 @@
  *
  * The bound is NOT a buffer in this file — the decode mallocs and the JSON
  * parser allocates as it goes, so there is no fixed array here to overrun, and
- * looking for one is how this limit came to be missed. It is the KERNEL's, and
- * it applies before any line of this program runs. The runtime hands execrelayd
- * its environment through execve(), and Linux caps each individual argv/envp
- * string at MAX_ARG_STRLEN = 32 * PAGE_SIZE; strnlen_user counts the NUL, so
- * with the smallest page size in use (4096) one string may be at most 131072
- * bytes including it, i.e. 131071 characters. "CHAMBER_EXEC_CONSEQUENCE_SPEC_B64="
- * is 34 of those, leaving 131037 for the value. Past it execve fails E2BIG and
- * the container never starts — no message from this program, no ArmingRefusal,
- * just a cell that will not come up.
+ * looking for one is how this limit came to be missed. It applies before any
+ * line of this program runs, because this value never reaches the guest via a
+ * host-performed execve() at all: it flows host-side from
+ * ExecConsequencePlan::to_env_pairs() through a 0600 --env-file (never
+ * `-e KEY=VALUE`, which would sit in the host process table) into
+ * `docker create --env-file <path>`, then the docker daemon, then containerd,
+ * and only then runc's execve() of THIS program with that envp. The kernel's
+ * MAX_ARG_STRLEN = 32 * PAGE_SIZE ceiling on that final execve() is real —
+ * strnlen_user counts the NUL, so with the smallest page size in use (4096)
+ * one string may be at most 131072 bytes including it, i.e. 131071 characters;
+ * "CHAMBER_EXEC_CONSEQUENCE_SPEC_B64=" is 34 of those, leaving 131037 for the
+ * value — but it is the LAST of several hops, not the only one: the docker
+ * CLI's own --env-file line parser is a plausible tighter ceiling that would
+ * fail first (unverified from this program, but worth naming as the more
+ * likely actual failure point). Whichever hop refuses it, the failure surfaces
+ * as a real, typed error on the host (chamber-isolation's EngineError::Failed,
+ * carrying the daemon's stderr) — not silently, and not as "no message, no
+ * ArmingRefusal, just a cell that will not come up".
  *
  * So this is checked host-side (chamber-capture's `validate`, against the
- * mirrored constant) to turn that into a legible refusal, and enforced here as
- * well so the two parsers agree on a stated limit rather than on a kernel
- * behaviour one of them cannot see. A larger PAGE_SIZE (16K/64K aarch64 kernels
- * exist) only makes the kernel MORE permissive than this number, so the check
- * stays the tighter of the two on every configuration — which is the direction
- * that fails closed.
+ * mirrored constant) to turn that into an EARLY, legible refusal — before any
+ * container operation is attempted — rather than a docker or containerd error
+ * about a line it could not parse. Enforced here as well so the two parsers
+ * agree on a stated limit rather than on a hop-chain behaviour one of them
+ * cannot see. A larger PAGE_SIZE (16K/64K aarch64 kernels exist) only makes
+ * the kernel's own ceiling MORE permissive, and the exact tightest real
+ * ceiling among the several hops is not independently verified from this
+ * program — but this number is chosen tighter than the kernel's, which is the
+ * direction that fails closed regardless of which hop is truly tightest.
  *
  * Rounded DOWN to a multiple of 4 (131036, from the 131037 the arithmetic
  * above gives) because padded base64 has no other length: no encoded spec can
