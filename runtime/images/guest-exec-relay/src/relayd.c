@@ -28,6 +28,7 @@
 #include <linux/elf.h>
 #include "config.h"
 #include "json.h"
+#include "base64.h"
 
 /* ---- aarch64 register set (matches kernel struct user_pt_regs / NT_PRSTATUS) ---- */
 struct arm64_regs {
@@ -155,30 +156,6 @@ static int install_seccomp_filter(void) {
     return syscall(SYS_seccomp, SECCOMP_SET_MODE_FILTER, 0, &prog);
 }
 
-/* Scratch-buffer protocol between the tracer (this file) and the traced
- * worker (also this file, running post-fork — see run_traced below). The
- * tracer writes into the worker's own memory via /proc/pid/mem before
- * resuming a trapped execve; the worker's post-execve-failure code (which
- * only runs if the syscall did not actually succeed) reads it back to know
- * whether a "failure" was real or an intentional fabricate. */
-#define SCRATCH_MODE_NONE       0
-#define SCRATCH_MODE_SUBSTITUTE 1
-#define SCRATCH_MODE_FABRICATE  2
-
-struct fabricate_payload {
-    int32_t exit_code;
-    uint32_t stdout_len;
-    uint32_t stderr_len;
-    /* followed by stdout_len bytes of stdout, then stderr_len bytes of stderr */
-};
-
-/* Fabricate payloads (mode + header + stdout+stderr bytes) live in the first
- * half of the scratch buffer; a substitute path or the fabricate sentinel
- * path lives in the second half, so the two never collide even though both
- * are written for a single trapped syscall in the fabricate case. */
-#define SCRATCH_PAYLOAD_OFFSET 0
-#define SCRATCH_PATH_OFFSET (SCRATCH_SIZE / 2)
-
 /* Reads the NULL-terminated argv[] pointer array at `argv_addr` in the
  * tracee's memory (the execve/execveat syscall's own argv argument — NOT
  * the top-level command run_traced() was started with, which for a forked
@@ -250,16 +227,12 @@ static int run_traced(char *const argv[], char *const envp_extra[], int envp_ext
         close(outp[1]); close(errp[1]);
         if (devnull >= 0) close(devnull);
 
-        static char scratch[SCRATCH_SIZE]; /* fixed address the tracer can overwrite */
-
         if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0) { _exit(126); }
         if (install_seccomp_filter() != 0) { _exit(126); }
 
-        /* tell parent we're ready to be seized, and where the scratch buffer is */
-        unsigned long long addr = (unsigned long long)(uintptr_t)scratch;
+        /* tell parent we're ready to be seized */
         char ok = 'R';
         write(syncr[1], &ok, 1);
-        write(syncr[1], &addr, sizeof(addr));
 
         /* wait for parent's go-ahead (parent has SEIZEd us by now) */
         char go;
@@ -275,21 +248,7 @@ static int run_traced(char *const argv[], char *const envp_extra[], int envp_ext
         envp[k] = NULL;
 
         execve(argv[0], argv, envp);
-        /* execve only returns on error. Check whether the tracer left a
-         * fabricate payload in our own scratch buffer before assuming this
-         * is a genuine failure. */
-        {
-            uint8_t mode = ((uint8_t *)scratch)[SCRATCH_PAYLOAD_OFFSET];
-            if (mode == SCRATCH_MODE_FABRICATE) {
-                struct fabricate_payload pl;
-                memcpy(&pl, scratch + SCRATCH_PAYLOAD_OFFSET + 1, sizeof(pl));
-                const uint8_t *out = (const uint8_t *)scratch + SCRATCH_PAYLOAD_OFFSET + 1 + sizeof(pl);
-                const uint8_t *err = out + pl.stdout_len;
-                if (pl.stdout_len) write_full(STDOUT_FILENO, out, pl.stdout_len);
-                if (pl.stderr_len) write_full(STDERR_FILENO, err, pl.stderr_len);
-                _exit(pl.exit_code);
-            }
-        }
+        /* execve only returns on error */
         fprintf(stderr, "relay: execve(%s) failed: %s\n", argv[0], strerror(errno));
         _exit(127);
     }
@@ -298,12 +257,10 @@ static int run_traced(char *const argv[], char *const envp_extra[], int envp_ext
     close(outp[1]); close(errp[1]); close(syncr[1]); close(syncg[0]);
 
     char rbyte;
-    unsigned long long scratch_addr = 0;
     if (read_full(syncr[0], &rbyte, 1) != 1 || rbyte != 'R') {
         logline("req=%s pid=%d: child failed to signal ready", req_id?req_id:"-", pid);
         goto reap_and_fail;
     }
-    read_full(syncr[0], &scratch_addr, sizeof(scratch_addr));
 
     if (ptrace(PTRACE_SEIZE, pid, 0,
                (void*)(long)(PTRACE_O_TRACESECCOMP | PTRACE_O_TRACEFORK |
@@ -350,30 +307,29 @@ static int run_traced(char *const argv[], char *const envp_extra[], int envp_ext
                 int status;
                 pid_t w = waitpid(-1, &status, WNOHANG | __WALL);
                 if (w <= 0) break;
-                if (w != pid) continue; /* only the child we're relaying for */
+                /* Every waited pid may be relevant: PTRACE_O_TRACEFORK/VFORK/
+                 * CLONE makes descendants tracees of this same tracer, and
+                 * their own seccomp traps arrive through this same waitpid.
+                 * Handled per-pid via `w` throughout; only the ORIGINAL
+                 * top-level process's exit (w == pid) ends the whole request
+                 * — a grandchild exiting is not the command finishing. */
 
                 if (WIFSTOPPED(status)) {
                     int sig = WSTOPSIG(status);
                     int event = status >> 16;
                     if (sig == SIGTRAP && event == PTRACE_EVENT_SECCOMP) {
                         unsigned long msg = 0;
-                        ptrace(PTRACE_GETEVENTMSG, pid, 0, &msg); /* == syscall nr, per our BPF encoding */
+                        ptrace(PTRACE_GETEVENTMSG, w, 0, &msg);
                         struct arm64_regs regs;
-                        get_regs(pid, &regs);
+                        get_regs(w, &regs);
                         int is_execveat = (msg == (unsigned long)SYS_execveat);
                         unsigned long long path_reg = is_execveat ? regs.regs[1] : regs.regs[0];
                         char reqpath[1024];
-                        read_tracee_str(pid, path_reg, reqpath, sizeof(reqpath));
+                        read_tracee_str(w, path_reg, reqpath, sizeof(reqpath));
 
-                        /* argv is the 2nd execve arg (x1) or the 3rd execveat
-                         * arg (x2, since execveat's signature inserts dirfd
-                         * before pathname) — read fresh on every trap, since
-                         * a forked grandchild's own exec (coverage: nested
-                         * subprocesses) needs ITS OWN argv, not whatever the
-                         * top-level command started with. */
                         unsigned long long argv_ptr_reg = is_execveat ? regs.regs[2] : regs.regs[1];
                         char tracee_argv[EXEC_RELAY_MAX_ARGV][256];
-                        int tracee_argc = read_tracee_argv(pid, argv_ptr_reg, tracee_argv, EXEC_RELAY_MAX_ARGV);
+                        int tracee_argc = read_tracee_argv(w, argv_ptr_reg, tracee_argv, EXEC_RELAY_MAX_ARGV);
                         char *argv_ptrs[EXEC_RELAY_MAX_ARGV];
                         for (int ai = 0; ai < tracee_argc; ai++) argv_ptrs[ai] = tracee_argv[ai];
 
@@ -382,73 +338,99 @@ static int run_traced(char *const argv[], char *const envp_extra[], int envp_ext
                         const char *verb_name = "passthrough";
                         char detail[1200] = "-";
 
+                        /* Computed fresh from THIS trap's own live SP, not a
+                         * fixed address handed over once by the top-level
+                         * worker at startup — this is what makes substitute
+                         * (and fabricate's redirect-to-helper, below) work
+                         * for ANY tracee, including a grandchild running a
+                         * completely different program's memory image. */
+                        unsigned long long scratch_addr = regs.sp - SCRATCH_SIZE;
+
                         if (!rule) {
                             /* passthrough: leave the syscall untouched */
                         } else if (rule->verb == VERB_SUBSTITUTE) {
                             verb_name = "substitute";
                             const char *replacement = rule->replacement_argv[0];
                             size_t rl = strlen(replacement) + 1;
-                            if (rl <= (SCRATCH_SIZE - SCRATCH_PATH_OFFSET) && scratch_addr) {
-                                write_tracee_mem(pid, scratch_addr + SCRATCH_PATH_OFFSET, replacement, rl);
-                                if (is_execveat) regs.regs[1] = scratch_addr + SCRATCH_PATH_OFFSET;
-                                else regs.regs[0] = scratch_addr + SCRATCH_PATH_OFFSET;
-                                set_regs(pid, &regs);
+                            if (rl <= SCRATCH_SIZE) {
+                                write_tracee_mem(w, scratch_addr, replacement, rl);
+                                if (is_execveat) regs.regs[1] = scratch_addr;
+                                else regs.regs[0] = scratch_addr;
+                                set_regs(w, &regs);
                                 snprintf(detail, sizeof(detail), "%s", replacement);
                             } else {
                                 verb_name = "substitute-failed-scratch-too-small";
                             }
                         } else if (rule->verb == VERB_FABRICATE) {
                             verb_name = "fabricate";
-                            uint8_t mode = SCRATCH_MODE_FABRICATE;
-                            struct fabricate_payload pl = {
-                                .exit_code = rule->fabricate_exit_code,
-                                .stdout_len = rule->fabricate_stdout_len,
-                                .stderr_len = rule->fabricate_stderr_len,
-                            };
-                            uint8_t buf[SCRATCH_PATH_OFFSET];
-                            size_t off = 0;
-                            memcpy(buf + off, &mode, 1); off += 1;
-                            memcpy(buf + off, &pl, sizeof(pl)); off += sizeof(pl);
-                            memcpy(buf + off, rule->fabricate_stdout, pl.stdout_len); off += pl.stdout_len;
-                            memcpy(buf + off, rule->fabricate_stderr, pl.stderr_len); off += pl.stderr_len;
-                            write_tracee_mem(pid, scratch_addr + SCRATCH_PAYLOAD_OFFSET, buf, off);
-                            static const char SENTINEL[] = "/.exec-consequence-fabricate-sentinel";
-                            write_tracee_mem(pid, scratch_addr + SCRATCH_PATH_OFFSET, SENTINEL, sizeof(SENTINEL));
-                            if (is_execveat) regs.regs[1] = scratch_addr + SCRATCH_PATH_OFFSET;
-                            else regs.regs[0] = scratch_addr + SCRATCH_PATH_OFFSET;
-                            set_regs(pid, &regs);
-                            snprintf(detail, sizeof(detail), "exit=%d stdout_len=%u stderr_len=%u",
-                                     pl.exit_code, pl.stdout_len, pl.stderr_len);
+                            /* Redirect (substitute-style) to a baked-in helper,
+                             * passing the canned result via argv — argv content
+                             * is copied by the kernel as part of execve() itself,
+                             * so (unlike scratch memory) it survives a REAL exec
+                             * even though the new image gets a fresh, ASLR-
+                             * randomized stack. This is what lets fabricate work
+                             * on a grandchild, not just the top-level worker. */
+                            char *b64_stdout = base64_encode(rule->fabricate_stdout, rule->fabricate_stdout_len);
+                            char *b64_stderr = base64_encode(rule->fabricate_stderr, rule->fabricate_stderr_len);
+                            char exit_code_str[16];
+                            snprintf(exit_code_str, sizeof(exit_code_str), "%d", rule->fabricate_exit_code);
+
+                            int ok = 0;
+                            if (b64_stdout && b64_stderr) {
+                                static const char HELPER_PATH[] = "/usr/local/bin/fabricate-emit";
+                                const char *helper_argv[4] = { HELPER_PATH, exit_code_str, b64_stdout, b64_stderr };
+
+                                uint8_t buf[SCRATCH_SIZE];
+                                size_t off = 0;
+                                unsigned long long str_addrs[4];
+                                int fits = 1;
+                                for (int ai = 0; ai < 4 && fits; ai++) {
+                                    size_t sl = strlen(helper_argv[ai]) + 1;
+                                    if (off + sl > SCRATCH_SIZE - 64) { fits = 0; break; }
+                                    memcpy(buf + off, helper_argv[ai], sl);
+                                    str_addrs[ai] = scratch_addr + off;
+                                    off += sl;
+                                }
+                                if (fits) {
+                                    off = (off + 7) & ~(size_t)7; /* 8-byte align the pointer array */
+                                    unsigned long long ptr_array_addr = scratch_addr + off;
+                                    unsigned long long ptrs[5] = { str_addrs[0], str_addrs[1], str_addrs[2], str_addrs[3], 0 };
+                                    memcpy(buf + off, ptrs, sizeof(ptrs));
+                                    off += sizeof(ptrs);
+
+                                    write_tracee_mem(w, scratch_addr, buf, off);
+                                    if (is_execveat) { regs.regs[1] = str_addrs[0]; regs.regs[2] = ptr_array_addr; }
+                                    else { regs.regs[0] = str_addrs[0]; regs.regs[1] = ptr_array_addr; }
+                                    set_regs(w, &regs);
+                                    snprintf(detail, sizeof(detail), "exit=%d stdout_b64_len=%zu stderr_b64_len=%zu",
+                                             rule->fabricate_exit_code, strlen(b64_stdout), strlen(b64_stderr));
+                                    ok = 1;
+                                }
+                            }
+                            if (!ok) verb_name = "fabricate-failed-encode-or-scratch";
+                            free(b64_stdout);
+                            free(b64_stderr);
                         } else if (rule->verb == VERB_REWRITE) {
-                            /* Real exec proceeds untouched; the transform is applied to
-                             * the piped output in the parent's poll loop (Task 5), not
-                             * here — this trap only needs to record which rule fired. */
                             verb_name = "rewrite";
                             snprintf(detail, sizeof(detail), "stdout_find=%s",
                                       rule->has_stdout_rewrite ? rule->stdout_find : "(none)");
                         }
 
                         logline("req=%s pid=%d syscall=%s requested=%s verb=%s rule=%s detail=%s",
-                                req_id?req_id:"-", pid, is_execveat?"execveat":"execve",
+                                req_id?req_id:"-", w, is_execveat?"execveat":"execve",
                                 reqpath, verb_name, rule_name, detail);
                         disclosure_record(req_id, reqpath, rule_name, verb_name, detail);
                         active_rewrite = (rule && rule->verb == VERB_REWRITE) ? rule : NULL;
-                        ptrace(PTRACE_CONT, pid, 0, 0);
+                        ptrace(PTRACE_CONT, w, 0, 0);
                     } else if (sig == SIGTRAP && event != 0) {
-                        /* fork/vfork/clone/exit event etc: just continue, we don't need
-                         * to do anything special for this spike beyond letting new
-                         * descendants run (they inherit our seccomp filter + tracer). */
-                        ptrace(PTRACE_CONT, pid, 0, 0);
+                        ptrace(PTRACE_CONT, w, 0, 0);
                     } else {
-                        /* genuine signal-delivery stop: pass it through unmolested */
-                        ptrace(PTRACE_CONT, pid, 0, (void*)(long)sig);
+                        ptrace(PTRACE_CONT, w, 0, (void*)(long)sig);
                     }
                 } else if (WIFEXITED(status)) {
-                    ecode = WEXITSTATUS(status);
-                    have_exit = 1;
+                    if (w == pid) { ecode = WEXITSTATUS(status); have_exit = 1; }
                 } else if (WIFSIGNALED(status)) {
-                    ecode = 128 + WTERMSIG(status);
-                    have_exit = 1;
+                    if (w == pid) { ecode = 128 + WTERMSIG(status); have_exit = 1; }
                 }
             }
         }

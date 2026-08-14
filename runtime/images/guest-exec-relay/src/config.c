@@ -1,6 +1,7 @@
 // runtime/images/guest-exec-relay/src/config.c
 #include "config.h"
 #include "json.h"
+#include "base64.h"
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -137,35 +138,10 @@ int config_load_from_env(struct exec_plan *out) {
     const char *b64 = getenv("CHAMBER_EXEC_CONSEQUENCE_SPEC_B64");
     if (!b64) return -1;
 
-    /* Minimal base64 decode — standard alphabet, '=' padding. The Rust side
-     * (Task 1) is the source of truth for what gets encoded; this decoder
-     * only needs to invert it, not accept arbitrary base64 dialects. */
-    /* Initialize all entries to -1 (invalid), then override valid base64 chars */
-    signed char T[256];
-    for (int i = 0; i < 256; i++) T[i] = -1;
-    /* Set valid base64 alphabet characters */
-    for (char c = 'A'; c <= 'Z'; c++) T[(unsigned char)c] = c - 'A';
-    for (char c = 'a'; c <= 'z'; c++) T[(unsigned char)c] = 26 + (c - 'a');
-    for (char c = '0'; c <= '9'; c++) T[(unsigned char)c] = 52 + (c - '0');
-    T[(unsigned char)'+'] = 62;
-    T[(unsigned char)'/'] = 63;
-    size_t inlen = strlen(b64);
-    char *decoded = malloc(inlen); /* decoded is always <= inlen bytes */
-    if (!decoded) return -1;
+    char *decoded = NULL;
     size_t outlen = 0;
-    int val = 0, valb = -8;
-    for (size_t i = 0; i < inlen; i++) {
-        unsigned char c = (unsigned char)b64[i];
-        if (c == '=' || c == '\n' || c == '\r') continue;
-        signed char d = T[c];
-        if (d < 0) { free(decoded); return -1; } /* invalid base64 character */
-        val = (val << 6) | d;
-        valb += 6;
-        if (valb >= 0) {
-            decoded[outlen++] = (char)((val >> valb) & 0xFF);
-            valb -= 8;
-        }
-    }
+    if (base64_decode(b64, &decoded, &outlen) != 0) return -1;
+
     int rc = config_load_from_json(decoded, outlen, out);
     free(decoded);
     return rc;
