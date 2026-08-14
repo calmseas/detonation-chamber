@@ -118,6 +118,8 @@ impl std::fmt::Display for ExecConsequenceConfigError {
     }
 }
 
+impl std::error::Error for ExecConsequenceConfigError {}
+
 impl ExecConsequencePlan {
     pub fn from_json(text: &str) -> Result<Self, ExecConsequenceConfigError> {
         let plan: ExecConsequencePlan =
