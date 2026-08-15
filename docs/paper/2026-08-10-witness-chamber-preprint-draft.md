@@ -1,4 +1,4 @@
-# The Detonation Chamber: Behavioural Evaluation of Suborned Agentic Skills, and an Honest Account of What It Cannot See
+# The Witness Chamber: Behavioural Evaluation of Suborned Agentic Skills, and an Honest Account of What It Cannot See
 
 *Working preprint draft — 2026-08-10. Status: methods + preliminary findings; empirical sections marked (PRELIMINARY, N=…) are pending the scale-up in §5.3.*
 
@@ -11,7 +11,7 @@ assistant — are trusted on the basis of what they *say* they do. We show that
 review of the artefact text is a poor predictor of runtime behaviour, and that
 whether an assistant is suborned by a malicious skill depends sharply on (a) the
 driving model and (b) the framing of the user's request. We present the
-**Detonation Chamber**, a harness that executes an untrusted skill inside a
+**Witness Chamber**, a harness that executes an untrusted skill inside a
 sealed cell driven by a *live* model, plants a decoy credential (a *canary*), and
 watches egress channels for the canary escaping; and a **differential** mode that
 subtracts a benign reference arm from a candidate arm under a shared task battery.
@@ -74,7 +74,7 @@ false-negative "no findings"; worst-case observation is the point.
 **Out of scope.** Kernel/hypervisor escape, the model provider as adversary, and
 side channels the cell does not instrument (enumerated in §7).
 
-## 3. Method: the Detonation Chamber
+## 3. Method: the Witness Chamber
 
 ### 3.1 The cell and the canary
 The skill is staged into a sealed cell (`/work`) with no uplink. A canary secret

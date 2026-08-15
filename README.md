@@ -1,4 +1,4 @@
-# Detonation Chamber
+# Witness Chamber
 
 *Containment and review for installable prompt artefacts.*
 
@@ -43,7 +43,7 @@ Stated in the tool's own output on every run, not buried here:
 
 **A clean result licenses "this artefact is legible", never "this artefact is safe."**
 
-Runtime behaviour is the detonation chamber's job — this is the cheap deterministic layer that runs first.
+Runtime behaviour is the witness chamber's job — this is the cheap deterministic layer that runs first.
 
 ## Exit codes
 
@@ -72,7 +72,10 @@ Reports only what the new version introduces.
 ## Status
 
 `chamber scan` — built and tested.
-`chamber detonate` — specified, not implemented. It refuses rather than degrading to a weaker check.
+`chamber detonate` — the behavioural layer. Substantially built (a baseline diff, a live model
+driver, a general exec-interception mechanism, a first corpus-wide reading) but not a shipped
+product. See [ROADMAP.md](ROADMAP.md) for what's built, what's a documented gap, and the
+findings so far — stated with their limits, not instead of them.
 
 ## Licence
 

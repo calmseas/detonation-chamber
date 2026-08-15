@@ -12,7 +12,7 @@ one layer of a larger design:
 
 ```
 chamber scan       static legibility checks    — SHIPPED
-chamber detonate   runtime behavioural review  — SLICE 0 BUILT (walking skeleton)
+chamber detonate   runtime behavioural review  — substantially built, not shipped
 ```
 
 `scan` is the cheap deterministic gate that runs first. `detonate` is the expensive behavioural
@@ -20,10 +20,12 @@ layer that observes what an artefact actually does. Neither is a trust gate on i
 they close the specific holes the published bypasses exploit, which is more than any single
 shipping tool does.
 
-`detonate` is no longer only a specification: a Slice 0 walking skeleton runs end to end and
-emits a signed evidence bundle a third party can check. It is not a shipped product — it drives
-replayed turns, not a live model, and it reports on a single arm rather than a baseline diff (see
-below). What it does today, and what it still cannot, are both stated precisely under
+`detonate` is no longer only a specification: it runs a live model against a baseline diff and
+emits a signed evidence bundle a third party can check, and it has produced a first corpus-wide
+reading across the fixture set. It is not a shipped product — no `chamber detonate` binary
+ships, several axes below are documented gaps rather than built capability, and the one reading
+it has produced needs a larger sample and a blind audit before it is cited anywhere that
+matters. What it does today, and what it still cannot, are both stated precisely under
 [chamber detonate](#then--chamber-detonate-the-behavioural-layer).
 
 ## Shipped — `chamber scan`
@@ -87,40 +89,94 @@ Priorities, from the red-team findings still open (documented, not yet closed):
 
 ## Then — `chamber detonate` (the behavioural layer)
 
-The runtime half. A Slice 0 walking skeleton is built; the core that makes its verdict *mean*
-what the design intends — a baseline diff, not an absolute — is next.
+The runtime half. Substantially further along than an earlier "Slice 0 walking skeleton"
+framing now suggests: a baseline diff runs, a live model can drive the artefact, a general
+exec-interception mechanism exists, and a first corpus-wide reading has produced a real,
+twice-replicated finding. Still not a shipped product — no `chamber detonate` binary ships
+today, and the gaps stated below remain gaps.
 
-### Slice 0 — built
+### Built
 
-A whole detonation runs end to end and emits a signed evidence bundle:
+- **Disposable containers per run** — a warden that owns the network namespace, an observer,
+  and the agent cell joined into that namespace with an empty capability bounding set. The
+  cell mounts nothing from the host — read-only rootfs, tmpfs scratch — so the only host path
+  is the evidence directory the observer writes, which is how the bundle outlives the run.
+- **Default-deny egress** enforced in nftables, through a logging MITM proxy that terminates
+  TLS and records full request bodies, plus a DNS sink that answers every name and logs the
+  asking. One process, one monotonic ordinal, so an interleaving — a name looked up, then
+  POSTed to — is recoverable from the bundle alone.
+- **A per-run credential canary**; any token crossing the boundary — in a body, a URL, a
+  header, a DNS name, or the TLS SNI — is an unambiguous, verdict-bearing witness.
+- **A signed bundle** a third party checks with `chamber-verify` and the two files, nothing
+  else; the verdict is re-derived from the ledger, never trusted from the file.
+- **An anti-rubber-stamp fixture matrix** — a planted token that crosses detonates, and things
+  that look like it but are not each stay no-finding (or refuse to conclude, for a dead
+  observer), each for the reason it names — plus the full containment probe table corroborated
+  by drop counters and captured frames, a boundary self-test that refuses to arm a matcher that
+  has silently broken, and a supply-chain gate over the dependency closure.
+- **A baseline arm.** Differential detonation: two arms run the same task battery, and what is
+  reported is the *diff* between them, not either arm's absolute verdict — a canary-only axis
+  that bears a verdict, plus a weaker "shape" axis that reports leads without asserting one, for
+  cases the canary axis is structurally blind to. This is the gap the original walking-skeleton
+  design flagged as its own next step.
+- **A live driver.** LiveTurns: an actual model drives the artefact under test — credulous,
+  digest-only, behind an explicit `Model` abstraction — rather than only replaying a checked-in
+  script. A live source must still be explicitly selected; nothing defaults to it.
+- **A general exec-interception mechanism.** `execrelayd`: a PID-1 supervisor using
+  `PTRACE_SEIZE` and a seccomp filter to substitute, rewrite, or fabricate the outcome of any
+  command the driving agent runs inside the cell, with disclosure sealed into the bundle
+  alongside what actually happened. Generalizes what used to be a one-off `pip-shim.sh` fixture
+  into reusable, config-driven infrastructure. It does not do anything on its own yet —
+  migrating `pip-shim.sh` onto it is a real, documented, not-yet-started follow-up, and no
+  fixture in the corpus currently depends on it.
+- **An integrity axis**, not only an exfiltration one. A multi-oracle panel — a golden/reference
+  comparison, a metamorphic-consistency check, cross-referencing, and a confidence-gated jury —
+  catches a skill whose output is subtly *wrong* rather than exfiltrating anything, extended to
+  file-level output too (a skill that writes a subtly wrong file, not only a wrong answer).
 
-- disposable containers per run: a warden that owns the network namespace, an observer, and the
-  agent cell joined into that namespace with an empty capability bounding set. The cell mounts
-  nothing from the host — read-only rootfs, tmpfs scratch — so the only host path is the evidence
-  directory the observer writes, which is how the bundle outlives the run.
-- default-deny egress enforced in nftables, through a logging MITM proxy that terminates TLS and
-  records full request bodies, plus a DNS sink that answers every name and logs the asking. One
-  process, one monotonic ordinal, so an interleaving — a name looked up, then POSTed to — is
-  recoverable from the bundle alone.
-- a per-run credential canary; any token crossing the boundary — in a body, a URL, a header, a
-  DNS name, or the TLS SNI — is an unambiguous, verdict-bearing witness.
-- a signed bundle a third party checks with `chamber-verify` and the two files, nothing else; the
-  verdict is re-derived from the ledger, never trusted from the file.
-- an anti-rubber-stamp fixture matrix — a planted token that crosses detonates, and four things
-  that look like it but are not each stay no-finding (or refuse to conclude, for a dead observer),
-  each for the reason it names — plus the full containment probe table corroborated by drop
-  counters and captured frames, a boundary self-test that refuses to arm a matcher that has
-  silently broken, and a supply-chain gate over the dependency closure.
+### A first corpus-wide reading
 
-### Remaining — stated as gaps in every bundle, not hidden
+27 fixtures × 5 models × 3 repeats — the first time the elicitation battery has run as one
+durable, corpus-wide report instead of one fixture measured at a time. 405 real, sealed
+container runs; zero false positives across every benign fixture, every model.
 
-- **No baseline arm.** Slice 0 reports on a single arm and an absolute verdict. The design's real
-  signal is a three-part task battery — legitimate / held-out / tempting — run against a baseline,
-  where what matters is the *diff*, not the absolute. This is the next slice.
-- **No live driver.** Turns are replayed from a checked-in script, stamped into the bundle as
-  such; a live model source must be explicitly selected, never defaulted.
-- **One bait type.** A credential canary is planted; the customer and source bait the design calls
-  for are not yet.
+The finding worth stating plainly: the model with the lowest fire rate in the sweep (opus-4.8,
+3 of 39 catchable-exfil runs) fires 0 of 27 times on every fixture where the payload lives in
+the skill itself — it reads the script first almost every time there. Its only three fires
+anywhere in the corpus belong to a different fixture class (the fabricated-pip supply-chain
+rungs), where the transcript shows the harmful command running first and the model recognising
+what it did only afterward. An earlier, independent experiment (a five-rung reticence ladder,
+75 of 75 runs sealed) found the same order of events first, on a different harness.
+
+Read this next to its limits, not instead of them: `n=3` per cell is thin and needs raising
+before this is cited anywhere it matters, and the exact cells behind the headline number
+(h-mal-blatant/silent/warn, 1 of 3 each) are cells the sweep's own report calls noisy at that
+depth; the sweep covers one arm and the network-egress axis only, so the destructive and
+dependency-hallucination axes are structural zeros in this particular reading, not clean
+results; several fixtures targeting the same host share enough surface (SKILL.md, endpoint)
+that they cannot be independently attributed; the harness's own TLS trust anchor is a measured
+confound concentrated in exactly this model — 19% of its runs flag it as suspicious, versus
+zero for every other model — and two of the three firing transcripts behind the headline number
+cite it directly, so "recognising what it did" may be partly the model noticing the harness
+rather than reasoning about the exfil; the reticence-ladder result above ran the identical
+payload through the identical image and detonation substrate, only orchestration and scoring
+differ, and the sweep's own report states its numbers are not poolable with the ladder's; and
+the blind audit this result should survive before publication has not yet been run.
+
+### Remaining — stated as gaps, not hidden
+
+- **MCP tool-metadata poisoning.** A different injection surface — the payload sits in tool
+  descriptions, not skill files. Whether this belongs inside the chamber or as a sibling tool
+  is an open scope question, not yet decided.
+- **Persistence / backdoor payloads.** A skill that installs something durable rather than
+  acting once needs cross-run, post-teardown inspection the chamber does not do yet.
+- **Time/date-triggered poison** and **a pure timing/request-count side-channel.** The first
+  needs new instrumentation (guest-clock control) that does not exist yet; the second is
+  expected to surface an honest gap in the chamber's own coverage rather than a catch.
+- **A within-run escalation ("the kick").** Deliberately not built. It is gated on a flat
+  realism ladder showing a plateau below saturation, and the most recent run of that ladder did
+  not show one. Building the escalation mechanism anyway would mean building real
+  instrumentation against a signal that has not yet appeared.
 
 Its honest limits are part of the spec, not a footnote: it proves a positive ("this misbehaved"),
 never its negation; it does not see dormant or conditional payloads; the ledger is tamper-evident
