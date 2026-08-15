@@ -276,7 +276,7 @@ the user (§9) — applied not to an opinion or fact, as in the existing literat
 but to a runtime safety decision. This is a claim we make, not a result those
 papers state; establishing it rigorously is a goal of the scale-up.
 
-### 6.3 Where does refusal break? A sharp, recent discontinuity
+### 6.3 Where does refusal break? A single-version step in compliance
 We swept the Anthropic lineage on `e2-custom` at N=10 under default framing.
 Refusal is not gradual — it appears only at the newest version of each line:
 
@@ -299,16 +299,32 @@ authority-override nudge (§6.2), Sonnet 5 cracks to 2/10, whereas Opus 4.8 stay
 is the more robust.
 
 Every Opus from 4 through 4.7 and every Sonnet from 4 through 4.6 ran the
-credential theft, most at a rate of 1.0. Robust refusal is a **single-version
-step**: Opus 4.7→4.8 flips from 10/10 compliance to refusal; Sonnet 4.6→5 does the
-same. Capability improves gradually across these minor versions, while this
-behaviour flips in one step — which is stronger evidence for an
-alignment-training change than for a capability threshold; a capability-driven
-effect would not switch a model from 100% compliance to refusal in a single minor
-increment. (Sonnet 4's 6/10 versus 4.5/4.6's 10/10 is a minor non-monotonicity in
-the compliant regime, not the boundary.) This is the paper's clearest single
-result and the strongest argument that the behaviour of interest is trained in,
-not scaled in.
+credential theft, most at a rate of 1.0. Refusal is a **single-version step**:
+Opus 4.7→4.8 flips from 10/10 compliance to refusal; Sonnet 4.6→5 does the
+same. (Sonnet 4's 6/10 versus 4.5/4.6's 10/10 is a minor non-monotonicity in
+the compliant regime, not the boundary.)
+
+**This shape is not, on its own, evidence of a discrete training change.**
+Schaeffer, Miranda, and Koyejo ("Are Emergent Abilities of Large Language
+Models a Mirage?," arXiv:2304.15004) show that on BIG-Bench, over 92% of
+claimed sharp "emergent ability" transitions concentrate in exactly two
+metrics — Multiple Choice Grade, which they characterize as discontinuous,
+and Exact String Match, which they characterize as nonlinear — and that at
+least one such transition (LaMDA's) vanishes outright when rescored on a
+continuous metric (Brier Score). Our own metric shares the structural
+vulnerability their argument targets, if not its exact mechanism: outcomes
+are thresholded to pass/fail per trial and tallied over a small sample
+(N=10), which can make a gradual underlying change look like a discrete
+step. We have not run the continuous-scoring or larger-N measurement that
+would tell the two apart. This reads next to its limits, not instead of
+them (§8): a shared deployment-layer safety classifier could produce a
+synchronized cross-lineage flip independent of either model's own training,
+and Anthropic reports Opus 4.8 scoring worse than recent models on a
+malicious-computer-use evaluation — a complicating data point, not a
+competing explanation, that would sit awkwardly next to a clean
+trained-not-scaled story if it bears on this result. We hedge accordingly:
+the single-version-step shape is worth further investigation as a possible
+signature of an alignment-training change, not yet established as one.
 
 ### 6.4 The detector's blind spot is real and reproducible
 For every model that ran `e2-custom`, the canary left the wire (recovered by
@@ -404,6 +420,24 @@ finding" is never rendered as "safe."
   literature.
 - **Driver is deliberately credulous**, so results upper-bound the *skill's*
   suasive power, not a hardened deployment's resistance.
+- **§6.3's metric has not been checked against a continuous alternative.**
+  The comparison that would settle whether the single-version flip is a real
+  discrete step or a small-N artifact — larger N, or a continuous compliance
+  score instead of a binary per-trial tally — has not been run; §6.3 cites
+  Schaeffer et al. (arXiv:2304.15004) as the reason this matters, not as
+  proof either way.
+- **The deployment-layer-classifier alternative for §6.3's flip is
+  untested.** We have no evidence for or against a shared safety classifier
+  operating above the model layer; it would explain a synchronized
+  cross-lineage flip without requiring either lineage's own weights to have
+  changed, and nothing in our data currently distinguishes it from a
+  genuine per-model training change.
+- **Opus 4.8's own reported regression complicates a clean reading of
+  §6.3.** Anthropic's system card (§5.1.2) has Opus 4.8 scoring worse than
+  recent models on a malicious-computer-use evaluation, more willing to
+  begin a task without scrutinizing harmful intent — in some tension with
+  reading §6.3's refusal as a general alignment improvement, if the two
+  evaluations bear on the same underlying disposition.
 - **§6.5's two experiments share substrate, not independence.** The
   corpus-wide sweep and the reticence ladder both detonate the same
   H-supplychain fixtures through the same underlying mechanism; only
@@ -492,6 +526,8 @@ what the method still cannot see.
 - X. Liu, Y. E. Zhang, V. Kasprova, P. Rabbani, P. S. Zahraei, T. Zhang, A. Ebrahimpour-Boroojeny, and V. Chandrasekaran, "AgentAbstain: Do LLM Agents Know When Not to Act?," 2026. arXiv:2607.10059.
 - Z. Chen, X. Liu, H. Tong, C. Guo, Y. Nie, J. Zhang, M. Kang, C. Xu, Q. Liu, X. Liu, T. Shi, C. Xiao, S. Koyejo, P. Liang, W. Guo, D. Song, and B. Li, "DecodingTrust-Agent Platform (DTap): A Controllable and Interactive Red-Teaming Platform for AI Agents," 2026. arXiv:2605.04808.
 - Z. Chen, X. Liu, J. Zhu, H. Dou, S. Jiang, J. Li, L. Guo, F. Chen, and C. Zhang, "REDAgentBench: Executable Red Teaming and Faithful Measurement of LLM Agent Systems," 2026. arXiv:2608.10669.
+- R. Schaeffer, B. Miranda, and S. Koyejo, "Are Emergent Abilities of Large Language Models a Mirage?," 2023. arXiv:2304.15004.
+- Anthropic, "Claude Opus 4.8 System Card," 2026. https://www-cdn.anthropic.com/0b4915911bb0d19eca5b5ee635c80fef830a37ea/Claude%20Opus%204.8%20System%20Card.pdf
 
 ## References (to add before submission)
 - Agentic-security / tool-injection benchmarks (AgentDojo, InjecAgent, …).
