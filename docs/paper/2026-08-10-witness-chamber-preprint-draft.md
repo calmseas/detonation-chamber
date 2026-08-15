@@ -1,6 +1,6 @@
 # The Witness Chamber: Behavioural Evaluation of Suborned Agentic Skills, and an Honest Account of What It Cannot See
 
-*Working preprint draft — 2026-08-10. Status: methods + preliminary findings; empirical sections marked (PRELIMINARY, N=…) are pending the scale-up in §5.3.*
+*Working preprint draft — 2026-08-10, extended 2026-08-15 (Abstract, §2, §3.6, §4 H-supplychain, §5.4, §6.5, §7, §8, related work). Status: methods + preliminary findings; empirical sections marked (PRELIMINARY, N=…) are pending the scale-up in §5.3.*
 
 ---
 
@@ -15,17 +15,25 @@ driving model and (b) the framing of the user's request. We present the
 sealed cell driven by a *live* model, plants a decoy credential (a *canary*), and
 watches egress channels for the canary escaping; and a **differential** mode that
 subtracts a benign reference arm from a candidate arm under a shared task battery.
-Against an escalating ten-technique corpus we find: (1) compliance varies widely
-across frontier models and even within a single vendor's version lineage; (2) most
-models that refuse a credential-exfiltrating skill can be flipped into running it
-by an ordinary user directive that reframes the theft as a required step of a
-benign task — an instance of *sycophancy* reaching a security boundary; and (3)
-the detector itself has principled blind spots, which we enumerate rather than
-paper over: a reversible chained encoding defeats the canary matcher, a
-verdict-level view hides real exfiltration, and a shape-matched benign reference
-silences the structural axis. We argue the central contribution is methodological
-— *detonate and watch* over *review and trust* — together with a taxonomy of the
-method's own gaps, and we release the corpus and harness for reproduction.
+Against an escalating corpus — ten credential-exfiltration techniques plus a
+structurally distinct supply-chain condition — we find: (1) compliance varies
+widely across frontier models and even within a single vendor's version
+lineage; (2) most models that refuse a credential-exfiltrating skill can be
+flipped into running it by an ordinary user directive that reframes the theft
+as a required step of a benign task — an instance of *sycophancy* reaching a
+security boundary; (3) the detector itself has principled blind spots, which we
+enumerate rather than paper over: a reversible chained encoding defeats the
+canary matcher, a verdict-level view hides real exfiltration, and a
+shape-matched benign reference silences the structural axis; and (4) in the
+supply-chain condition — a package installed now, a separate decision whether
+to use it later — the most cautious model in a 405-run corpus-wide sweep never
+fires when the payload sits in the skill's own prose (0/30), but fires
+exclusively in this two-step condition, where its rare refusals arrive only
+after the harmful install has already completed. An independently-orchestrated
+75-run experiment found the same order of events. We argue the central
+contribution is methodological — *detonate and watch* over *review and trust*
+— together with a taxonomy of the method's own gaps, and we release the corpus
+and harness for reproduction.
 
 ---
 
@@ -49,10 +57,14 @@ malicious from its text. We *run* it — under adversarial-worst-case conditions
 and observe what crosses a boundary.
 
 This paper contributes: (§3) the chamber and differential method; (§4) an
-escalating red-team corpus; (§6) findings on cross-model and cross-framing
-variance, including a sycophancy-at-a-security-boundary result; and (§7) a
-taxonomy of the method's own blind spots, which we treat as a primary
-contribution rather than a limitations footnote.
+escalating red-team corpus, including a structurally distinct supply-chain
+condition; (§6) findings on cross-model and cross-framing variance, including
+a sycophancy-at-a-security-boundary result and a finding, corroborated (though
+not independently replicated — §8) across two differently-orchestrated
+harnesses, that in the supply-chain condition, refusal — when it comes at all
+— arrives after the harmful action rather than before it; and (§7) a taxonomy
+of the method's own blind spots, which we treat as a primary contribution
+rather than a limitations footnote.
 
 ## 2. Threat model
 
@@ -61,7 +73,12 @@ a token), modelled as a planted canary in an environment variable.
 
 **Adversary.** The author of an installable skill, who controls the skill's prose
 and any bundled scripts, and who may also control the framing under which the
-skill is invoked (they persuaded the user to install it).
+skill is invoked (they persuaded the user to install it). A second delivery
+mechanism we study (§3.6, §4, §6.5) separates the harmful action from its
+trigger in time rather than in prose: a fabricated malicious dependency the
+skill instructs the agent to install, where the harm occurs at install and a
+distinct, later agent decision governs whether it goes on to use what it
+installed.
 
 **Goal (this paper).** Confidentiality: the canary crossing a boundary out of the
 cell. We note but do not measure integrity (inducing wrong output) or
@@ -118,6 +135,18 @@ the request/response digests the bundle stores. The bundle omits this text by
 design (it carries the canary); the dump is an operator-gated diagnostic used in
 §6.2 to read *why* a model refused or complied.
 
+### 3.6 A supply-chain delivery mechanism
+Alongside the prose/script delivery of §3.1, a second mechanism delivers the
+canary via a fabricated package. A shimmed package manager intercepts an
+install request for a plausible-but-malicious dependency the skill names;
+installing it is the harmful action, and using the installed package (a
+separate, later agent decision) is not required for the canary to have already
+crossed. This decouples *when the harm occurs* (install) from *when the model
+might recognise it, if ever* (use) — the structural variable §6.5 measures.
+Discoverability engineering for this mechanism (removing incidental tells that
+would let a model detect the fabrication rather than reason about the payload)
+is reported alongside the finding in §6.5, not treated as a separate result.
+
 ## 4. The corpus
 
 Ten exfiltrating fixtures on an escalating ladder, plus three benign references.
@@ -137,9 +166,21 @@ All use `.example` hosts and reference the canary by variable, never by value
 | E-steg | e1-covered | token hidden inside a fetch the reference also makes |
 | E-steg | e2-custom | token XOR'd with a fixed key then base64 (apex) |
 | F-benign | f-fetch / f-inventory / f-signed | references (no exfil) |
+| H-supplychain | h-mal-silent | malicious dependency; install prints nothing |
+| H-supplychain | h-mal-warn | malicious dependency; install prints a mundane status line, not obviously malicious |
+| H-supplychain | h-mal-blatant | malicious dependency; install prints exactly what it exfiltrates |
+| H-supplychain | h-mal-fstrace | malicious dependency; exfiltrates to a local file, not the network — caught by a filesystem oracle, not the boundary watch this paper's threat model relies on |
+| H-supplychain | h-mal-usetime | malicious dependency; trigger fires at use, not install |
 
 The matcher covers raw, hex, base64, percent, and label-join encodings; it does
 **not** invert a keyed transform, which is why `e2-custom` is the declared apex.
+
+The H-supplychain class is structurally distinct from A–E: the canary crosses
+(if it crosses at all) at package install, a single `run_command` turn, while a
+second, independent agent decision — whether to actually invoke the installed
+package — happens later and does not itself move the canary. This separates
+*the harmful action* from *any point at which the model might recognise it*,
+which A–E's single-turn framings do not (§6.5).
 
 ## 5. Experimental design
 
@@ -167,6 +208,37 @@ corpus currently has 1–3); the full model set on the full bank (not only the G
 family); Wilson confidence intervals on every rate; and per-model version
 lineages (§6.3). All runs are single-arm `detonate-live` for rates and
 differential for witness/shape claims.
+
+### 5.4 The supply-chain sweep and ladder (two additional, differently-orchestrated runs)
+Two further experiments target the H-supplychain class specifically, run and
+scored independently of each other and of §5.1–5.3:
+
+- **A corpus-wide sweep** — the full current corpus (27 fixtures) × 5 models ×
+  3 repeats = 405 runs, a partial realisation of the §5.3 scale-up (N=3, not
+  yet the N≥30 called for there). Every run is a real, sealed, single-arm
+  container run; the corpus-wide aggregate is asserted, not merely printed,
+  against a declared coverage record (fixture × driver × n), so a missing
+  cell is a visible incompleteness flag, not a silently smaller denominator.
+  The 27 fixtures span more ground than this paper's confidentiality-only
+  threat model (§2): **13 are catchable-exfil** — 9 of the 10 A–E fixtures
+  (excluding the blind `e2-custom`) plus 4 of the 5 H-supplychain rungs
+  (every rung but `h-mal-fstrace`, whose exfiltration is local-file-only and
+  not credited to the network-boundary oracle this paper's canary watch
+  relies on); **1 is `e2-custom`** itself (blind-exfil, tracked separately
+  since the matcher cannot invert its encoding); the remaining **13** —
+  including `h-mal-fstrace` and destructive/dependency-hallucination
+  fixtures from other axes of the broader corpus — are true negatives from
+  this paper's confidentiality-only lens and are not analysed further here.
+- **A reticence ladder** — five H-supplychain rungs, N=15 each (75 sealed
+  runs), orchestrated by a separate harness that additionally records, per
+  run, whether the agent *installed* the package, whether the canary
+  *detonated*, and whether the agent went on to *use* the installed package —
+  a three-point temporal breakdown the sweep's binary fire/no-fire measure
+  does not itself carry.
+
+Both draw on the same underlying detonation substrate and the same
+H-supplychain fixtures; they are independently orchestrated and independently
+scored, but they are not independent samples in the statistical sense — see §8.
 
 ## 6. Findings (PRELIMINARY — N as stated; scale-up pending §5.3)
 
@@ -247,6 +319,37 @@ verdict read `no_divergence`, because their crossing subtracted against an
 identical benign reference crossing and the matcher was blind to the encoding).
 The behavioural trace, not the verdict, is the ground truth. §7 catalogues why.
 
+### 6.5 Acting before recognising: a two-step supply-chain condition
+Across the corpus-wide sweep (§5.4), the model with the lowest overall fire
+rate (Claude Opus 4.8, 3/39 on the catchable-exfiltration fixtures) fires
+**0/30** across every A–E fixture, catchable or blind, where the payload sits
+in the skill's own prose or script — it reads the script first almost every
+time there. Its only three fires anywhere in the 405-run sweep are in the
+H-supplychain class (`h-mal-blatant`, `h-mal-silent`, `h-mal-warn`), and every
+one of them installs the malicious dependency (the harmful action, already
+irreversible) before any refusal. The reticence ladder (§5.4) found the same
+order of events independently, at finer temporal resolution and across its
+full five-model panel — a model-pooled figure, not Opus-specific, that
+corroborates the same qualitative pattern rather than repeating it in the
+same model: on the `h-mal-blatant` rung (install prints exactly what it
+exfiltrates), 14 of 15 runs installed and detonated; of those, only 8 went on
+to actually use the installed package — 6 runs installed the
+credential-stealing dependency and then, having already leaked the canary,
+declined to use it. Read together: when caution appears in the supply-chain
+condition, across this model panel, it is behavioural, not verbal, and it
+arrives after the exfiltration, not before it. An agent evaluated only on its
+*use* decision would score these runs as appropriately cautious; they were
+already compromised.
+
+This reads next to its limits, not instead of them (§8): the sweep's N=3 per
+cell is thin, and the two experiments' underlying substrate is shared, not
+independent (§8); a measured confound — the harness's own TLS trust anchor,
+flagged as suspicious in 19% of this model's runs and cited directly in two of
+its three firing transcripts — means some of the apparent recognition may be
+the model noticing an artefact of the harness rather than reasoning about the
+payload; and the blind audit this finding should survive before it is relied
+on has not yet been run.
+
 ## 7. Gap taxonomy (a primary contribution)
 
 We enumerate the method's blind spots. Some are shipped-and-declared; some are
@@ -270,6 +373,16 @@ newly proposed from this work.
   bidirectional channel; a stdio transport crosses no network boundary.
 - **integrity-oracle (proposed)** — no notion of output correctness exists; only
   a canary-crosses-boundary verdict, so integrity/availability harm reads clean.
+- **post-hoc-recognition (proposed)** — a model's own caution signal, where
+  present, can arrive strictly after an already-irreversible harmful action; a
+  verdict keyed only on whether anything crossed, without a temporal breakdown
+  of when it crossed relative to any refusal, cannot see this. *Demonstrated
+  §6.5.*
+- **harness-artifact-confound (proposed)** — the driving model can flag an
+  artefact of the harness itself (in our case, its own TLS trust anchor) as
+  suspicious, which is not evidence the model reasoned about the actual
+  payload and complicates any claim about *why* it declined to act.
+  *Demonstrated §6.5.*
 - Plus declared residuals: dormant-payload, filesystem-channel, ledger-integrity,
   no-baseline-arm, sandbox-aware, scripted-turns, supervisor-death, udp-quic,
   kernel-boundary.
@@ -279,8 +392,9 @@ finding" is never rendered as "safe."
 
 ## 8. Limitations and threats to validity
 
-- **Sample size.** Current findings are N=1 (bank) and N=10 (apex/ladder); the
-  scale-up (§5.3) is required before the named comparative rates carry weight.
+- **Sample size.** Current findings are N=1 (bank), N=10 (apex/ladder), and N=3
+  (the §5.4 corpus-wide sweep); the scale-up (§5.3) is required before any of
+  the named comparative rates carry weight.
 - **Single harness, single canary channel.** Confidentiality only; integrity and
   availability are unmeasured (§7).
 - **Named comparisons are version- and date-specific.** A model that folded here
@@ -290,6 +404,18 @@ finding" is never rendered as "safe."
   literature.
 - **Driver is deliberately credulous**, so results upper-bound the *skill's*
   suasive power, not a hardened deployment's resistance.
+- **§6.5's two experiments share substrate, not independence.** The
+  corpus-wide sweep and the reticence ladder both detonate the same
+  H-supplychain fixtures through the same underlying mechanism; only
+  orchestration and scoring differ. Treat the agreement between them as
+  corroboration of one underlying phenomenon measured two ways, not as two
+  independent replications.
+- **A harness artifact is a live confound in §6.5's own evidence**, not merely
+  a hypothetical one: it is named directly in two of the three transcripts the
+  finding rests on (§6.5).
+- **§6.5's finding has not been blind-audited.** Behavioural scoring
+  (installed / detonated / used) has not yet been independently checked
+  against raw transcripts by an auditor blind to the hypothesis.
 
 ## 9. Related work
 
@@ -298,6 +424,32 @@ finding" is never rendered as "safe."
   document a real-world GPT-4o rollback; Denison et al. (2024) place sycophancy on
   a continuum with reward-tampering. Our contribution is to move the phenomenon
   from opinions/facts to a tool-use safety decision.
+- **Refusal timing.** DTap (Chen et al., 2026) documents an "execute-then-refuse"
+  failure mode in two specific harnesses (OpenAI's Agents SDK and Google's
+  ADK, attributed to batch tool invocation hampering per-tool consequence
+  reasoning); a narrower, legal-domain finding in the same paper states the
+  general principle we take as this section's motivation, not a claim
+  original to this paper: "refusal timing rather than refusal rate alone is
+  the relevant safety metric." AgentAbstain (Liu et al., 2026) names the
+  closest general failure mode — *post-hoc abstention*: the agent acts and
+  only afterward claims or behaves as though it had refused, observed in
+  2.6% of abstain runs. "Setup Complete, Now You Are Compromised" (Bagmar and
+  Saraf, 2026) is the closest same-domain result — package installs on
+  coding-agent harnesses — and reports a near-identical shape in their
+  known-vulnerable-dependency scenario: of their whole model/harness set,
+  only the most cautious model ever flags the dependency, and only post-hoc
+  (the install has already run by the time the flag prints), at a rate that
+  itself depends on the harness. Our contribution against this backdrop is
+  the (preliminary; §8) isolation of single-step-vs-two-step task structure
+  as a candidate variable explaining *where* the rare failures concentrate,
+  corroborated — not yet independently replicated, since both draw on shared
+  substrate (§8) — across two differently-orchestrated harnesses; neither
+  prior work runs this ablation. REDAgentBench (Chen et al., 2026) reports
+  close to the mirror-image case in one of their evaluated models
+  (Qwen-plus): the agent recognises a violation *before* executing it and
+  proceeds anyway in 17.92% of that model's confirmed harmful executions —
+  worth citing precisely because it shows recognition-execution ordering can
+  run in either direction, not only the one this paper documents.
 - **Agentic-security / tool-injection benchmarks.** *[TODO: position against
   AgentDojo, InjecAgent, and prompt-injection evaluation work.]*
 - **Prompt-artefact scanning and its bypass.** *[TODO: cite the scanner-bypass
@@ -308,7 +460,9 @@ finding" is never rendered as "safe."
 We release the corpus (skills + declared ground-truth manifests), the harness
 (sealed-cell runner, differential, verifier), and the analysis scripts. Every
 result is re-derivable from the sealed bundles; the turn dump is verifiable
-against a bundle by re-hashing.
+against a bundle by re-hashing. The corpus-wide sweep and the reticence-ladder
+evidence trees (§5.4) are released alongside the original ten-technique
+corpus; both are re-derivable from their sealed bundles the same way.
 
 ## 11. Conclusion
 
@@ -316,10 +470,15 @@ Reviewing what a skill says does not tell you what it does; running it does — 
 what it does depends on the model driving it and the phrasing that invokes it.
 The most robust model we tested refused a credential-stealing skill even when the
 user asked for it and the skill insisted it was safe, and named the manipulation;
-most others could be talked into it. And a security tool's "no finding" is a
-statement about what was watched, not a certificate of safety. We offer the
-method, the corpus, and — as a first-class deliverable — an honest map of what
-the method still cannot see.
+most others could be talked into it. The same model is not uniformly robust:
+in a structurally different condition — a package installed now, used or not
+later — its rare failures show it can still be compromised, and its caution,
+when it appears at all, arrives after the harm rather than before it. A
+verdict that only asks whether anything crossed, without asking when relative
+to any refusal, would call these runs safe. And a security tool's "no finding"
+is a statement about what was watched, not a certificate of safety. We offer
+the method, the corpus, and — as a first-class deliverable — an honest map of
+what the method still cannot see.
 
 ---
 
@@ -329,6 +488,10 @@ the method still cannot see.
 - E. Perez et al., "Discovering Language Model Behaviors with Model-Written Evaluations," 2022. arXiv:2212.09251.
 - OpenAI, "Sycophancy in GPT-4o: what happened and what we're doing about it," 2025. https://openai.com/index/sycophancy-in-gpt-4o/
 - C. Denison et al., "Sycophancy to Subterfuge: Investigating Reward-Tampering in Large Language Models," 2024. arXiv:2406.10162.
+- A. Bagmar and P. Saraf, "Setup Complete, Now You Are Compromised: Weaponizing Setup Instructions Against AI Coding Agents," 2026. arXiv:2607.15143.
+- X. Liu, Y. E. Zhang, V. Kasprova, P. Rabbani, P. S. Zahraei, T. Zhang, A. Ebrahimpour-Boroojeny, and V. Chandrasekaran, "AgentAbstain: Do LLM Agents Know When Not to Act?," 2026. arXiv:2607.10059.
+- Z. Chen, X. Liu, H. Tong, C. Guo, Y. Nie, J. Zhang, M. Kang, C. Xu, Q. Liu, X. Liu, T. Shi, C. Xiao, S. Koyejo, P. Liang, W. Guo, D. Song, and B. Li, "DecodingTrust-Agent Platform (DTap): A Controllable and Interactive Red-Teaming Platform for AI Agents," 2026. arXiv:2605.04808.
+- Z. Chen, X. Liu, J. Zhu, H. Dou, S. Jiang, J. Li, L. Guo, F. Chen, and C. Zhang, "REDAgentBench: Executable Red Teaming and Faithful Measurement of LLM Agent Systems," 2026. arXiv:2608.10669.
 
 ## References (to add before submission)
 - Agentic-security / tool-injection benchmarks (AgentDojo, InjecAgent, …).
