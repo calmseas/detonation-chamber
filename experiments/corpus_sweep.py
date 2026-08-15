@@ -33,6 +33,13 @@ Three things this loop owns that a bare `elicit.py` invocation cannot:
    install dies at command-not-found and the rung measures nothing. Selected by
    `CHAMBER_IMAGE_GUEST` when `chamber-guest-supply-<fixture>:test` exists.
 
+4. **A record of what the tree is supposed to contain.** `sweep.json` in the
+   out-root declares the fixtures, drivers, arms and N, plus the task, canary and
+   guest image each fixture was run with. It ACCUMULATES across invocations — a
+   later, narrower pass never shrinks it (`merge_record`) — and `report` checks
+   the tree against it (`coverage`), so a cell that is missing reads as a hole
+   instead of quietly shrinking a denominator into a clean-looking rate.
+
 **What this sweep measures, and what it does not.** The canonical scorer's axis
 is the network/DNS boundary: FIRE is a planted canary crossing it. That is the
 whole of the A/B/C/D/E/F axis and of the h-mal-* rungs' payloads. It is NOT the
@@ -53,6 +60,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from collections import OrderedDict
 
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
@@ -172,8 +180,51 @@ def stage(fixture: pathlib.Path, dest: pathlib.Path) -> pathlib.Path:
 # ---------------------------------------------------------------- run
 
 
-def _reap_incomplete(root: pathlib.Path) -> int:
-    """Remove run dirs that are not a result, so they are retried not skipped.
+#: The out-root's provenance record: what this tree is DECLARED to contain, and
+#: the denominator `report` checks the tree against. Accumulated across every
+#: `run` invocation into the same out-root — see `merge_record`.
+RECORD = "sweep.json"
+
+#: Where a reaped run's carcass is kept, under its own `<driver>/<arm>/`. Named
+#: so nothing that walks the tree can mistake it for a result: `_cells`,
+#: `elicit._runs` and `_reap_incomplete` itself all match `run-*` at the arm
+#: level, and this is a `.`-prefixed directory one level below that.
+REAPED = ".reaped"
+
+
+def _run_index(d: pathlib.Path) -> int | None:
+    """The repeat number of a `run-<k>` directory, or ``None`` if it is not one."""
+    m = re.fullmatch(r"run-(\d+)", d.name)
+    return int(m.group(1)) if m else None
+
+
+def _quarantine(d: pathlib.Path, reason: str) -> pathlib.Path:
+    """Move a dead run out of the matrix, keeping it as evidence that it was tried.
+
+    A bare `rm -rf` here was destroying the only record that a cell was ever
+    attempted — the log with the exit code and the runner's own account went with
+    it. A cell that fails every attempt then looks exactly like a cell nobody ran,
+    which is the one distinction an evidence tree must not lose. The carcass is
+    moved, not deleted, so `elicit.run` still re-creates `run-<k>` (it skips on
+    directory existence) while "we tried and it never sealed" stays on disk.
+    """
+    dest_root = d.parent / REAPED
+    dest_root.mkdir(exist_ok=True)
+    attempt = 1
+    while (dest_root / f"{d.name}-attempt{attempt}").exists():
+        attempt += 1
+    dest = dest_root / f"{d.name}-attempt{attempt}"
+    shutil.move(str(d), str(dest))
+    # A sibling note, never a rewrite: `bundle.json`/`bundle.sig` are sealed and
+    # are moved byte-for-byte, so a quarantined bundle still verifies.
+    (dest / "reaped.json").write_text(
+        json.dumps({"reason": reason, "reaped_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "was": d.name}, indent=2)
+    )
+    return dest
+
+
+def _reap_incomplete(root: pathlib.Path, n: int | None = None) -> int:
+    """Retire run dirs that are not a result, so they are retried not skipped.
 
     Two kinds, and neither is a zero — both are holes:
 
@@ -190,20 +241,32 @@ def _reap_incomplete(root: pathlib.Path) -> int:
       is not evidence about the fixture.
 
     Done here rather than in the runner, which is deliberately left as-is.
+
+    ``n`` bounds it to the repeats this invocation is actually trying to
+    (re)produce. Without that bound a `--n 1` pass against an out-root an earlier
+    `--n 3` pass had filled would reap a truncated `run-3` it has no intention of
+    re-running, deleting a repeat outright rather than retrying it. Runs outside
+    the range belong to a differently-configured invocation and are left alone;
+    so is any directory whose name is not `run-<k>`, which this does not own.
+
+    Nothing is deleted: see `_quarantine`.
     """
-    n = 0
+    reaped = 0
     for d in sorted(root.glob("*/*/run-*")):
         if not d.is_dir():
             continue
+        idx = _run_index(d)
+        if idx is None or (n is not None and idx > n):
+            continue
         if not (d / "bundle.json").exists():
-            shutil.rmtree(d)
-            n += 1
+            _quarantine(d, "no sealed bundle — the detonation did not complete")
+            reaped += 1
             continue
         score = scoring.score_run(d)
         if score is not None and score.truncated:
-            shutil.rmtree(d)
-            n += 1
-    return n
+            _quarantine(d, "sealed but truncated — no boundary crossings and an empty turn dump")
+            reaped += 1
+    return reaped
 
 
 def preflight(fx: list[pathlib.Path]) -> None:
@@ -228,24 +291,85 @@ def preflight(fx: list[pathlib.Path]) -> None:
             )
 
 
+def read_record(out_root: pathlib.Path, *, set_aside: bool = False) -> dict:
+    """The out-root's provenance record, or ``{}`` if it has none.
+
+    ``set_aside`` moves an unreadable record out of the way instead of letting
+    the next write clobber it — it is the tree's own account of itself, and
+    losing it quietly is the failure this whole path exists to prevent. Only
+    `run` passes it: `report` re-scores an existing tree and must not mutate it.
+    """
+    p = out_root / RECORD
+    if not p.exists():
+        return {}
+    try:
+        rec = json.loads(p.read_text())
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        if not set_aside:
+            print(f"!! {RECORD} is unreadable — nothing to check this tree's coverage against")
+            return {}
+        aside = p.with_suffix(f".json.unreadable-{int(time.time())}")
+        p.rename(aside)
+        print(f"!! {RECORD} was unreadable; kept it as {aside.name} and starting a fresh record")
+        return {}
+    return rec if isinstance(rec, dict) else {}
+
+
+def merge_record(prev: dict, drivers: dict, n: int, fx: list[pathlib.Path]) -> dict:
+    """This out-root's record AFTER this invocation: a union, never a shrink.
+
+    `run` used to write the CURRENT invocation's parameters straight over
+    whatever was already there. A later, narrower pass — healing one fixture,
+    say — then rewrote a 27-fixture record as a one-fixture one, and the tree's
+    own account of what it holds no longer matched the tree. That is exactly the
+    kind of mismatch a provenance file exists to make impossible, and it takes
+    the per-fixture task/canary/guest-image mapping of every fixture the pass did
+    not touch with it. (It happened: `~/chamber-ev/corpus-sweep/sweep.json` read
+    `fixtures: ["a-blatant"]` over 405 real runs across all 27.)
+
+    So the record accumulates. Every fixture ever declared against this out-root
+    stays declared, `n` is the deepest ever asked for, and a fixture's recorded
+    task/canary/guest image survives a pass that did not cover it. `report` reads
+    this back as the denominator it checks the tree against, so a fixture that
+    drops out of a later pass reads as a HOLE rather than quietly ceasing to be
+    expected. To start a genuinely new record, use a new out-root (or delete the
+    file deliberately) — nothing shrinks it by accident.
+    """
+    order = {f.name: i for i, f in enumerate(fixtures())}
+    names = list(prev.get("fixtures") or [])
+    names += [f.name for f in fx if f.name not in names]
+    names.sort(key=lambda x: (order.get(x, len(order)), x))
+
+    guests = dict(prev.get("guest_images") or {})
+    for f in fx:
+        img = guest_image(f)
+        if img:
+            guests[f.name] = img
+
+    return {
+        "drivers": {**(prev.get("drivers") or {}), **dict(drivers)},
+        "arms": {**(prev.get("arms") or {}), **ARMS},
+        "n": max(int(prev.get("n") or 0), n),
+        "fixtures": names,
+        "tasks": {**(prev.get("tasks") or {}), **{f.name: task_for(f) for f in fx}},
+        "canaries": {**(prev.get("canaries") or {}), **{f.name: canary_for(f) for f in fx}},
+        "guest_images": guests,
+    }
+
+
 def run(out_root: pathlib.Path, drivers: OrderedDict, n: int, only: list[str] | None) -> None:
     fx = fixtures(only)
     preflight(fx)
     out_root.mkdir(parents=True, exist_ok=True)
-    (out_root / "sweep.json").write_text(
-        json.dumps(
-            {
-                "drivers": dict(drivers),
-                "arms": {k: v for k, v in ARMS.items()},
-                "n": n,
-                "fixtures": [f.name for f in fx],
-                "tasks": {f.name: task_for(f) for f in fx},
-                "canaries": {f.name: canary_for(f) for f in fx},
-                "guest_images": {f.name: guest_image(f) for f in fx if guest_image(f)},
-            },
-            indent=2,
+    record = merge_record(read_record(out_root, set_aside=True), drivers, n, fx)
+    (out_root / RECORD).write_text(json.dumps(record, indent=2) + "\n")
+    carried = [name for name in record["fixtures"] if name not in {f.name for f in fx}]
+    if carried:
+        print(
+            f"{RECORD}: this pass covers {len(fx)} fixture(s); the record keeps all "
+            f"{len(record['fixtures'])} ever run here (n={record['n']}), so the "
+            f"{len(carried)} it does not touch stay declared and are reported as holes if absent"
         )
-    )
     total = len(fx) * len(drivers) * len(ARMS) * n
     print(f"corpus sweep: {len(fx)} fixtures x {len(drivers)} drivers x {len(ARMS)} arm(s) x n={n} = {total} cells")
 
@@ -254,9 +378,12 @@ def run(out_root: pathlib.Path, drivers: OrderedDict, n: int, only: list[str] | 
         print(f"\n===== PASS {rep}/{n} =====", flush=True)
         for f in fx:
             fixture_out = out_root / f.name
-            reaped = _reap_incomplete(fixture_out) if fixture_out.exists() else 0
+            # Bounded by this invocation's `n`, not by `rep`: run-3 is legitimately
+            # produced by a later pass of this same invocation, but a `--n 1`
+            # invocation is not going to re-run it and so must not retire it.
+            reaped = _reap_incomplete(fixture_out, n) if fixture_out.exists() else 0
             if reaped:
-                print(f"  {f.name}: retrying {reaped} incomplete cell(s)")
+                print(f"  {f.name}: retrying {reaped} incomplete cell(s) (carcasses under {REAPED}/)")
             skill_md = stage(f, out_root / "_staged" / f.name)
             img = guest_image(f)
             if img:
@@ -326,8 +453,89 @@ def _agg(rows: list[scoring.RunScore]) -> dict:
     }
 
 
+def coverage(record: dict, data: dict[str, dict]) -> dict:
+    """What `sweep.json` DECLARES this tree should hold, against what is in it.
+
+    Without this a hole is silently absorbed into the denominator: a fixture with
+    2 of its 3 runs present prints `2/2`, a clean-looking rate over a sample that
+    is quietly one third smaller than the one the sweep claims to have taken. The
+    aggregation is honest about what it found; it just had nothing to compare it
+    against. The record is that comparison, so a missing cell reads as a hole.
+
+    Every field is a shortfall against the declaration, plus `undeclared` for the
+    other direction — runs on disk the record does not account for, which is a
+    provenance problem of its own (an out-root written by two different configs).
+    """
+    declared_fx = list(record.get("fixtures") or [])
+    arms = record.get("arms") or ARMS
+    declared_cells = [f"{d}/{a}" for d in (record.get("drivers") or {}) for a in arms]
+    want_n = int(record.get("n") or 0)
+
+    missing_fixtures: list[str] = []
+    missing_cells: list[tuple[str, str]] = []
+    short_cells: list[tuple[str, str, int, int]] = []
+    for name in declared_fx:
+        found = (data.get(name) or {}).get("cells") or {}
+        if not found:
+            missing_fixtures.append(name)
+            continue
+        for cell in declared_cells:
+            got = found.get(cell)
+            if got is None:
+                missing_cells.append((name, cell))
+            elif want_n and got["n"] < want_n:
+                short_cells.append((name, cell, got["n"], want_n))
+
+    undeclared = [
+        (name, cell)
+        for name, v in data.items()
+        for cell in v["cells"]
+        if name not in declared_fx or cell not in declared_cells
+    ]
+    return {
+        "declared": {"fixtures": len(declared_fx), "cells_per_fixture": len(declared_cells), "n": want_n},
+        "expected_runs": len(declared_fx) * len(declared_cells) * want_n,
+        "found_runs": sum(c["n"] for v in data.values() for c in v["cells"].values()),
+        "missing_fixtures": missing_fixtures,
+        "missing_cells": [list(c) for c in missing_cells],
+        "short_cells": [list(c) for c in short_cells],
+        "undeclared": [list(c) for c in undeclared],
+        "complete": not (missing_fixtures or missing_cells or short_cells),
+    }
+
+
+def _print_coverage(cov: dict | None) -> None:
+    print("\n\nCoverage against sweep.json (what this out-root declares it holds)")
+    if cov is None:
+        print("  !! NO sweep.json HERE — every rate above is over whatever happened to be")
+        print("     on disk, with nothing to check it against. A cell missing two of its")
+        print("     three runs prints as a clean 2/2. Treat these numbers as unaudited.")
+        return
+    d = cov["declared"]
+    shape = f"{d['fixtures']} fixtures x {d['cells_per_fixture']} cell(s) x n={d['n']}"
+    if cov["complete"]:
+        print(f"  complete: {cov['found_runs']}/{cov['expected_runs']} runs, {shape}")
+    else:
+        print(f"  !! INCOMPLETE: {cov['found_runs']} of {cov['expected_runs']} declared runs present ({shape})")
+        for name in cov["missing_fixtures"]:
+            print(f"     MISSING fixture   {name}: declared, but no scored run at all")
+        for name, cell in cov["missing_cells"]:
+            print(f"     MISSING cell      {name} {cell}: declared, but no scored run")
+        for name, cell, got, want in cov["short_cells"]:
+            print(f"     SHORT      {got}/{want}  {name} {cell}: the printed rate is over {got}, not {want}")
+        print("     A `!` in the tables above marks a cell whose denominator is short.")
+    # Not a shortfall but still a provenance gap: numbers nothing declared.
+    for name, cell in cov["undeclared"]:
+        print(f"  !! UNDECLARED        {name} {cell}: on disk but not in sweep.json")
+
+
 def report(out_root: pathlib.Path, per_fixture: bool = False, json_out: str | None = None) -> dict:
-    fx = [f for f in fixtures() if (out_root / f.name).is_dir()]
+    record = read_record(out_root)
+    declared_fx = set(record.get("fixtures") or [])
+    # Declared-but-absent fixtures are carried into the report so they show as
+    # holes. Dropping them (the tree is the only input) is how a fixture that
+    # never ran becomes indistinguishable from one that was never asked for.
+    fx = [f for f in fixtures() if (out_root / f.name).is_dir() or f.name in declared_fx]
     data: dict[str, dict] = {}
     for f in fx:
         cells = _cells(out_root / f.name)
@@ -340,11 +548,23 @@ def report(out_root: pathlib.Path, per_fixture: bool = False, json_out: str | No
             "cells": {f"{d}/{a}": _agg(rows) for (d, a), rows in cells.items()},
         }
 
-    drivers = [d for d in DRIVERS if any(f"{d}/default" in v["cells"] for v in data.values())]
+    cov = coverage(record, data) if record else None
+    # The tables flag the very numbers that are affected, not only a footer: a
+    # reader who quotes one rate out of the table must see the hole in it.
+    short = {(name, cell) for name, cell, _got, _want in (cov["short_cells"] if cov else [])}
+    absent = {(name, cell) for name, cell in (cov["missing_cells"] if cov else [])}
+    absent |= {(name, f"{d}/default") for name in (cov["missing_fixtures"] if cov else []) for d in DRIVERS}
+
+    # Declared drivers keep their column even with nothing in it — a driver that
+    # produced no run at all is the largest hole there is and must not vanish.
+    seen = [d for d in DRIVERS if any(f"{d}/default" in v["cells"] for v in data.values())]
+    from_record = [d for d in (record.get("drivers") or {}) if d not in seen]
+    drivers = seen + from_record
 
     # ---- headline: FIRE per fixture x driver, against declared ground truth
     print("FIRE = a planted canary crossed the network/DNS boundary (scoring.fire).")
-    print("Cell is fires/n for the `default` (refusing-boundary) arm.\n")
+    print("Cell is fires/n for the `default` (refusing-boundary) arm.")
+    print("`!` = fewer runs on disk than sweep.json declares; `MISSING` = declared, none found.\n")
     w = max((len(k) for k in data), default=8) + 1
     hdr = f"{'fixture':<{w}}{'class':<14}{'expect':<8}" + "".join(f"{d:>10}" for d in drivers)
     print(hdr)
@@ -353,14 +573,18 @@ def report(out_root: pathlib.Path, per_fixture: bool = False, json_out: str | No
         expect = "FIRE" if (v["exfils"] and v["expect_boundary_catch"]) else "-"
         cells = []
         for d in drivers:
-            c = v["cells"].get(f"{d}/default")
-            cells.append(f"{c['fire']}/{c['n']}" if c else "-")
+            cell = f"{d}/default"
+            c = v["cells"].get(cell)
+            if c:
+                cells.append(f"{c['fire']}/{c['n']}" + ("!" if (name, cell) in short else ""))
+            else:
+                cells.append("MISSING" if (name, cell) in absent else "-")
         print(f"{name:<{w}}{v['class']:<14}{expect:<8}" + "".join(f"{c:>10}" for c in cells))
 
     # ---- the full read, one row per fixture x driver
     print("\n\nPer-cell detail (default arm)")
     hdr2 = (
-        f"{'fixture':<{w}}{'driver':<10}{'n':>3}{'fire':>6}{'deton':>7}{'cross':>7}"
+        f"{'fixture':<{w}}{'driver':<10}{'n':>3} {'fire':>6}{'deton':>7}{'cross':>7}"
         f"{'cmds':>6}{'noop':>6}{'insp':>6}{'infs':>6}{'susp':>6}"
     )
     print(hdr2)
@@ -370,8 +594,9 @@ def report(out_root: pathlib.Path, per_fixture: bool = False, json_out: str | No
             c = v["cells"].get(f"{d}/default")
             if not c:
                 continue
+            flag = "!" if (name, f"{d}/default") in short else " "
             print(
-                f"{name:<{w}}{d:<10}{c['n']:>3}{c['fire']:>6}{c['detonated']:>7}{c['crossed']:>7}"
+                f"{name:<{w}}{d:<10}{c['n']:>3}{flag}{c['fire']:>6}{c['detonated']:>7}{c['crossed']:>7}"
                 f"{c['commands']:>6}{c['noop']:>6}{c['inspected']:>6}{c['infsight']:>6}{c['suspect']:>6}"
             )
 
@@ -426,13 +651,19 @@ def report(out_root: pathlib.Path, per_fixture: bool = False, json_out: str | No
     if suspect:
         print(f"\n!! {suspect} run(s) SUSPECT (truncated: no crossings AND an empty turn dump). Re-run those cells.")
 
+    _print_coverage(cov)
+
     if per_fixture:
         for name in data:
+            if not (out_root / name).is_dir():
+                continue
             print(f"\n\n===== {name} (elicit.report) =====")
             elicit.report(str(out_root / name))
 
     if json_out:
-        pathlib.Path(json_out).write_text(json.dumps({"fixtures": data, "rollup": rollup}, indent=2))
+        pathlib.Path(json_out).write_text(
+            json.dumps({"fixtures": data, "rollup": rollup, "coverage": cov}, indent=2)
+        )
         print(f"\nwrote {json_out}")
     return data
 
