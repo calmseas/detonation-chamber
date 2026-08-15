@@ -163,7 +163,7 @@ impl AgentCell {
     ///   [`AgentCell::halt`]; captured logs survive until the container is
     ///   REMOVED, so that ordering constraint is gone.
     ///
-    /// Decoded with [`String::from_utf8_lossy`], deliberately: a disclosure
+    /// Decoded by [`decode_capture`], deliberately lossily: a disclosure
     /// record's `requested_argv0` is a path read raw out of tracee memory and
     /// carries no encoding guarantee, so an invalid byte must cost its own
     /// line's readability and nothing more. A strict decode that fell back to
@@ -178,7 +178,7 @@ impl AgentCell {
     /// [`CellError`] if the engine refuses.
     pub fn captured_stdout(&self) -> Result<String, CellError> {
         let raw = self.container.logs_bytes()?;
-        Ok(String::from_utf8_lossy(&raw.stdout).into_owned())
+        Ok(decode_capture(&raw.stdout))
     }
 
     /// [`AgentCell::captured_stdout`], required to actually BE a disclosure
@@ -279,6 +279,37 @@ pub const EMPTY_BOUNDING_SET: &str = "0000000000000000";
 /// stay decoupled from whatever tells that header currently lists.
 pub const DISCLOSURE_HEADER_KEY: &str = "known_residual_tells";
 
+/// The captured stream's bytes as text, keeping everything that was not
+/// invalid.
+///
+/// An invalid sequence becomes U+FFFD and costs its own line's readability;
+/// every other byte arrives. The alternative — a strict decode whose failure
+/// collapses to an empty string — erased a whole run's exec-consequence
+/// evidence over one byte, which is the Critical this fallback exists to close.
+///
+/// **This is not reachable from the end-to-end tests, and that is why it is a
+/// function.** The suite's two invalid-UTF-8 tests
+/// (`one_invalid_utf8_byte_does_not_erase_the_rest_of_the_disclosure_log` and
+/// `a_composed_detonation_seals_a_record_whose_argv0_is_not_valid_utf8` in
+/// `chamber-e2e/tests/exec_consequence.rs`) do write a raw `0xFF` into a
+/// disclosure record and do watch it survive to the sealed bundle — but Docker's
+/// `json-file` log driver, this project's default, stores captured output as
+/// JSON strings and REPAIRS invalid UTF-8 to U+FFFD on the way in. By the time
+/// `docker logs` hands the bytes back to this process they are already valid
+/// UTF-8. Those tests therefore exercise the sealing pipeline end to end, which
+/// is worth having, but they would stay green against a strict decode: the byte
+/// this fallback exists for never reaches it through that driver. Only the unit
+/// tests below reach it — they hand it the bytes directly, so nothing upstream
+/// gets to launder them first.
+///
+/// The fallback stays regardless. It is what a different log driver, a raw
+/// Engine API read, or any capture path that does not pre-sanitise would meet,
+/// and being unreachable through one particular driver is not the same as being
+/// unnecessary.
+fn decode_capture(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
 /// Accepts `text` as a disclosure stream only if it opens with the header.
 ///
 /// Split out of [`AgentCell::captured_disclosure_log`] so the decision is
@@ -376,6 +407,88 @@ mod tests {
             require_disclosure_header(with_records.clone()).expect("a real stream"),
             with_records
         );
+    }
+
+    /// The sealing read's lossy decode, driven directly.
+    ///
+    /// This is the test that actually pins the fallback. The end-to-end pair in
+    /// `chamber-e2e` cannot: Docker's `json-file` driver repairs invalid UTF-8
+    /// before `docker logs` returns it, so the bytes those tests plant never
+    /// arrive here as invalid — see [`decode_capture`]'s note. Handed the
+    /// bytes directly, there is nothing upstream to launder them.
+    ///
+    /// The three properties, all of which a strict decode fails: the surrounding
+    /// content survives, the invalid byte is REPRESENTED rather than dropped,
+    /// and the whole thing does not collapse to an error, a panic, or an empty
+    /// string — the last being the exact shape of the Critical, since an empty
+    /// capture seals as a run with zero exec-consequence observations.
+    #[test]
+    fn an_invalid_byte_in_the_capture_costs_its_own_character_and_nothing_else() {
+        // A realistic disclosure stream: the header, a record whose
+        // `requested_argv0` carries a raw 0xFF the way a path read out of
+        // tracee memory can, and a record after it.
+        let mut captured = Vec::new();
+        captured.extend_from_slice(b"{\"known_residual_tells\":[\"TracerPid nonzero\"]}\n");
+        captured.extend_from_slice(b"{\"turn_id\":\"turn-0\",\"requested_argv0\":\"/bin/no");
+        captured.push(0xff);
+        captured.extend_from_slice(b"such\"}\n");
+        captured.extend_from_slice(b"{\"turn_id\":\"turn-1\",\"requested_argv0\":\"/bin/echo\"}\n");
+        assert!(
+            String::from_utf8(captured.clone()).is_err(),
+            "this fixture is supposed to be invalid UTF-8; without that the test \
+             proves nothing"
+        );
+
+        let decoded = decode_capture(&captured);
+
+        assert!(
+            !decoded.is_empty(),
+            "the whole capture collapsed to nothing — the erasure this fallback exists for"
+        );
+        assert_eq!(
+            decoded.lines().count(),
+            3,
+            "every line must survive, not just the clean ones: {decoded:?}"
+        );
+        assert!(decoded.contains("known_residual_tells"));
+        assert!(decoded.contains("turn-1"));
+
+        let bad = decoded.lines().nth(1).expect("the middle line");
+        assert!(
+            bad.contains('\u{FFFD}'),
+            "the invalid byte was dropped rather than represented: {bad:?}"
+        );
+        assert!(bad.starts_with("{\"turn_id\":\"turn-0\""), "{bad:?}");
+        assert!(bad.ends_with("such\"}"), "{bad:?}");
+    }
+
+    /// And the decode composes with the header guard: a stream whose records
+    /// carry invalid bytes is still a disclosure stream, because the header line
+    /// is intact. The two guards must not cancel each other out — a lossy decode
+    /// that made the capture unrecognisable to
+    /// [`require_disclosure_header`] would turn one bad byte into a refused read,
+    /// which is the erasure again wearing the other guard's clothes.
+    #[test]
+    fn an_invalid_byte_in_a_record_does_not_disqualify_the_stream() {
+        let mut captured = Vec::new();
+        captured.extend_from_slice(b"{\"known_residual_tells\":[\"TracerPid nonzero\"]}\n");
+        captured.extend_from_slice(b"{\"turn_id\":\"turn-0\",\"requested_argv0\":\"/bin/");
+        captured.push(0xfe);
+        captured.extend_from_slice(b"\"}\n");
+
+        let accepted = require_disclosure_header(decode_capture(&captured))
+            .expect("a stream with a valid header is a disclosure stream, bad bytes and all");
+        assert_eq!(accepted.lines().count(), 2);
+        assert!(accepted.contains('\u{FFFD}'));
+    }
+
+    /// Valid input must come back unchanged, so "survives invalid UTF-8" has not
+    /// been bought by mangling the ordinary case — which is every real run.
+    #[test]
+    fn a_valid_capture_is_decoded_verbatim() {
+        let text =
+            "{\"known_residual_tells\":[]}\n{\"detail\":\"caf\u{e9} \u{20ac}5 \u{1f4a5}\"}\n";
+        assert_eq!(decode_capture(text.as_bytes()), text);
     }
 
     /// The header is required on the FIRST line, which is where `execrelayd`

@@ -207,12 +207,20 @@ pub enum ArmingRefusal {
     ExecRelayImageWithoutPlan {
         guest: String,
     },
+    /// The engine will not read back what it captured from the cell, so the
+    /// disclosure stream this run's exec-consequence evidence IS cannot be
+    /// fetched — measured against the live cell at arming rather than
+    /// discovered after the run.
+    CapturedLogsUnreadable {
+        detail: String,
+    },
 }
 
 impl std::fmt::Display for ArmingRefusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let relay_detail;
         let unconfigured_detail;
+        let unreadable_detail;
         let (what, detail) = match self {
             Self::NoEngine(d) => ("no usable container engine", d),
             Self::Preflight(d) => ("the host's structural asserts did not hold", d),
@@ -246,6 +254,23 @@ impl std::fmt::Display for ArmingRefusal {
                 (
                     "the relay guest image was selected with nothing to configure it",
                     &unconfigured_detail,
+                )
+            }
+            Self::CapturedLogsUnreadable { detail } => {
+                unreadable_detail = format!(
+                    "the plan configures an exec_consequence, whose entire evidence is \
+                     `execrelayd`'s captured stdout read back with `docker logs` — but the \
+                     engine refused that read against this run's own cell, seconds after \
+                     creating it: {detail}. A log driver that cannot be read back (`none`, \
+                     `syslog`, `fluentd`, `gelf`) is the usual cause and is a HOST \
+                     configuration, not anything about the artefact. Left to be discovered \
+                     after the run, this costs a whole detonation and produces a bundle with \
+                     the exec-consequence channel `Absent`; asked here, it costs one \
+                     `docker logs` against a cell that has just started"
+                );
+                (
+                    "the engine will not read back what it captures from the cell",
+                    &unreadable_detail,
                 )
             }
         };
@@ -412,6 +437,35 @@ pub async fn run_detonation(
         .expect("just set")
         .write_file(&sealed_env.anchor_path, sealed_env.ca_pem.as_bytes())
         .map_err(|e| ArmingRefusal::Chamber(format!("placing the trust anchor: {e}")))?;
+
+    // Whether the engine will hand back what it captured, asked NOW rather than
+    // after the run.
+    //
+    // For an exec-consequence run the captured stdout is not a diagnostic, it is
+    // the channel's whole evidence. A host whose engine is configured with a log
+    // driver that cannot be read back — `none`, `syslog`, `fluentd`, `gelf` —
+    // produces a run that looks entirely normal until the sealing read, at which
+    // point every exec-consequence observation is gone and the bundle can only
+    // report the channel `Absent { ObserverFailed }`. That is a whole detonation
+    // spent to discover a host misconfiguration knowable in milliseconds:
+    // `docker logs` against such a driver exits 1 with an empty stdout and
+    // "configured logging driver does not support reading" on stderr (measured).
+    //
+    // `captured_stdout` rather than `captured_disclosure_log`: the question here
+    // is whether the READ works, not whether the relay has written its header
+    // yet — the cell has only just started and requiring content would be a race
+    // against `disclosure_init`. An empty-but-successful read is a pass; only the
+    // engine refusing is a refusal.
+    if plan.exec_consequence.is_some() {
+        arming
+            .cell
+            .as_ref()
+            .expect("just set")
+            .captured_stdout()
+            .map_err(|e| ArmingRefusal::CapturedLogsUnreadable {
+                detail: e.to_string(),
+            })?;
+    }
 
     // The skill's own files, if any, staged into the cell before the first turn.
     // A refusal here is still a refusal to arm: a half-staged skill would
@@ -1269,6 +1323,45 @@ mod tests {
         assert_eq!(
             source.turns_asked, 0,
             "the refusal must happen before any turn is driven"
+        );
+    }
+
+    /// The refusal a host with an unreadable log driver gets, and what it has
+    /// to say.
+    ///
+    /// The check itself needs a live cell to be reached, so what is pinned here
+    /// is the message — because the whole value of moving this failure to
+    /// arming is that the operator is told the cause. A refusal that says only
+    /// "could not read logs" leaves them looking at the artefact, which is the
+    /// one place the problem is not: `docker run --log-driver none` then
+    /// `docker logs` exits 1 with an empty stdout and "configured logging driver
+    /// does not support reading" (measured), and that engine text has to survive
+    /// into what the operator reads.
+    #[test]
+    fn an_unreadable_log_driver_refuses_to_arm_and_says_what_to_look_at() {
+        let refusal = ArmingRefusal::CapturedLogsUnreadable {
+            detail: "`docker logs deadbeef` exited 1: Error response from daemon: \
+                     configured logging driver does not support reading"
+                .to_owned(),
+        };
+
+        let printed = refusal.to_string();
+        assert!(printed.starts_with("REFUSED TO ARM"), "{printed}");
+        assert!(
+            printed.contains("configured logging driver does not support reading"),
+            "the engine's own reason must survive into the message: {printed}"
+        );
+        assert!(
+            printed.contains("log driver"),
+            "the message must name the class of cause, not only echo the engine: {printed}"
+        );
+        assert!(
+            printed.contains("HOST"),
+            "the operator must be told this is host configuration, not the artefact: {printed}"
+        );
+        assert!(
+            printed.contains("No bundle was written"),
+            "an arming refusal seals nothing, and says so: {printed}"
         );
     }
 

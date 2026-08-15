@@ -1252,11 +1252,23 @@ fn strictly_sequential_requests_are_never_refused_by_the_cap() {
 /// essentially always. This one cannot lose it: eight arguments at the
 /// protocol's own per-argument ceiling is 512 KiB, comfortably past any default
 /// AF_UNIX socket buffer, so the stub is guaranteed to still be writing when the
-/// refusal lands. Both halves of the fix are load-bearing here and neither alone
-/// suffices: the relay's shutdown-and-drain lets the write complete when the
-/// request fits inside the drain budget, and the stub's `SIGPIPE` handling plus
-/// its read-anyway fallthrough are what make the outcome survivable when it does
-/// not.
+/// refusal lands.
+///
+/// **What this test pins, exactly.** One mechanism, on the stub side:
+/// `signal(SIGPIPE, SIG_IGN)` in `stub.c`'s `main`, plus the read-anyway
+/// fallthrough that follows a failed `send_request`. Remove either and this test
+/// goes red with `status: Some(141)` — SIGPIPE's default disposition kills the
+/// stub mid-write and the queued refusal frames are never read.
+///
+/// It used to claim to pin two, the other being the relay's bounded
+/// drain-before-close, and that claim was false: the test stayed green with
+/// either one removed, because each on its own is sufficient here. A test that
+/// cannot fail for a mechanism does not pin it. The drain has since been
+/// removed outright (it was redundant at the cost of a 500 ms head-of-line stall
+/// in the accept loop — see `shutdown_and_close` in relayd.c), so there is one
+/// mechanism left and this test now fails for exactly it. Verified by mutation,
+/// not by assertion: with the drain gone and `signal(SIGPIPE, SIG_IGN)` deleted
+/// from `stub.c`, this test fails on the 141.
 #[test]
 fn an_over_cap_refusal_of_a_large_request_arrives_framed_rather_than_killing_the_caller() {
     let Some(_engine) = require_containers() else {
@@ -1862,6 +1874,122 @@ fn a_nested_exec_does_not_end_a_rewrite_mid_stream() {
     }
 }
 
+/// A second rewrite rule matching mid-stream is recorded as NOT APPLIED, by
+/// name.
+///
+/// One output stream carries one transform. Once a rewrite is in force for a
+/// request it stays in force to the end of that request's output — swapping it
+/// would restart `rewrite.c`'s sliding window and release the tail the first
+/// rule was holding back, which is how a match spanning the boundary leaks. So
+/// the relay keeps the armed rule and declines the newcomer.
+///
+/// Declining is the correct behaviour and it is also, silently, an operator's
+/// config not doing what it says: a rule was written, it matched, and it did
+/// nothing. Round 2 gave that outcome its own verb —
+/// `rewrite-not-applied-stream-already-transformed`, in the
+/// `substitute-failed-*` / `fabricate-failed-*` convention — precisely so the
+/// sealed evidence says so rather than leaving the reader to infer it from a
+/// record that is absent. The verb shipped with no test; this is it.
+///
+/// Two rules, both rewrites, matching different argv0s. `sh` arms `rw-outer`;
+/// each nested `/bin/echo` matches `rw-inner` while `rw-outer` is still
+/// transforming the shared stream. Both halves of the claim are asserted, and
+/// the behavioural one is what makes this more than a string check: `rw-outer`
+/// stays in force (its marker is transformed everywhere, including in output
+/// written by the very execs that matched `rw-inner`) and `rw-inner` never
+/// applies (its marker passes through verbatim).
+#[test]
+fn a_second_rewrite_rule_matching_mid_stream_is_recorded_as_not_applied() {
+    let Some(_engine) = require_containers() else {
+        return;
+    };
+    let _serialised = chamber_subnet_lock();
+
+    let plan = ExecConsequencePlan {
+        rules: vec![
+            ExecConsequenceRule {
+                name: "rw-outer".to_owned(),
+                match_argv: ArgvMatcher::Argv0 {
+                    name: "/bin/sh".to_owned(),
+                },
+                verb: ExecVerb::Rewrite {
+                    stdout_find: Some("SECRET".to_owned()),
+                    stdout_replace: Some("[REDACTED]".to_owned()),
+                    stderr_find: None,
+                    stderr_replace: None,
+                },
+            },
+            ExecConsequenceRule {
+                name: "rw-inner".to_owned(),
+                match_argv: ArgvMatcher::Argv0 {
+                    name: "/bin/echo".to_owned(),
+                },
+                verb: ExecVerb::Rewrite {
+                    stdout_find: Some("OTHER".to_owned()),
+                    stdout_replace: Some("[ALSO-REDACTED]".to_owned()),
+                    stderr_find: None,
+                    stderr_replace: None,
+                },
+            },
+        ],
+        timeout_ms: 60_000,
+        max_concurrent_handlers: 32,
+    };
+    let cell = start_cell(&plan);
+    cell.start().expect("start");
+    std::thread::sleep(Duration::from_millis(300));
+
+    // Absolute paths so each `echo` is a genuine fork+exec that traps and
+    // matches `rw-inner`, rather than a shell builtin that traps not at all.
+    let script = "/bin/echo SECRET-one; /bin/echo OTHER-two";
+    let out = cell
+        .exec(&["stub", "/bin/sh", "-c", script], OP_WINDOW)
+        .expect("exec");
+    assert_eq!(out.status, Some(0), "stderr: {}", out.stderr);
+
+    assert_eq!(
+        out.stdout, "[REDACTED]-one\nOTHER-two\n",
+        "the armed rule must stay in force for the whole stream and the \
+         second rule must not have been applied to any of it"
+    );
+
+    let records = disclosure_records(&cell);
+
+    // The armed rule, once.
+    let applied = records_with_verb(&records, "rewrite");
+    assert_eq!(
+        applied.len(),
+        1,
+        "exactly one rewrite rule may arm the stream:\n{records:#?}"
+    );
+    assert_eq!(applied[0]["matched_rule"].as_str(), Some("rw-outer"));
+
+    // And the declined one, said out loud — once per nested exec that matched
+    // it, since each is its own trap and its own record.
+    let declined = records_with_verb(&records, "rewrite-not-applied-stream-already-transformed");
+    assert_eq!(
+        declined.len(),
+        2,
+        "a rule that matched and did nothing must be recorded as such, per \
+         trap:\n{records:#?}"
+    );
+    for record in &declined {
+        assert_eq!(
+            record["matched_rule"].as_str(),
+            Some("rw-inner"),
+            "the record must name the rule that was DECLINED: {record:#?}"
+        );
+        // The detail names the rule holding the stream, which is the one thing
+        // an operator needs to understand why their rule did nothing.
+        assert!(
+            record["detail"]
+                .as_str()
+                .is_some_and(|d| d.contains("rw-outer")),
+            "the detail must name the rule already transforming the stream: {record:#?}"
+        );
+    }
+}
+
 /// `Exact` and `Prefix` are different matchers, and only a longer argv can tell
 /// them apart.
 ///
@@ -2288,6 +2416,21 @@ fn turn_id_lands_on_the_disclosure_record() {
 /// The record before the bad one and the record after it are what make this a
 /// test of the failure that actually happened: erasure was total, not local, so
 /// their survival is the property under test, not merely the bad record's own.
+///
+/// **What this does NOT pin, despite appearances.** The host's lossy decode
+/// (`decode_capture` in `chamber-isolation/src/cell.rs`). Docker's `json-file`
+/// log driver — this project's default, and what runs here — stores captured
+/// output as JSON strings and repairs invalid UTF-8 to U+FFFD as it writes
+/// them, so the `0xFF` planted below has already become a valid U+FFFD by the
+/// time `docker logs` hands the bytes back. This test would stay green against a
+/// STRICT host-side decode, because no invalid byte ever reaches it through this
+/// driver. What it does pin is the pipeline in general: that the relay records
+/// an arbitrary byte string verbatim, that the record still parses, and that
+/// neighbouring records survive — all of which are worth having and none of
+/// which is the decode fallback. The fallback is pinned by
+/// `an_invalid_byte_in_the_capture_costs_its_own_character_and_nothing_else`,
+/// a unit test that hands `decode_capture` the bytes directly with no driver in
+/// between.
 #[test]
 fn one_invalid_utf8_byte_does_not_erase_the_rest_of_the_disclosure_log() {
     let Some(_engine) = require_containers() else {
@@ -2359,9 +2502,10 @@ fn one_invalid_utf8_byte_does_not_erase_the_rest_of_the_disclosure_log() {
     }
 
     // And the bad record is READABLE, not merely counted: its argv0 arrives
-    // with the invalid byte represented (U+FFFD, from whichever of the log
-    // driver or `String::from_utf8_lossy` reached it first) and everything
-    // around that byte intact.
+    // with the invalid byte represented as U+FFFD and everything around that
+    // byte intact. The substitution is the `json-file` driver's, not the host
+    // decode's — see the note above — so this asserts the driver did not eat the
+    // record, which is a real property and not the fallback's.
     let bad_record = records
         .iter()
         .find(|r| r["turn_id"].as_str() == Some("bad-utf8"))
@@ -2841,6 +2985,17 @@ fn a_composed_detonation_arms_the_relay_and_seals_what_it_intercepted() {
 /// as `requested_argv0`. What the exec then does is immaterial to this test —
 /// busybox dispatches on argv[0]'s basename and exits 127 — because the record
 /// is written at the trap, before the syscall resumes.
+///
+/// **The same caveat as the direct test carries here**, and it is worth stating
+/// twice because this one names `captured_disclosure_log`'s decode in its own
+/// description: Docker's `json-file` driver repairs invalid UTF-8 to U+FFFD
+/// before `docker logs` returns it, so the decode this chain runs never actually
+/// meets an invalid byte under the default driver. This test pins the chain —
+/// relay records it, the capture carries it, the parse keeps it, the coverage
+/// decision holds — and would stay green against a strict decode. The decode
+/// fallback itself is pinned by `chamber-isolation`'s
+/// `an_invalid_byte_in_the_capture_costs_its_own_character_and_nothing_else`,
+/// which drives `decode_capture` directly.
 #[test]
 fn a_composed_detonation_seals_a_record_whose_argv0_is_not_valid_utf8() {
     let Some(_engine) = require_containers() else {
@@ -2897,9 +3052,9 @@ fn a_composed_detonation_seals_a_record_whose_argv0_is_not_valid_utf8() {
          exactly the total erasure R1 reported"
     );
 
-    // The bad record itself, by shape rather than by exact bytes: whichever of
-    // the log driver or `String::from_utf8_lossy` reached the 0xFF first, it
-    // arrives as U+FFFD with its neighbours intact.
+    // The bad record itself, by shape rather than by exact bytes: the 0xFF
+    // arrives as U+FFFD (substituted by the `json-file` driver, per the note
+    // above) with its neighbours intact.
     let bad = records
         .iter()
         .find(|(_, argv0, _, _, _)| argv0.starts_with("/work/bad") && argv0.ends_with("name"))

@@ -171,8 +171,18 @@ static void logline(const char *fmt, ...) {
  * proto_send_stream (sliced to the limit); bounded control frames go through
  * proto_send_frame. */
 
-/* Read tracee's NUL-terminated string at remote address via /proc/pid/mem */
+/* Read tracee's NUL-terminated string at remote address via /proc/pid/mem.
+ *
+ * Returns the length read, or -1 if the tracee's memory could not be opened at
+ * all. `out` is left EMPTY-AND-TERMINATED in that case rather than untouched:
+ * the caller checks the return, but a caller that ever forgets must inherit an
+ * empty string, not 1 KiB of the tracer's own uninitialised stack. That
+ * distinction is not academic here — `reqpath` is composed straight into a
+ * disclosure record, which is SEALED, and round 2's R7 was exactly this shape
+ * (an unterminated `req->id` read past the bytes that arrived and into a signed
+ * artefact). A wrong record is a quiet lie; an empty one is legible. */
 static int read_tracee_str(int pid, unsigned long long addr, char *out, size_t outsz) {
+    if (outsz) out[0] = 0;
     char path[64];
     snprintf(path, sizeof(path), "/proc/%d/mem", pid);
     int fd = open(path, O_RDONLY | O_CLOEXEC);
@@ -823,12 +833,63 @@ static int run_traced(char *const argv[],
                     if (sig == SIGTRAP && event == PTRACE_EVENT_SECCOMP) {
                         unsigned long msg = 0;
                         ptrace(PTRACE_GETEVENTMSG, w, 0, &msg);
+
+                        /* Both reads below fill data that is composed straight
+                         * into a SEALED disclosure record, and both were
+                         * previously unchecked — R7's class exactly. The
+                         * registers are the sharper of the two: `regs` is a
+                         * plain stack local, so a failed PTRACE_GETREGSET (the
+                         * tracee raced away between the trap and this read, or
+                         * was killed by something in the cell) left every field
+                         * uninitialised, and the record was then composed from
+                         * whatever the tracer's own stack happened to hold —
+                         * `reqpath` read from a garbage address, `scratch_addr`
+                         * derived from a garbage SP. Zeroed AND checked, rather
+                         * than either alone: the zeroing bounds what an
+                         * unchecked path could ever leak, the check is what
+                         * stops the record being written at all.
+                         *
+                         * A trap whose registers cannot be read is disclosed as
+                         * itself, not as an exec of "": the request is still
+                         * IDENTIFIABLE (`req_id`) and the syscall still
+                         * happened, so silence here would be the disclosure
+                         * log's one forbidden failure — a real exec dropped —
+                         * while a fabricated path would be worse than silence.
+                         * The tracee is resumed unmodified, which is the only
+                         * safe thing to do with a trap nothing could be learned
+                         * about. `recorded_any` is deliberately NOT set: whether
+                         * anything loaded is precisely what could not be
+                         * determined, and the end-of-request
+                         * `passthrough-exec-failed` record alongside this one
+                         * states the uncertainty rather than papering it. */
                         struct arm64_regs regs;
-                        get_regs(w, &regs);
+                        memset(&regs, 0, sizeof regs);
+                        if (get_regs(w, &regs) != 0) {
+                            logline("req=%s pid=%d: PTRACE_GETREGSET failed: %s",
+                                    req_id?req_id:"-", w, strerror(errno));
+                            disclosure_record(req_id, "-", "-", "trap-unreadable",
+                                              "the tracee's registers could not be read at this "
+                                              "exec trap; nothing about the requested command is "
+                                              "known and nothing was intercepted");
+                            ptrace(PTRACE_CONT, w, 0, 0);
+                            continue;
+                        }
                         int is_execveat = (msg == (unsigned long)SYS_execveat);
                         unsigned long long path_reg = is_execveat ? regs.regs[1] : regs.regs[0];
                         char reqpath[1024];
-                        read_tracee_str(w, path_reg, reqpath, sizeof(reqpath));
+                        /* 0 is a legitimate answer (execveat with AT_EMPTY_PATH
+                         * carries no path), so only a negative return is the
+                         * failure: the tracee's memory could not be opened. */
+                        if (read_tracee_str(w, path_reg, reqpath, sizeof(reqpath)) < 0) {
+                            logline("req=%s pid=%d: tracee memory unreadable: %s",
+                                    req_id?req_id:"-", w, strerror(errno));
+                            disclosure_record(req_id, "-", "-", "trap-unreadable",
+                                              "the tracee's memory could not be read at this exec "
+                                              "trap; the requested path is unknown and nothing "
+                                              "was intercepted");
+                            ptrace(PTRACE_CONT, w, 0, 0);
+                            continue;
+                        }
 
                         /* Computed HERE, from the trap's untouched registers,
                          * because the verb dispatch below rewrites regs[0]/
@@ -1128,54 +1189,40 @@ reap_and_fail:
 
 /* ------------------------- socket-relay server path ------------------------- */
 
-/* Ends a refused connection without yanking it out from under a peer that is
- * still writing.
+/* Ends a refused connection: half-close, then close.
  *
- * A bare close() on a socket the stub has not finished sending into destroys
- * the refusal it was just handed: the stub's next write() gets EPIPE (and,
- * before this round's stub fix, SIGPIPE — signal 13, `docker exec` exit 141),
- * so it dies mid-request having never read the TAG_STDERR/TAG_EXIT frames
- * sitting in its own receive buffer. The caller then sees 141 instead of the
- * framed exit 112, i.e. the refusal machinery round 1 built is silently skipped
- * exactly when the relay is under the conditions that trigger refusals. The
- * over-cap path is the sharpest case: it fires before a single byte of the
- * request has been read, so the stub is guaranteed to still be writing whenever
- * the request is bigger than the socket buffer.
+ * The frames already written — TAG_STDERR carrying the reason, TAG_EXIT
+ * carrying 112 — are queued in the socket's send buffer, and shutdown(SHUT_WR)
+ * leaves them there for the peer to read, followed by a clean EOF. That is all
+ * this needs to do. It is kept ahead of the close because it says exactly one
+ * thing and says it explicitly — this end has finished writing — rather than
+ * relying on close()'s delivery behaviour on an AF_UNIX stream to mean the same.
  *
- * shutdown(SHUT_WR) first — the frames already written stay queued and the peer
- * gets a clean EOF after them, rather than a socket that has ceased to exist —
- * then discard whatever the peer is still pushing, so its writes complete
- * instead of failing. BOUNDED, because this also runs on the accept loop's own
- * refusal paths (the cap, and the reserve failure), where an unbounded drain
- * would let one slow client stall every other connection: past the byte or time
- * budget it simply closes, and the stub's `signal(SIGPIPE, SIG_IGN)` plus its
- * write-failure fallthrough are what make that outcome survivable. Neither half
- * alone is enough — this one narrows the window, the stub's one removes the
- * fatality. */
-#define REFUSAL_DRAIN_BYTES (1u << 20)   /* 1 MiB */
-#define REFUSAL_DRAIN_MS    500
+ * **What this deliberately no longer does.** Round 2 added a bounded
+ * drain-before-close here: up to 1 MiB or 500 ms of reading-and-discarding
+ * whatever the stub was still pushing, so its in-flight write() would complete
+ * rather than fail. The reasoning was that a stub still blocked in write() when
+ * the refusal lands takes EPIPE — and, with no SIGPIPE disposition installed,
+ * SIGPIPE, signal 13, `docker exec` exit 141 — and so dies mid-request having
+ * never read the refusal frames sitting in its own receive buffer.
+ *
+ * That fatality is now removed at its source: stub.c installs
+ * `signal(SIGPIPE, SIG_IGN)` and falls through a failed write to read the
+ * response anyway, which delivers the guarantee (a refused request arrives as
+ * the framed exit 112, never as a killed caller) on its own, for every refusal
+ * path, whatever the request's size. The drain was therefore buying nothing the
+ * stub side was not already buying — at the cost of blocking THIS loop, the
+ * single-threaded accept loop, for up to 500 ms per refusal. That reintroduces
+ * a bounded head-of-line stall into the one component the design's §8 exists to
+ * keep free of it: a burst of over-cap refusals would serialise behind each
+ * other here, which is precisely the failure the accept loop's cap is meant to
+ * prevent rather than cause. Redundant machinery that costs latency in the hot
+ * path is worse than no machinery, so it is gone.
+ *
+ * If the stub's SIGPIPE disposition is ever removed, this is NOT the place to
+ * compensate — restore it there. */
 static void shutdown_and_close(int cfd) {
     shutdown(cfd, SHUT_WR);
-    size_t drained = 0;
-    struct timespec started;
-    clock_gettime(CLOCK_MONOTONIC, &started);
-    for (;;) {
-        struct timespec now;
-        clock_gettime(CLOCK_MONOTONIC, &now);
-        long elapsed_ms = (long)(now.tv_sec - started.tv_sec) * 1000
-                         + (now.tv_nsec - started.tv_nsec) / 1000000;
-        if (elapsed_ms >= REFUSAL_DRAIN_MS) break;
-        struct pollfd pfd = { .fd = cfd, .events = POLLIN, .revents = 0 };
-        int pr = poll(&pfd, 1, (int)(REFUSAL_DRAIN_MS - elapsed_ms));
-        if (pr < 0) { if (errno == EINTR) continue; break; }
-        if (pr == 0) break;
-        char scrap[4096];
-        ssize_t r = read(cfd, scrap, sizeof(scrap));
-        if (r < 0) { if (errno == EINTR) continue; break; }
-        if (r == 0) break;                       /* peer is done: the clean end */
-        drained += (size_t)r;
-        if (drained >= REFUSAL_DRAIN_BYTES) break;
-    }
     close(cfd);
 }
 

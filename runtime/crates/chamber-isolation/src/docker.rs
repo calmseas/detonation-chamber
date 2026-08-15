@@ -87,6 +87,11 @@ pub enum EngineError {
     /// whole channel is built to avoid.
     CaptureTooLarge {
         argv: Vec<String>,
+        /// Which of the two captures blew the cap. Both are bounded and both
+        /// are agent-driven, so the operator needs to be told which one — they
+        /// mean different things (`stdout` is the disclosure stream itself,
+        /// `stderr` the relay's operator log).
+        stream: &'static str,
         bytes: u64,
         cap: u64,
     },
@@ -113,9 +118,14 @@ impl fmt::Display for EngineError {
                 argv.join(" "),
                 after
             ),
-            Self::CaptureTooLarge { argv, bytes, cap } => write!(
+            Self::CaptureTooLarge {
+                argv,
+                stream,
+                bytes,
+                cap,
+            } => write!(
                 f,
-                "`docker {}` produced {bytes} bytes of stdout, over the {cap}-byte cap this \
+                "`docker {}` produced {bytes} bytes of {stream}, over the {cap}-byte cap this \
                  read holds in memory; refused rather than truncated, because a shortened \
                  capture that nothing says was shortened is indistinguishable from a complete one",
                 argv.join(" "),
@@ -189,7 +199,7 @@ fn run_within_raw(argv: &[&str], within: Duration) -> Result<RawOutcome, EngineE
     run_within_raw_capped(argv, within, None)
 }
 
-/// [`run_within_raw`] with an optional ceiling on how much stdout it will read
+/// [`run_within_raw`] with an optional ceiling on how much output it will read
 /// into memory.
 ///
 /// The cap is checked against the capture FILE's size before a byte of it is
@@ -201,10 +211,20 @@ fn run_within_raw(argv: &[&str], within: Duration) -> Result<RawOutcome, EngineE
 /// One caller passes a cap — see [`Container::logs_bytes`] — and it is the only
 /// read whose length is chosen by the artefact under evaluation rather than by
 /// this harness.
+///
+/// **Both streams, not just stdout.** `docker logs` splits the container's two
+/// streams across its own two, and for the exec-relay guest BOTH are written by
+/// something the agent drives: stdout carries one disclosure record per
+/// intercepted exec, and stderr carries `execrelayd`'s per-trap `logline` —
+/// which fires on every trap, including the PATH probes that are deliberately
+/// not recorded, so it can be the LARGER of the two. Capping only stdout bounds
+/// the smaller half and leaves the other an unbounded read into this process's
+/// memory. Nothing about the reasoning for the cap distinguishes the streams, so
+/// neither does the cap.
 fn run_within_raw_capped(
     argv: &[&str],
     within: Duration,
-    stdout_cap: Option<u64>,
+    capture_cap: Option<u64>,
 ) -> Result<RawOutcome, EngineError> {
     let (out_path, err_path) = (scratch_path("out"), scratch_path("err"));
     let mut child = Command::new("docker")
@@ -229,17 +249,12 @@ fn run_within_raw_capped(
 
     // Before the read, not after it: the whole point of the cap is that the
     // oversized capture never becomes a `Vec<u8>` in this process.
-    if let Some(cap) = stdout_cap
-        && let Ok(meta) = std::fs::metadata(&out_path)
-        && meta.len() > cap
-    {
+    let too_large = over_cap(argv, "stdout", captured_len(&out_path), capture_cap)
+        .or_else(|| over_cap(argv, "stderr", captured_len(&err_path), capture_cap));
+    if let Some(refusal) = too_large {
         let _ = std::fs::remove_file(&out_path);
         let _ = std::fs::remove_file(&err_path);
-        return Err(EngineError::CaptureTooLarge {
-            argv: argv.iter().map(|a| (*a).to_owned()).collect(),
-            bytes: meta.len(),
-            cap,
-        });
+        return Err(refusal);
     }
 
     let stdout = read_bytes_and_remove(&out_path);
@@ -290,6 +305,57 @@ fn raw_or_failed(argv: &[&str], outcome: RawOutcome) -> Result<RawOutcome, Engin
             stderr: decode_lossy(outcome.stderr),
         })
     }
+}
+
+/// The ceiling on a `docker logs` capture this process reads into memory, per
+/// stream. See [`Container::logs_bytes`] for why this one read is bounded when
+/// no other is.
+///
+/// 64 MiB is far more disclosure than any legitimate run produces (a record is
+/// a few hundred bytes, so this is on the order of a hundred thousand execs),
+/// so nothing real is at risk of tripping it, and a run that does trip it has
+/// something wrong with it that a reviewer should be told about rather than
+/// have papered over by a truncated read. Refused rather than truncated, for
+/// the reason everything in this subsystem is.
+///
+/// Module-level rather than a local inside `logs_bytes` so the tests can state
+/// the bound they are pinning instead of restating the number.
+const LOGS_BYTES_CAP: u64 = 64 * 1024 * 1024;
+
+/// The cap decision, split out so it is reachable from a test without an
+/// engine — for the same reason [`raw_or_failed`] is.
+///
+/// A capture large enough to trip the cap cannot be arranged against a live
+/// daemon in a test worth running: the bound is 64 MiB and producing it means an
+/// agent that spent its run in a loop. As a value it is one line. The condition
+/// that matters is the boundary — `bytes > cap` refuses, `bytes == cap` does
+/// not — and the outcome that matters is that the oversized capture becomes an
+/// ERROR rather than a truncated success, which is the one thing this whole
+/// subsystem exists to prevent.
+///
+/// `None` for a capture within its cap, or for a caller that set none.
+fn over_cap(
+    argv: &[&str],
+    stream: &'static str,
+    bytes: u64,
+    cap: Option<u64>,
+) -> Option<EngineError> {
+    let cap = cap?;
+    (bytes > cap).then(|| EngineError::CaptureTooLarge {
+        argv: argv.iter().map(|a| (*a).to_owned()).collect(),
+        stream,
+        bytes,
+        cap,
+    })
+}
+
+/// How many bytes a capture file holds, without reading it.
+///
+/// Unreadable metadata answers 0, which declines to refuse rather than refusing
+/// on a guess: the read that follows will produce whatever it can, and the cap
+/// is a memory bound, not an assertion about the filesystem.
+fn captured_len(path: &PathBuf) -> u64 {
+    std::fs::metadata(path).map_or(0, |m| m.len())
 }
 
 fn scratch_path(kind: &str) -> PathBuf {
@@ -882,14 +948,7 @@ impl Container {
         // process would otherwise read into memory in full, on a host already
         // running several containers.
         //
-        // Deliberately generous: 64 MiB is far more disclosure than any
-        // legitimate run produces (a record is a few hundred bytes, so this is
-        // on the order of a hundred thousand execs), so nothing real is at risk
-        // of tripping it, and a run that does trip it has something wrong with
-        // it that a reviewer should be told about rather than have papered over
-        // by a truncated read. Refused rather than truncated, for the reason
-        // everything in this subsystem is.
-        const LOGS_BYTES_CAP: u64 = 64 * 1024 * 1024;
+        // Deliberately generous: see LOGS_BYTES_CAP.
         let argv = ["logs", self.id.as_str()];
         let outcome = run_within_raw_capped(&argv, Duration::from_secs(30), Some(LOGS_BYTES_CAP))?;
         raw_or_failed(&argv, outcome)
@@ -1111,6 +1170,106 @@ mod tests {
             }
             other => panic!("expected EngineError::Failed, got {other:?}"),
         }
+    }
+
+    /// The cap refuses rather than truncating — the property the whole bound
+    /// exists for, and one nothing reached before.
+    ///
+    /// A truncated disclosure log is the worst available outcome: it parses, it
+    /// seals, it reports the channel as watched, and nothing in the bundle says
+    /// records are missing. So the oversized capture has to arrive as an ERROR
+    /// naming the size and the bound, not as a shorter success.
+    #[test]
+    fn a_capture_over_the_cap_is_refused_rather_than_truncated() {
+        let err = over_cap(
+            &["logs", "deadbeef"],
+            "stdout",
+            LOGS_BYTES_CAP + 1,
+            Some(LOGS_BYTES_CAP),
+        )
+        .expect("a capture past the cap must be refused");
+
+        match err {
+            EngineError::CaptureTooLarge {
+                argv,
+                stream,
+                bytes,
+                cap,
+            } => {
+                assert_eq!(argv, vec!["logs".to_owned(), "deadbeef".to_owned()]);
+                assert_eq!(stream, "stdout");
+                assert_eq!(bytes, LOGS_BYTES_CAP + 1);
+                assert_eq!(cap, LOGS_BYTES_CAP);
+            }
+            other => panic!("expected CaptureTooLarge, got {other:?}"),
+        }
+
+        // The operator is told what happened and what the bound was: a refusal
+        // nobody can act on is barely better than a truncation.
+        let rendered = over_cap(
+            &["logs", "deadbeef"],
+            "stdout",
+            LOGS_BYTES_CAP + 1,
+            Some(LOGS_BYTES_CAP),
+        )
+        .expect("just built one")
+        .to_string();
+        assert!(
+            rendered.contains("refused rather than truncated"),
+            "{rendered}"
+        );
+        assert!(rendered.contains(&LOGS_BYTES_CAP.to_string()), "{rendered}");
+    }
+
+    /// Both of `docker logs`' streams are bounded, not only stdout.
+    ///
+    /// `execrelayd` writes a `logline` per TRAP — including the PATH probes it
+    /// deliberately does not record — so its stderr is agent-driven and can be
+    /// the larger of the two captures. A cap on stdout alone bounds the smaller
+    /// half and leaves the other an unbounded read into this process.
+    #[test]
+    fn the_cap_covers_stderr_and_not_only_stdout() {
+        let err = over_cap(
+            &["logs", "deadbeef"],
+            "stderr",
+            LOGS_BYTES_CAP * 2,
+            Some(LOGS_BYTES_CAP),
+        )
+        .expect("an oversized stderr capture must be refused too");
+        let EngineError::CaptureTooLarge { stream, .. } = err else {
+            panic!("expected CaptureTooLarge");
+        };
+        assert_eq!(
+            stream, "stderr",
+            "the refusal must name which stream blew the cap"
+        );
+    }
+
+    /// The bound must not be bought by refusing ordinary reads. Everything up
+    /// to and INCLUDING the cap is a capture this process will read: the cap is
+    /// the largest acceptable size, not the smallest refused one, and an
+    /// off-by-one here turns an exactly-64-MiB run into a lost bundle.
+    ///
+    /// The uncapped case is the other half — every read in this module except
+    /// `logs_bytes` passes `None`, and none of them may acquire a bound by
+    /// accident.
+    #[test]
+    fn a_capture_within_the_cap_and_an_uncapped_one_are_both_read() {
+        assert!(
+            over_cap(
+                &["logs", "x"],
+                "stdout",
+                LOGS_BYTES_CAP,
+                Some(LOGS_BYTES_CAP)
+            )
+            .is_none(),
+            "a capture exactly at the cap is within it"
+        );
+        assert!(over_cap(&["logs", "x"], "stdout", 0, Some(LOGS_BYTES_CAP)).is_none());
+        assert!(
+            over_cap(&["ps"], "stdout", u64::MAX, None).is_none(),
+            "a caller that set no cap must not acquire one"
+        );
     }
 
     /// The guard must not be bought by turning ordinary reads into failures: a
