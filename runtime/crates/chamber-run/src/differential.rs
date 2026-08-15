@@ -2513,13 +2513,16 @@ fn arm_detonation_plan(
         },
         // NOT matched on role: both arms meet the same boundary, or the
         // subtraction attributes the environment's difference to the artefact.
-        consequence: plan.consequence.clone(),
-        // Cloned, NOT hardcoded None: for the same reason as `consequence`
-        // just above, the exec-interception relay is part of the environment
-        // both arms meet. Dropping it for either arm would run that arm's
-        // commands unintercepted, and the subtraction would then read the
-        // relay's own effect on behaviour as the artefact's.
-        exec_consequence: plan.exec_consequence.clone(),
+        realism: chamber_capture::RealismProfile {
+            consequence: plan.consequence.clone(),
+            // Cloned, NOT hardcoded None: for the same reason as
+            // `consequence` just above, the exec-interception relay is part
+            // of the environment both arms meet. Dropping it for either arm
+            // would run that arm's commands unintercepted, and the
+            // subtraction would then read the relay's own effect on
+            // behaviour as the artefact's.
+            exec_consequence: plan.exec_consequence.clone(),
+        },
     }
 }
 

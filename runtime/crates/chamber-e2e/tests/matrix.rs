@@ -121,8 +121,7 @@ fn plan_with(evidence: std::path::PathBuf, canaries: Vec<PlantedCanary>) -> Deto
         skill_dir: None,
         // The matrix pins the default boundary's behaviour. A fixture row that
         // wanted a plausible answer would set this and say so.
-        consequence: None,
-        exec_consequence: None,
+        realism: chamber_capture::RealismProfile::default(),
     }
 }
 

@@ -2875,22 +2875,24 @@ fn a_composed_detonation_arms_the_relay_and_seals_what_it_intercepted() {
         }],
         max_turns: 8,
         skill_dir: None,
-        consequence: None,
-        exec_consequence: Some(ExecConsequencePlan {
-            rules: vec![ExecConsequenceRule {
-                name: "fab-touch".to_owned(),
-                match_argv: ArgvMatcher::Argv0 {
-                    name: "/bin/touch".to_owned(),
-                },
-                verb: ExecVerb::Fabricate {
-                    exit_code: 0,
-                    stdout: "fabricated-ok".to_owned(),
-                    stderr: String::new(),
-                },
-            }],
-            timeout_ms: 60_000,
-            max_concurrent_handlers: 32,
-        }),
+        realism: chamber_capture::RealismProfile {
+            consequence: None,
+            exec_consequence: Some(ExecConsequencePlan {
+                rules: vec![ExecConsequenceRule {
+                    name: "fab-touch".to_owned(),
+                    match_argv: ArgvMatcher::Argv0 {
+                        name: "/bin/touch".to_owned(),
+                    },
+                    verb: ExecVerb::Fabricate {
+                        exit_code: 0,
+                        stdout: "fabricated-ok".to_owned(),
+                        stderr: String::new(),
+                    },
+                }],
+                timeout_ms: 60_000,
+                max_concurrent_handlers: 32,
+            }),
+        },
     };
 
     let script = format!(
@@ -3023,12 +3025,14 @@ fn a_composed_detonation_seals_a_record_whose_argv0_is_not_valid_utf8() {
         }],
         max_turns: 8,
         skill_dir: None,
-        consequence: None,
-        exec_consequence: Some(ExecConsequencePlan {
-            rules: vec![],
-            timeout_ms: 60_000,
-            max_concurrent_handlers: 32,
-        }),
+        realism: chamber_capture::RealismProfile {
+            consequence: None,
+            exec_consequence: Some(ExecConsequencePlan {
+                rules: vec![],
+                timeout_ms: 60_000,
+                max_concurrent_handlers: 32,
+            }),
+        },
     };
 
     // JSON `\\377` decodes to the two-character shell escape `\377`, which
@@ -3127,12 +3131,14 @@ fn an_exec_consequence_against_a_relayless_guest_image_refuses_to_arm() {
         }],
         max_turns: 8,
         skill_dir: None,
-        consequence: None,
-        exec_consequence: Some(ExecConsequencePlan {
-            rules: vec![],
-            timeout_ms: 60_000,
-            max_concurrent_handlers: 32,
-        }),
+        realism: chamber_capture::RealismProfile {
+            consequence: None,
+            exec_consequence: Some(ExecConsequencePlan {
+                rules: vec![],
+                timeout_ms: 60_000,
+                max_concurrent_handlers: 32,
+            }),
+        },
     };
     let mut turns =
         ScriptedTurns::from_bytes("refusal", br#"[{"do": "conclude"}]"#).expect("parse");

@@ -29,7 +29,6 @@ use std::cell::RefCell;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use chamber_capture::ConsequencePlan;
 use chamber_deadline::{StageTrace, Window};
 use chamber_evidence::Verdict;
 use chamber_isolation::{
@@ -136,7 +135,7 @@ fn guest_image_carries_exec_relay(tag: &str) -> bool {
 ///   image and this plan field are selected together or not at all.
 fn check_exec_relay_capability(plan: &DetonationPlan) -> Result<(), ArmingRefusal> {
     match (
-        plan.exec_consequence.is_some(),
+        plan.realism.exec_consequence.is_some(),
         guest_image_carries_exec_relay(&plan.images.guest),
     ) {
         (true, true) | (false, false) => Ok(()),
@@ -175,17 +174,10 @@ pub struct DetonationPlan {
     /// turn. `None` reproduces Slice-0 behaviour exactly — nothing is staged,
     /// and the driver's brief is the only place the skill appears.
     pub skill_dir: Option<PathBuf>,
-    /// What the boundary answers intercepted requests with. `None` — the
-    /// default — is the `403 blocked by the detonation chamber` refusal.
-    ///
-    /// `Some` turns on [consequence
-    /// mode](chamber_capture::consequence): the boundary fabricates this
-    /// response so the artefact's request appears to succeed, which removes the
-    /// tell that a 403 from every host would otherwise hand an eval-aware
-    /// model. It grants no egress — the response is built inside the observer,
-    /// and the request is discarded there exactly as a refused one is.
-    pub consequence: Option<ConsequencePlan>,
-    pub exec_consequence: Option<chamber_capture::exec_consequence::ExecConsequencePlan>,
+    /// What the boundary tells the guest, network-side and exec-side. See
+    /// [`chamber_capture::RealismProfile`] for what each half does and how
+    /// `exec_consequence` is validated against the guest image.
+    pub realism: chamber_capture::RealismProfile,
 }
 
 /// Why no run happened.
@@ -456,7 +448,7 @@ pub async fn run_detonation(
     // yet — the cell has only just started and requiring content would be a race
     // against `disclosure_init`. An empty-but-successful read is a pass; only the
     // engine refusing is a refusal.
-    if plan.exec_consequence.is_some() {
+    if plan.realism.exec_consequence.is_some() {
         arming
             .cell
             .as_ref()
@@ -499,7 +491,7 @@ pub async fn run_detonation(
         let cell = arming.cell.as_ref().expect("armed");
         drive_turns(
             turns,
-            &ToolBridge::new_with_exec_relay(plan.exec_consequence.is_some()),
+            &ToolBridge::new_with_exec_relay(plan.realism.exec_consequence.is_some()),
             cell,
             plan.max_turns,
         )
@@ -550,7 +542,7 @@ pub async fn run_detonation(
     // halves of the guard (the exit status, and the relay's startup header
     // actually being there), so there is no shape of failed read that reaches
     // this match as an `Ok`.
-    let exec_consequence_log: Option<String> = if plan.exec_consequence.is_some() {
+    let exec_consequence_log: Option<String> = if plan.realism.exec_consequence.is_some() {
         let cell = arming.cell.as_ref().expect("armed");
         match cell.captured_disclosure_log() {
             Ok(text) => Some(text),
@@ -670,7 +662,7 @@ pub async fn run_detonation(
                 // armed at all, and whether its log came back. Neither is
                 // inferable from the turn count, which is what this used to be
                 // reported from.
-                exec_interception: if plan.exec_consequence.is_some() {
+                exec_interception: if plan.realism.exec_consequence.is_some() {
                     bundle::ExecInterception::Armed {
                         disclosure_log_read: exec_consequence_log.is_some(),
                         malformed_lines: disclosure_parse
@@ -798,7 +790,7 @@ fn observer_env(plan: &DetonationPlan) -> Vec<(String, String)> {
     // sees neither variable and keeps refusing. The body is base64 in these
     // pairs: the env file this becomes is one `KEY=value` line per pair, and a
     // plausible response body has newlines in it.
-    if let Some(consequence) = &plan.consequence {
+    if let Some(consequence) = &plan.realism.consequence {
         pairs.extend(consequence.to_env_pairs());
     }
     pairs
@@ -968,7 +960,7 @@ fn seal_cell_environment(
         placements.plant_env(canary.label.clone(), name);
     }
 
-    apply_exec_consequence_env(&mut draft, plan.exec_consequence.as_ref())?;
+    apply_exec_consequence_env(&mut draft, plan.realism.exec_consequence.as_ref())?;
 
     // Refuses if a canary was declared for a variable that was never bound —
     // the failure that produces a run with nothing to find, reported as no
@@ -985,6 +977,7 @@ fn seal_cell_environment(
 mod tests {
     use super::*;
     use crate::turns::{CellOutput, TurnError, TurnProvenance};
+    use chamber_capture::ConsequencePlan;
     use chamber_isolation::{CellError, ExecOutcome};
 
     /// Answers every command with the same canned output.
@@ -1183,8 +1176,10 @@ mod tests {
             }],
             max_turns: 4,
             skill_dir: None,
-            consequence,
-            exec_consequence: None,
+            realism: chamber_capture::RealismProfile {
+                consequence,
+                exec_consequence: None,
+            },
         }
     }
 
@@ -1306,7 +1301,7 @@ mod tests {
     async fn refuses_to_arm_an_exec_consequence_against_a_non_relay_image() {
         let mut plan = bare_plan(None);
         plan.images.guest = "chamber-guest:test".to_owned();
-        plan.exec_consequence = Some(empty_exec_plan());
+        plan.realism.exec_consequence = Some(empty_exec_plan());
         let mut source = DeafSource::default();
 
         let refusal = run_detonation(&plan, &mut source)
@@ -1371,7 +1366,7 @@ mod tests {
     fn the_relay_image_arms_an_exec_consequence() {
         let mut plan = bare_plan(None);
         plan.images.guest = "chamber-guest-exec-relay:test".to_owned();
-        plan.exec_consequence = Some(empty_exec_plan());
+        plan.realism.exec_consequence = Some(empty_exec_plan());
         assert!(check_exec_relay_capability(&plan).is_ok());
     }
 
@@ -1403,7 +1398,7 @@ mod tests {
     async fn refuses_to_arm_the_relay_image_with_no_exec_consequence() {
         let mut plan = bare_plan(None);
         plan.images.guest = "chamber-guest-exec-relay:test".to_owned();
-        plan.exec_consequence = None;
+        plan.realism.exec_consequence = None;
         let mut source = DeafSource::default();
 
         let refusal = run_detonation(&plan, &mut source)
@@ -1443,7 +1438,7 @@ mod tests {
         ] {
             let mut plan = bare_plan(None);
             plan.images.guest = guest.to_owned();
-            plan.exec_consequence = has_plan.then(empty_exec_plan);
+            plan.realism.exec_consequence = has_plan.then(empty_exec_plan);
             assert_eq!(
                 check_exec_relay_capability(&plan).is_ok(),
                 ok,

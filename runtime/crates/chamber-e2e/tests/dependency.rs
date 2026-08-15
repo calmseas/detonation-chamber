@@ -69,8 +69,7 @@ fn plan(skill_dir: std::path::PathBuf, evidence: std::path::PathBuf) -> Detonati
         }],
         max_turns: 4,
         skill_dir: Some(skill_dir),
-        consequence: None,
-        exec_consequence: None,
+        realism: chamber_capture::RealismProfile::default(),
     }
 }
 

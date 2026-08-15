@@ -79,8 +79,7 @@ async fn main() -> ExitCode {
         skill_dir: None,
         // The scripted detonator refuses, as it always has. Consequence mode is
         // an instrument for live runs, and belongs to chamber-detonate-live.
-        consequence: None,
-        exec_consequence: None,
+        realism: chamber_capture::RealismProfile::default(),
     };
 
     match run_detonation(&plan, &mut turns).await {

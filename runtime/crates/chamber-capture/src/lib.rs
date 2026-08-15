@@ -38,6 +38,7 @@ pub mod dns;
 pub mod exec_consequence;
 #[cfg(feature = "observer")]
 pub mod proxy;
+pub mod realism;
 pub mod recorder;
 pub mod writer;
 
@@ -47,5 +48,6 @@ pub use consequence::{ConsequenceConfigError, ConsequencePlan, ConsequenceRespon
 pub use dns::DnsSink;
 #[cfg(feature = "observer")]
 pub use proxy::InterceptingProxy;
+pub use realism::RealismProfile;
 pub use recorder::Recorder;
 pub use writer::{LedgerFile, LedgerWriter, read_ledger};

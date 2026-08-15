@@ -185,10 +185,12 @@ async fn main() -> ExitCode {
         // more than just its markdown — so a bundled script is present in the
         // cell to run. A lone SKILL.md stages nothing new.
         skill_dir: skill_dir_of(&artefact_path),
-        consequence: consequence.clone(),
-        // Command-consequence is not yet wired into the live driver; only
-        // chamber-run's other entry points set this.
-        exec_consequence: None,
+        realism: chamber_capture::RealismProfile {
+            consequence: consequence.clone(),
+            // Command-consequence is not yet wired into the live driver; only
+            // chamber-run's other entry points set this.
+            exec_consequence: None,
+        },
     };
 
     eprintln!("chamber: live run, model {model_id}, up to {max_turns} turns");
