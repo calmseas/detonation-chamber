@@ -13,6 +13,12 @@ static void test_parses_flat_object(void) {
     assert(json_as_int64(json_object_get(v, "a"), &a) == 0 && a == 1);
     assert(strcmp(json_as_string(json_object_get(v, "b")), "two") == 0);
     assert(json_object_get(v, "c")->type == JSON_BOOL);
+    int flag = 0;
+    assert(json_as_bool(json_object_get(v, "c"), &flag) == 0 && flag == 1);
+    /* Wrong type (a number) and absent (no such key) both refuse, the same
+     * shape as json_as_int64/json_as_string on a mismatch. */
+    assert(json_as_bool(json_object_get(v, "a"), &flag) == -1);
+    assert(json_as_bool(json_object_get(v, "missing"), &flag) == -1);
     assert(json_object_get(v, "d")->type == JSON_NULL);
     assert(json_object_get(v, "missing") == NULL);
     json_free(v);

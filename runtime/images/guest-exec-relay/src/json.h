@@ -42,6 +42,12 @@ const char *json_as_string(json_value_t *v);
 /* Returns 0 and writes *out if `v` is a number with no fractional part
  * representable as int64_t; returns -1 otherwise. */
 int json_as_int64(json_value_t *v, int64_t *out);
+/* Returns 0 and writes *out (0 or 1) if `v` is a JSON bool; returns -1
+ * otherwise (including v == NULL, i.e. the key was absent) — a bool's own
+ * two values are both falsy in C, so callers that need to tell "absent" from
+ * "present and false" must check `json_object_get`'s result before calling
+ * this, the same pattern already used for json_as_int64. */
+int json_as_bool(json_value_t *v, int *out);
 
 /* Appends `s` to `buf` at offset `off` as the CONTENTS of a JSON string —
  * the surrounding quotes are the caller's — escaping every byte RFC 8259

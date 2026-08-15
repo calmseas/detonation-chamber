@@ -141,7 +141,26 @@ pub enum ExecVerb {
     /// not the requested one. That is inherent to running a different argv and
     /// is the honest trade for doing what the rule says; the alternative was
     /// doing something else quietly.
-    Substitute { replacement_argv: Vec<String> },
+    Substitute {
+        replacement_argv: Vec<String>,
+        /// When true, the traced command's own trailing arguments (argv[1..]
+        /// — never argv[0] itself, the command name being replaced) are
+        /// appended to `replacement_argv` at exec time, truncated (not
+        /// refused) at the guest's `EXEC_RELAY_MAX_ARGV` total. Off by
+        /// default, matching every existing rule's behaviour exactly:
+        /// `replacement_argv` alone is what runs.
+        ///
+        /// Exists for a wrapper program that needs the CALLER's own
+        /// arguments at runtime and cannot be given them any other way —
+        /// `replacement_argv` is fixed at plan-construction time, so a rule
+        /// wanting arbitrary per-invocation arguments (e.g. `ls`'s own flags
+        /// and path, unknown until the guest actually runs it) has no way to
+        /// name them in advance. Only the wrapper's own selector arguments
+        /// belong in `replacement_argv`; the real command's arguments ride
+        /// in via this flag.
+        #[serde(default)]
+        append_original_args: bool,
+    },
     /// Let the real command run; transform its captured output before the
     /// caller ever sees it. Literal substring find/replace in v1 — not
     /// regex, to keep the guest-side C matcher simple and injection-free.
@@ -480,7 +499,9 @@ impl ExecConsequencePlan {
                 }
             }
             match &rule.verb {
-                ExecVerb::Substitute { replacement_argv } => {
+                ExecVerb::Substitute {
+                    replacement_argv, ..
+                } => {
                     if replacement_argv.is_empty() {
                         return Err(ExecConsequenceConfigError::EmptyReplacementArgv(i));
                     }
@@ -724,6 +745,7 @@ mod tests {
                 },
                 verb: ExecVerb::Substitute {
                     replacement_argv: vec!["/opt/pkg/fake-pip".to_owned()],
+                    append_original_args: false,
                 },
             }],
             timeout_ms: 5_000,
@@ -990,6 +1012,7 @@ mod tests {
                 },
                 verb: ExecVerb::Substitute {
                     replacement_argv: elems.clone(),
+                    append_original_args: false,
                 },
             }],
             timeout_ms: 60_000,
@@ -1023,7 +1046,8 @@ mod tests {
                     name: "/bin/echo".to_owned()
                 },
                 verb: ExecVerb::Substitute {
-                    replacement_argv: too_many
+                    replacement_argv: too_many,
+                    append_original_args: false,
                 },
             })
             .validate()
@@ -1048,6 +1072,7 @@ mod tests {
             },
             verb: ExecVerb::Substitute {
                 replacement_argv: vec![at_limit.clone()],
+                append_original_args: false,
             },
         })
         .validate()
@@ -1096,6 +1121,7 @@ mod tests {
                 },
                 verb: ExecVerb::Substitute {
                     replacement_argv: vec![past],
+                    append_original_args: false,
                 },
             })
             .validate()

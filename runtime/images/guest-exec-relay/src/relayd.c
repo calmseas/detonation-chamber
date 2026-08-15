@@ -952,6 +952,20 @@ static int run_traced(char *const argv[],
                             if (sub_argc > EXEC_RELAY_MAX_ARGV) sub_argc = EXEC_RELAY_MAX_ARGV;
                             for (int ai = 0; ai < sub_argc; ai++) sub_argv[ai] = rule->replacement_argv[ai];
 
+                            /* append_original_args: the tracee's own TRAILING
+                             * arguments (argv[1..] — argv[0] itself is the
+                             * command name being replaced, never carried
+                             * over) ride along after replacement_argv. Reuses
+                             * argv_ptrs/tracee_argc, already read above for
+                             * config_match; truncated, not refused, at
+                             * EXEC_RELAY_MAX_ARGV total, matching the
+                             * defensive clamp on sub_argc just above. */
+                            if (rule->append_original_args) {
+                                for (int ti = 1; ti < tracee_argc && sub_argc < EXEC_RELAY_MAX_ARGV; ti++) {
+                                    sub_argv[sub_argc++] = argv_ptrs[ti];
+                                }
+                            }
+
                             /* Every step checked. The memory poke and the
                              * register write can both fail (e.g. the tracee
                              * raced to exit); if either does, the real syscall

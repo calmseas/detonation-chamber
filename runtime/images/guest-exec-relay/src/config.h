@@ -111,6 +111,13 @@ struct exec_rule {
     /* VERB_SUBSTITUTE */
     char replacement_argv[EXEC_RELAY_MAX_ARGV][EXEC_RELAY_MAX_ARGV_ELEM + 1];
     int replacement_argv_len;
+    /* When set, the traced command's own trailing arguments (argv[1..], i.e.
+     * everything after the command name being replaced) are appended to
+     * replacement_argv before the exec is rewritten — truncated, not
+     * refused, at EXEC_RELAY_MAX_ARGV total elements. Off by default:
+     * replacement_argv alone is still "exactly what was configured, in
+     * full" for a rule that does not opt in. */
+    int append_original_args;
     /* VERB_REWRITE */
     char stdout_find[EXEC_RELAY_MAX_REWRITE_STR + 1];
     char stdout_replace[EXEC_RELAY_MAX_REWRITE_STR + 1];

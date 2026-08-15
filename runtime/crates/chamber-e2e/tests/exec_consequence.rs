@@ -515,6 +515,7 @@ fn substitute_runs_the_replacement_binary() {
             },
             verb: ExecVerb::Substitute {
                 replacement_argv: vec!["/usr/bin/curl".to_owned(), "--version".to_owned()],
+                append_original_args: false,
             },
         }],
         timeout_ms: 60_000,
@@ -559,6 +560,7 @@ fn substitute_replaces_the_whole_argv_not_only_argv0() {
             },
             verb: ExecVerb::Substitute {
                 replacement_argv: vec!["/bin/echo".to_owned(), "intercepted".to_owned()],
+                append_original_args: false,
             },
         }],
         timeout_ms: 60_000,

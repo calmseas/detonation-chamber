@@ -56,6 +56,44 @@ static void test_loads_substitute_rule(void) {
     assert(strcmp(plan.rules[0].match_argv[1], "install") == 0);
     assert(plan.rules[0].verb == VERB_SUBSTITUTE);
     assert(strcmp(plan.rules[0].replacement_argv[0], "/opt/pkg/fake") == 0);
+    /* Absent from the JSON -> off, matching every rule written before this
+     * field existed exactly: replacement_argv alone is what runs. */
+    assert(plan.rules[0].append_original_args == 0);
+}
+
+static void test_loads_substitute_rule_with_append_original_args(void) {
+    const char *json =
+        "{\"rules\":[{\"name\":\"s\","
+        "\"match_argv\":{\"type\":\"argv0\",\"name\":\"ls\"},"
+        "\"verb\":{\"type\":\"substitute\",\"replacement_argv\":[\"/usr/local/bin/hide-entry\",\"ls\"],"
+        "\"append_original_args\":true}}]}";
+    struct exec_plan plan;
+    int rc = config_load_from_json(json, strlen(json), &plan);
+    assert(rc == 0);
+    assert(plan.rules[0].verb == VERB_SUBSTITUTE);
+    assert(plan.rules[0].replacement_argv_len == 2);
+    assert(strcmp(plan.rules[0].replacement_argv[0], "/usr/local/bin/hide-entry") == 0);
+    assert(strcmp(plan.rules[0].replacement_argv[1], "ls") == 0);
+    assert(plan.rules[0].append_original_args == 1);
+
+    /* Explicit false parses the same as absent. */
+    const char *json_false =
+        "{\"rules\":[{\"name\":\"s\","
+        "\"match_argv\":{\"type\":\"argv0\",\"name\":\"ls\"},"
+        "\"verb\":{\"type\":\"substitute\",\"replacement_argv\":[\"x\"],"
+        "\"append_original_args\":false}}]}";
+    assert(config_load_from_json(json_false, strlen(json_false), &plan) == 0);
+    assert(plan.rules[0].append_original_args == 0);
+
+    /* Present but the wrong JSON type is a hard parse error, not a silent
+     * default — matching every other typed field's discipline in this
+     * parser (json_as_int64's callers all refuse the same way). */
+    const char *json_wrong_type =
+        "{\"rules\":[{\"name\":\"s\","
+        "\"match_argv\":{\"type\":\"argv0\",\"name\":\"ls\"},"
+        "\"verb\":{\"type\":\"substitute\",\"replacement_argv\":[\"x\"],"
+        "\"append_original_args\":\"yes\"}}]}";
+    assert(config_load_from_json(json_wrong_type, strlen(json_wrong_type), &plan) == -1);
 }
 
 static void test_rejects_malformed_json(void) {
@@ -332,6 +370,7 @@ int main(void) {
     test_loads_empty_rules_with_defaults();
     test_loads_fabricate_rule();
     test_loads_substitute_rule();
+    test_loads_substitute_rule_with_append_original_args();
     test_rejects_malformed_json();
     test_matches_prefix();
     test_first_match_wins();

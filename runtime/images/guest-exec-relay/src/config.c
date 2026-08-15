@@ -52,6 +52,14 @@ static int load_verb(json_value_t *verb, struct exec_rule *rule) {
             }
         }
         rule->replacement_argv_len = (int)n;
+        json_value_t *append = json_object_get(verb, "append_original_args");
+        if (append) {
+            int flag = 0;
+            if (json_as_bool(append, &flag) != 0) return -1;
+            rule->append_original_args = flag;
+        } else {
+            rule->append_original_args = 0;
+        }
         return 0;
     }
     if (strcmp(type, "rewrite") == 0) {

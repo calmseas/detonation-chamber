@@ -356,3 +356,9 @@ int json_as_int64(json_value_t *v, int64_t *out) {
     *out = truncated;
     return 0;
 }
+
+int json_as_bool(json_value_t *v, int *out) {
+    if (!v || v->type != JSON_BOOL) return -1;
+    *out = v->u.boolean;
+    return 0;
+}
