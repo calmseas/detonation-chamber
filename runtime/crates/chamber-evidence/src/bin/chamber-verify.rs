@@ -30,7 +30,7 @@
 
 use std::process::ExitCode;
 
-use chamber_evidence::{BundleSeal, ChannelCoverage, OpenedBundle, Verdict, open};
+use chamber_evidence::{BundleSeal, ChannelCoverage, ObservationKind, OpenedBundle, Verdict, open};
 
 const VERIFIED: u8 = 0;
 const REFUSED: u8 = 1;
@@ -165,5 +165,32 @@ fn report(path: &str, opened: &OpenedBundle) {
             println!("  {} [{:?}]", gap.id, gap.cause);
             println!("      {}", gap.scope);
         }
+    }
+
+    // Inference accounting — what the run actually consumed, summed from the
+    // sealed per-call usage. Zero for a scripted run (no model, no billing);
+    // absent per-call usage (an older capture) simply contributes nothing.
+    let (mut calls, mut pt, mut ct, mut cached, mut reason, mut cost) =
+        (0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
+    for o in opened.ledger.entries() {
+        if let ObservationKind::InferenceCall { usage: Some(u), .. } = o.kind() {
+            calls += 1;
+            pt += u.prompt_tokens;
+            ct += u.completion_tokens;
+            cached += u.cached_tokens;
+            reason += u.reasoning_tokens;
+            cost += u.cost_micros;
+        }
+    }
+    if calls > 0 {
+        println!();
+        println!("inference accounting (sealed — the run's own consumption)");
+        println!("  {calls} call(s)");
+        println!("  input   {pt} tok ({cached} served from cache)");
+        println!("  output  {ct} tok ({reason} reasoning)");
+        println!(
+            "  cost    ${:.4} (provider-reported)",
+            cost as f64 / 1_000_000.0
+        );
     }
 }

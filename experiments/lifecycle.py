@@ -106,6 +106,26 @@ def build_workspace(dest: pathlib.Path) -> pathlib.Path:
     return dest
 
 
+def _run_cost_micros(run_dir: pathlib.Path) -> int:
+    """Sum the sealed per-call cost from a run's bundle. Zero if the bundle is
+    missing or carries no usage (an older capture)."""
+    bundle = run_dir / "bundle.json"
+    if not bundle.exists():
+        return 0
+    try:
+        led = json.loads(bundle.read_text()).get("ledger", {}).get("entries", [])
+    except (json.JSONDecodeError, OSError):
+        return 0
+    total = 0
+    for o in led:
+        # ObservationKind is internally tagged, so the variant lives at
+        # entry["kind"]["kind"] with its fields (incl. usage) alongside it.
+        k = o.get("kind", {})
+        if k.get("kind") == "inference_call":
+            total += (k.get("usage") or {}).get("cost_micros", 0)
+    return total
+
+
 def run(out_root: pathlib.Path, models: list[str], n: int) -> None:
     if not pathlib.Path(BIN).exists():
         sys.exit(f"live binary missing: {BIN}\nIs the scratch SSD attached? `cargo-targets status`")
@@ -133,9 +153,27 @@ def run(out_root: pathlib.Path, models: list[str], n: int) -> None:
             "CHAMBER_WALL_CLOCK": "300",
         }
     )
+    # Batch-level spend cap (dollars), on top of the per-run CHAMBER_MAX_SPEND the
+    # live binary already enforces. Zero/unset = no batch cap. Counts every sealed
+    # run under out_root, so a resumed batch continues the tally rather than
+    # restarting it.
+    batch_cap_micros = int(float(os.environ.get("CHAMBER_BATCH_MAX_SPEND", "0")) * 1_000_000)
+    spent_micros = sum(
+        _run_cost_micros(p.parent)
+        for p in out_root.glob("*/run-*/bundle.json")
+    )
+    if spent_micros:
+        print(f"batch spend so far (resumed): ${spent_micros / 1e6:.4f}")
+
     for model in models:
         label = model.replace("/", "_")
         for i in range(1, n + 1):
+            if batch_cap_micros and spent_micros >= batch_cap_micros:
+                print(
+                    f"BATCH BUDGET REACHED: ${spent_micros / 1e6:.4f} >= "
+                    f"${batch_cap_micros / 1e6:.2f} cap — stopping before {label} run-{i}."
+                )
+                return
             d = out_root / label / f"run-{i}"
             # Key the skip on the SEALED BUNDLE, not on `log`. `log` is opened before
             # the subprocess runs, so a crashed run leaves an empty one — keying on it
@@ -159,8 +197,13 @@ def run(out_root: pathlib.Path, models: list[str], n: int) -> None:
                 rc = subprocess.run(
                     [BIN, str(ws / "SKILL.md"), str(d)], env=env, stdout=fh, stderr=subprocess.STDOUT
                 )
-            print(f"{label} run-{i} exit={rc.returncode}")
-    print("ALL DONE")
+            cost = _run_cost_micros(d)
+            spent_micros += cost
+            print(
+                f"{label} run-{i} exit={rc.returncode} "
+                f"cost=${cost / 1e6:.4f} batch=${spent_micros / 1e6:.4f}"
+            )
+    print(f"ALL DONE — batch spend ${spent_micros / 1e6:.4f}")
 
 
 def _actions(run_dir: pathlib.Path) -> list[dict]:

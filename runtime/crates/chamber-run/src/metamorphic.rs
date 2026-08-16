@@ -364,6 +364,7 @@ mod tests {
                 model: "m".into(),
                 request_digest: chamber_evidence::Digest32([0; 32]),
                 response_digest: chamber_evidence::Digest32([0; 32]),
+                usage: None,
             })
             .is_none()
         );

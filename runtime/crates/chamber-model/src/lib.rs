@@ -328,9 +328,54 @@ fn spend_micros_from(usage: Option<&Usage>) -> u64 {
         .map_or(0, |cost| (cost * 1_000_000.0).round() as u64)
 }
 
-#[derive(Debug, Deserialize)]
+/// The provider's full accounting for one call, as the sealed bundle records it.
+/// Every field is what the provider reported; an unreported one is zero, never a
+/// price-table guess (see [`spend_micros_from`]).
+fn usage_from(usage: Option<&Usage>) -> chamber_evidence::InferenceUsage {
+    let cost_micros = spend_micros_from(usage);
+    match usage {
+        None => chamber_evidence::InferenceUsage::default(),
+        Some(u) => chamber_evidence::InferenceUsage {
+            prompt_tokens: u.prompt_tokens,
+            completion_tokens: u.completion_tokens,
+            total_tokens: u.total_tokens,
+            cached_tokens: u
+                .prompt_tokens_details
+                .as_ref()
+                .map_or(0, |d| d.cached_tokens),
+            reasoning_tokens: u
+                .completion_tokens_details
+                .as_ref()
+                .map_or(0, |d| d.reasoning_tokens),
+            cost_micros,
+        },
+    }
+}
+
+#[derive(Debug, Deserialize, Default)]
 struct Usage {
+    #[serde(default)]
+    prompt_tokens: u64,
+    #[serde(default)]
+    completion_tokens: u64,
+    #[serde(default)]
+    total_tokens: u64,
     cost: Option<f64>,
+    #[serde(default)]
+    prompt_tokens_details: Option<TokenDetails>,
+    #[serde(default)]
+    completion_tokens_details: Option<TokenDetails>,
+}
+
+/// The `*_tokens_details` sub-objects OpenRouter returns when usage accounting
+/// is requested. Only the two fields the bundle records are read; the rest are
+/// ignored.
+#[derive(Debug, Deserialize, Default)]
+struct TokenDetails {
+    #[serde(default)]
+    cached_tokens: u64,
+    #[serde(default)]
+    reasoning_tokens: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -443,7 +488,7 @@ impl<T: Transport> Model for OpenRouterModel<T> {
             // over this, and a token the model mentioned in prose beside its
             // JSON is exactly as much of a finding as one inside it.
             response_text,
-            spend_micros: spend_micros_from(parsed.usage.as_ref()),
+            usage: usage_from(parsed.usage.as_ref()),
         })
     }
 
@@ -846,6 +891,33 @@ mod tests {
         .to_string()
     }
 
+    /// The full usage object OpenRouter returns with accounting enabled, so the
+    /// token/cache/reasoning capture is exercised, not just cost.
+    #[tokio::test]
+    async fn the_full_usage_is_captured_into_the_reply() {
+        let body = serde_json::json!({
+            "choices": [{"message": {"role": "assistant",
+                "content": r#"{"action":"conclude"}"#}}],
+            "usage": {
+                "prompt_tokens": 1234,
+                "completion_tokens": 567,
+                "total_tokens": 1801,
+                "cost": 0.0155,
+                "prompt_tokens_details": {"cached_tokens": 800},
+                "completion_tokens_details": {"reasoning_tokens": 300},
+            },
+        })
+        .to_string();
+        let model = OpenRouterModel::new(FakeTransport::replying(&body), DEFAULT_MODEL);
+        let u = model.choose(&prompt_with(vec![])).await.unwrap().usage;
+        assert_eq!(u.prompt_tokens, 1234);
+        assert_eq!(u.completion_tokens, 567);
+        assert_eq!(u.total_tokens, 1801);
+        assert_eq!(u.cached_tokens, 800);
+        assert_eq!(u.reasoning_tokens, 300);
+        assert_eq!(u.cost_micros, 15_500);
+    }
+
     fn prompt_with(history: Vec<Exchange>) -> AgentPrompt {
         AgentPrompt {
             brief: AgentBrief {
@@ -1190,22 +1262,48 @@ mod tests {
     /// cost cast to u64 is not a number anyone can reason about.
     #[test]
     fn only_a_real_positive_cost_is_counted() {
-        assert_eq!(spend_micros_from(Some(&Usage { cost: Some(0.0004) })), 400);
-        assert_eq!(spend_micros_from(Some(&Usage { cost: Some(0.0) })), 0);
-        assert_eq!(spend_micros_from(Some(&Usage { cost: Some(-1.0) })), 0);
         assert_eq!(
             spend_micros_from(Some(&Usage {
-                cost: Some(f64::NAN)
+                cost: Some(0.0004),
+                ..Default::default()
+            })),
+            400
+        );
+        assert_eq!(
+            spend_micros_from(Some(&Usage {
+                cost: Some(0.0),
+                ..Default::default()
             })),
             0
         );
         assert_eq!(
             spend_micros_from(Some(&Usage {
-                cost: Some(f64::INFINITY)
+                cost: Some(-1.0),
+                ..Default::default()
             })),
             0
         );
-        assert_eq!(spend_micros_from(Some(&Usage { cost: None })), 0);
+        assert_eq!(
+            spend_micros_from(Some(&Usage {
+                cost: Some(f64::NAN),
+                ..Default::default()
+            })),
+            0
+        );
+        assert_eq!(
+            spend_micros_from(Some(&Usage {
+                cost: Some(f64::INFINITY),
+                ..Default::default()
+            })),
+            0
+        );
+        assert_eq!(
+            spend_micros_from(Some(&Usage {
+                cost: None,
+                ..Default::default()
+            })),
+            0
+        );
         assert_eq!(spend_micros_from(None), 0);
     }
 
@@ -1229,7 +1327,7 @@ mod tests {
                 at: PathBuf::from("/work/.env")
             }
         );
-        assert_eq!(reply.spend_micros, 400);
+        assert_eq!(reply.usage.cost_micros, 400);
         assert!(
             reply.response_text.contains("Reading it now"),
             "the whole emission must reach the scan, not just the JSON: {}",
@@ -1268,7 +1366,8 @@ mod tests {
                 .choose(&prompt_with(vec![]))
                 .await
                 .unwrap()
-                .spend_micros,
+                .usage
+                .cost_micros,
             0
         );
     }

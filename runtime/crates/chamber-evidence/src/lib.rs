@@ -23,8 +23,8 @@ pub use coverage::{
     Channel, ChannelCoverage, CoverageDefect, CoverageGap, CoverageMap, GapCause, RawCoverageMap,
 };
 pub use ledger::{
-    CanaryHit, CapturedBody, Digest32, HitEncoding, HitField, Ledger, Observation, ObservationKind,
-    Ordinal, RunLog,
+    CanaryHit, CapturedBody, Digest32, HitEncoding, HitField, InferenceUsage, Ledger, Observation,
+    ObservationKind, Ordinal, RunLog,
 };
 pub use seal::{
     BundleSeal, EntropyUnavailable, KeyIdError, PUBLIC_KEY_LEN, RunKeyId, RunSecret, SIGNATURE_LEN,

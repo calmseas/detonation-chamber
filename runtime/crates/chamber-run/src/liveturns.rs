@@ -25,7 +25,9 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use chamber_capture::CanarySet;
-use chamber_evidence::{CanaryHit, Channel, Digest32, HitField, ObservationKind, RunLog};
+use chamber_evidence::{
+    CanaryHit, Channel, Digest32, HitField, InferenceUsage, ObservationKind, RunLog,
+};
 use sha2::{Digest as _, Sha256};
 use tokio::time::Instant;
 
@@ -209,14 +211,15 @@ impl AgentPrompt {
 /// D9, and the digest that identifies it in the bundle. Both happen host-side
 /// and neither keeps the text.
 ///
-/// `spend_micros` is what the call actually cost, reported by the provider. The
-/// driver cannot estimate it — a price table would turn a bound the design
-/// states as MUST into an approximation.
+/// `usage` is what the call actually cost and consumed, reported by the
+/// provider. The driver cannot estimate it — a price table would turn a bound
+/// the design states as MUST into an approximation. `usage.cost_micros` is what
+/// the spend bound counts; the token/cache fields are the sealed accounting.
 #[derive(Clone, Debug)]
 pub struct ModelReply {
     pub choice: ModelChoice,
     pub response_text: String,
-    pub spend_micros: u64,
+    pub usage: InferenceUsage,
 }
 
 /// Why a model produced no choice.
@@ -282,6 +285,9 @@ pub struct InferenceRecord {
     pub request_digest: Digest32,
     pub response_digest: Digest32,
     pub response_hits: Vec<CanaryHit>,
+    /// What the provider billed for this call. Sealed into the bundle's
+    /// `InferenceCall` observation.
+    pub usage: InferenceUsage,
 }
 
 fn digest_of(bytes: &[u8]) -> Digest32 {
@@ -312,6 +318,7 @@ pub fn record_inference_calls(log: &mut RunLog, calls: &[InferenceRecord]) {
                 model: call.model.clone(),
                 request_digest: call.request_digest,
                 response_digest: call.response_digest,
+                usage: Some(call.usage),
             },
             call.response_hits.clone(),
         );
@@ -546,8 +553,26 @@ impl TurnSource for LiveTurns {
         self.last_prompt = Some(prompt);
 
         // Billed whether or not the answer is used, because it was.
-        self.spent_micros = self.spent_micros.saturating_add(reply.spend_micros);
+        self.spent_micros = self.spent_micros.saturating_add(reply.usage.cost_micros);
         self.turns_taken += 1;
+
+        // Progressive cost visibility: emit this turn's accounting to stderr as
+        // it happens, with the running total against the spend bound, so a live
+        // run can be watched — and stopped — before it seals. Written to stderr
+        // so it never lands in the bundle or on stdout beside a bundle path.
+        let u = &reply.usage;
+        eprintln!(
+            "chamber: turn {} — in {} (cache {}) out {} (reasoning {}) tok, ${:.4}; \
+             run ${:.4} / ${:.2} budget",
+            self.turns_taken,
+            u.prompt_tokens,
+            u.cached_tokens,
+            u.completion_tokens,
+            u.reasoning_tokens,
+            u.cost_micros as f64 / 1_000_000.0,
+            self.spent_micros as f64 / 1_000_000.0,
+            self.budget.max_spend_micros() as f64 / 1_000_000.0,
+        );
 
         // Only the model's own emission is scanned. Under raw output the
         // prompt already carries the harness-supplied canary in fed-back
@@ -564,6 +589,7 @@ impl TurnSource for LiveTurns {
             request_digest,
             response_digest: digest_of(reply.response_text.as_bytes()),
             response_hits,
+            usage: reply.usage,
         });
         if let Some(record) = self.calls.last() {
             self.dump_turn(turn_ordinal, record, &canonical_bytes, &reply.response_text);
@@ -663,7 +689,10 @@ mod tests {
         ModelReply {
             choice,
             response_text: text.to_owned(),
-            spend_micros,
+            usage: InferenceUsage {
+                cost_micros: spend_micros,
+                ..Default::default()
+            },
         }
     }
 
@@ -1071,6 +1100,7 @@ mod tests {
             request_digest: digest_of(b"asked"),
             response_digest: digest_of(b"answered"),
             response_hits: hits,
+            usage: InferenceUsage::default(),
         }
     }
 

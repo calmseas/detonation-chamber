@@ -768,6 +768,7 @@ mod activity_tests {
                 model: "test-model".to_owned(),
                 request_digest: chamber_evidence::Digest32([0u8; 32]),
                 response_digest: chamber_evidence::Digest32([0u8; 32]),
+                usage: None,
             },
             Channel::ExecConsequence => ObservationKind::ExecConsequence {
                 turn_id: "turn-0".to_owned(),
@@ -2184,6 +2185,7 @@ mod shape_tests {
                 model: "m".to_owned(),
                 request_digest: chamber_evidence::Digest32([0; 32]),
                 response_digest: chamber_evidence::Digest32([1; 32]),
+                usage: None,
             },
             vec![],
         );

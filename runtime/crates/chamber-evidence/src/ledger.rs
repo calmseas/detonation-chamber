@@ -140,12 +140,51 @@ pub enum ObservationKind {
         model: String,
         request_digest: Digest32,
         response_digest: Digest32,
+        /// What the provider billed for this call: token counts, cache reuse,
+        /// reasoning tokens, and cost. Optional and skipped-when-absent so
+        /// bundles written before usage capture existed round-trip byte-for-byte
+        /// (the same schema string, additively evolved — see
+        /// [`crate::bundle::SCHEMA`]). Present on any live run written by a build
+        /// that captures it; absent for a scripted run, which bills nothing.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        usage: Option<InferenceUsage>,
     },
     /// An entry this build does not understand.
     ///
     /// Retained rather than dropped. A reader that silently discards what it
     /// cannot parse turns a newer capture layer's finding into no finding.
     Unrecognised { tag: String, raw: serde_json::Value },
+}
+
+/// What the provider billed for one inference call.
+///
+/// The provider is the authority — every field is what it reported, never an
+/// estimate from a price table (a run's own accounting must be measured, like
+/// everything else the bundle seals). `cost_micros` is USD micros; the token
+/// fields are counts. A field the provider did not report is zero, not a guess.
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Serialize, Deserialize, Default)]
+pub struct InferenceUsage {
+    /// Input tokens billed (the full re-sent context, not a per-turn delta).
+    #[serde(default)]
+    pub prompt_tokens: u64,
+    /// Output tokens billed.
+    #[serde(default)]
+    pub completion_tokens: u64,
+    /// Total tokens, as the provider reported it (not necessarily prompt +
+    /// completion — some providers count differently).
+    #[serde(default)]
+    pub total_tokens: u64,
+    /// Prompt tokens served from cache rather than re-billed at full rate. The
+    /// cache changes what a turn costs, never what the model is shown.
+    #[serde(default)]
+    pub cached_tokens: u64,
+    /// Reasoning tokens billed as output but not present in the response text
+    /// (hidden chain-of-thought on reasoning models).
+    #[serde(default)]
+    pub reasoning_tokens: u64,
+    /// What the provider said the call cost, in USD micros.
+    #[serde(default)]
+    pub cost_micros: u64,
 }
 
 /// One thing that happened at the boundary.
@@ -329,6 +368,49 @@ impl Ledger {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The additive-evolution contract: an `InferenceCall` with no usage
+    /// (a bundle written before usage capture existed, or a scripted run)
+    /// serialises WITHOUT a `usage` key, so its canonical bytes are unchanged
+    /// and the seal still verifies. A call WITH usage carries it and round-trips.
+    #[test]
+    fn inference_usage_is_skipped_when_absent_and_carried_when_present() {
+        let without = ObservationKind::InferenceCall {
+            model: "m".into(),
+            request_digest: Digest32([0; 32]),
+            response_digest: Digest32([1; 32]),
+            usage: None,
+        };
+        let json = serde_json::to_string(&without).unwrap();
+        assert!(
+            !json.contains("usage"),
+            "an absent usage must not serialise a key: {json}"
+        );
+        assert_eq!(
+            serde_json::from_str::<ObservationKind>(&json).unwrap(),
+            without
+        );
+
+        let with = ObservationKind::InferenceCall {
+            model: "m".into(),
+            request_digest: Digest32([0; 32]),
+            response_digest: Digest32([1; 32]),
+            usage: Some(InferenceUsage {
+                prompt_tokens: 10,
+                completion_tokens: 5,
+                total_tokens: 15,
+                cached_tokens: 4,
+                reasoning_tokens: 2,
+                cost_micros: 1234,
+            }),
+        };
+        let json = serde_json::to_string(&with).unwrap();
+        assert!(json.contains("cost_micros"));
+        assert_eq!(
+            serde_json::from_str::<ObservationKind>(&json).unwrap(),
+            with
+        );
+    }
 
     fn drop_of(count: u64) -> ObservationKind {
         ObservationKind::PacketDrop {
