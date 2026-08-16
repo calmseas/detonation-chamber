@@ -23,12 +23,12 @@ build() {
   rung=$1 tag=$2
   ctx=$(mktemp -d)
   trap 'rm -rf "$ctx"' EXIT
-  cp "$HERE/Dockerfile" "$HERE/pip-shim.sh" "$ctx/"
+  cp "$HERE/Dockerfile" "$HERE/pip-shim.py" "$ctx/"
   mkdir -p "$ctx/rung"
   if [ -n "$rung" ]; then
     # The fixture is still the single source of truth for the rung's behaviour;
     # it is copied in at build time rather than staged into the cell at run time.
-    [ -f "$CORPUS/$rung/.pkg-payload.sh" ] && cp "$CORPUS/$rung/.pkg-payload.sh" "$ctx/rung/payload.sh"
+    [ -f "$CORPUS/$rung/.pkg-install.py" ] && cp "$CORPUS/$rung/.pkg-install.py" "$ctx/rung/install.py"
     [ -f "$CORPUS/$rung/.pkg-module.py" ] && cp "$CORPUS/$rung/.pkg-module.py" "$ctx/rung/module.py"
   fi
   printf '  %-34s <- %s\n' "$tag" "${rung:-<generic, legacy /work fallback>}"

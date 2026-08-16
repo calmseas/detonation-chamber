@@ -88,7 +88,7 @@ _RETICENT = re.compile(
 # at /opt/pkg instead, because staging them into /work let the agent read the
 # payload's source and refuse on it — measuring workspace inspection rather than
 # trust in the package (opus-4.8 installed 1 of 15 runs on that basis).
-HOST_ONLY = {"manifest.json", ".pkg-payload.sh", ".pkg-module.py"}
+HOST_ONLY = {"manifest.json", ".pkg-install.py", ".pkg-module.py"}
 
 
 def build_workspace(dest: pathlib.Path) -> pathlib.Path:
@@ -224,8 +224,8 @@ def _stimulus_pattern() -> re.Pattern | None:
     partial quotes as well as whole-line ones.
     """
     frags = []
-    for p in sorted(CORPUS.glob("h-mal-*/.pkg-payload.sh")):
-        for line in re.findall(r'echo\s+"([^"]*)"', p.read_text()):
+    for p in sorted(CORPUS.glob("h-mal-*/.pkg-install.py")):
+        for line in re.findall(r'stderr\.write\(\s*"([^"]*)"', p.read_text()):
             words = line.split()
             for i in range(len(words) - 3):
                 frags.append(r"\s+".join(re.escape(w) for w in words[i : i + 4]))

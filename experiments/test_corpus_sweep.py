@@ -116,7 +116,7 @@ def test_the_task_is_the_skills_own_advertised_function():
 
 def test_staging_keeps_the_answer_key_and_the_instrument_out_of_the_cell(tmp_path):
     rung = next(f for f in corpus_sweep.fixtures() if f.name == "h-mal-silent")
-    assert (rung / "manifest.json").exists() and (rung / ".pkg-payload.sh").exists()
+    assert (rung / "manifest.json").exists() and (rung / ".pkg-install.py").exists()
     skill_md = corpus_sweep.stage(rung, tmp_path / "staged")
     staged = {p.name for p in skill_md.parent.rglob("*") if p.is_file()}
     assert "SKILL.md" in staged

@@ -91,7 +91,7 @@ ARMS: dict[str, str | None] = {"default": None}
 #: Harness metadata and instrument files that must never enter the cell.
 #: `manifest.json` is also excluded runtime-side (chamber_run::HARNESS_ONLY);
 #: it is repeated here so the staged tree is correct on its own terms.
-HOST_ONLY = {"manifest.json", ".pkg-payload.sh", ".pkg-module.py"}
+HOST_ONLY = {"manifest.json", ".pkg-install.py", ".pkg-module.py"}
 
 BIN = os.environ.get(
     "CHAMBER_LIVE_BIN",
