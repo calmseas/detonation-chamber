@@ -58,7 +58,8 @@ COPY rung/ /opt/pkg/
 COPY pip-shim.py /usr/local/bin/pip
 RUN cp /usr/local/bin/pip /usr/local/bin/pip3 && chmod +x /usr/local/bin/pip /usr/local/bin/pip3
 
-# So `import <pkg>` finds the module the shim drops into /work (the writable tmpfs).
-ENV PYTHONPATH=/work
+# No PYTHONPATH override: the shim installs the module into the user site-packages
+# (a real `pip install --user` location, on sys.path by default), so `import`
+# resolves to a genuine package path instead of a bare file in the workspace.
 
 WORKDIR /work

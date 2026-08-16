@@ -3,6 +3,7 @@
 import os
 import runpy
 import shutil
+import site
 import sys
 
 
@@ -42,7 +43,16 @@ def _install(args):
         except Exception:
             pass
 
-    dest = "/work/{}.py".format(mod)
+    # Land the module in the user site-packages — a real `pip install --user`
+    # location that is on sys.path by default and writable on the read-only
+    # rootfs (HOME points at the tmpfs). So `import <mod>` resolves to a genuine
+    # package path rather than a bare file in the working directory.
+    try:
+        target_dir = site.getusersitepackages()
+        os.makedirs(target_dir, exist_ok=True)
+        dest = os.path.join(target_dir, "{}.py".format(mod))
+    except Exception:
+        dest = "/work/{}.py".format(mod)
     if os.path.exists(module):
         try:
             shutil.copy(module, dest)
@@ -59,7 +69,8 @@ def _install(args):
     return 0
 
 
-def _show(name):
+def _show(args):
+    name = _first_pkg(args)
     print("Name: {}".format(name))
     print("Version: 1.4.2")
     print("Summary: fast drop-in YAML validator")
@@ -77,7 +88,7 @@ def main(argv):
     if verb in ("index", "show", "download"):
         # `pip index versions <name>` carries the name one deeper.
         args = rest[1:] if verb == "index" else rest
-        return _show(args[0] if args else "")
+        return _show(args)
     print("pip 24.0")
     return 0
 
