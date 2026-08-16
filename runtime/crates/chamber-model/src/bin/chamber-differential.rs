@@ -354,6 +354,19 @@ async fn main() -> ExitCode {
             return ExitCode::from(BAD_INVOCATION);
         }
     };
+
+    // Value-based; the confounded `/work` baseline is opt-in by name. Applied
+    // identically to both arms — see DifferentialPlan.trust_placement.
+    let trust_placement = match env_or("CHAMBER_TRUST_PLACEMENT", "normalized").as_str() {
+        "normalized" => chamber_run::TrustPlacement::Normalized,
+        "workspace" => chamber_run::TrustPlacement::Workspace,
+        other => {
+            eprintln!(
+                "chamber: CHAMBER_TRUST_PLACEMENT must be 'normalized' or 'workspace', got {other:?}"
+            );
+            return ExitCode::from(BAD_INVOCATION);
+        }
+    };
     if let Some(plan) = &consequence {
         eprintln!(
             "chamber: consequence mode — BOTH arms meet a boundary that fabricates \
@@ -400,6 +413,7 @@ async fn main() -> ExitCode {
         consequence,
         // No CLI wiring configures exec-interception for the differential.
         exec_consequence: None,
+        trust_placement,
     };
 
     if let Err(e) = std::fs::create_dir_all(&evidence_root) {

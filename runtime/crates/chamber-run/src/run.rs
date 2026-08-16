@@ -158,6 +158,28 @@ pub struct PlantedCanary {
     pub var: String,
 }
 
+/// Where and how the per-run CA is placed in the guest, and thus how visible it
+/// is to the artefact.
+///
+/// The boundary's MITM needs the guest to trust the per-run CA; the only
+/// question is placement. `Normalized` installs it the way real corporate
+/// TLS-inspecting infrastructure does; `Workspace` is the older
+/// `/work/chamber-ca.pem` placement, retained as the confounded baseline whose
+/// visible artefact was measured (paper §6.5) as a tell. See
+/// `docs/superpowers/specs/2026-08-16-ca-normalization-trust-placement-design.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TrustPlacement {
+    /// The per-run CA is installed into the guest's system trust store under a
+    /// corporate-proxy identity: no `/work` file, no anomalous name, and only
+    /// the two embedded-bundle runtimes steered — at the standard system bundle
+    /// path. The default.
+    #[default]
+    Normalized,
+    /// The per-run CA is written to `/work/chamber-ca.pem` and four env vars
+    /// point at it. Today's behaviour, opt-in, the confounded baseline.
+    Workspace,
+}
+
 /// Everything one run needs.
 #[derive(Debug, Clone)]
 pub struct DetonationPlan {
@@ -178,6 +200,9 @@ pub struct DetonationPlan {
     /// [`chamber_capture::RealismProfile`] for what each half does and how
     /// `exec_consequence` is validated against the guest image.
     pub realism: chamber_capture::RealismProfile,
+    /// Where the per-run CA is placed in the guest. Defaults to
+    /// [`TrustPlacement::Normalized`].
+    pub trust_placement: TrustPlacement,
 }
 
 /// Why no run happened.
@@ -293,6 +318,12 @@ pub struct RunEpilogue {
     /// is a lead to confirm. It does not close `gap.filesystem-channel`, which is
     /// about sealed runtime observation.
     pub work_diff: crate::worksnapshot::WorkDiff,
+    /// Which trust placement this run used. Recorded here rather than in the
+    /// sealed bundle deliberately: unlike a canary crossing or the exec-relay's
+    /// disclosure, the placement is an operator-set experimental condition with
+    /// no untrusted party forging it, so it belongs at the harness-report
+    /// altitude, not in the tamper-evident core.
+    pub trust_placement: TrustPlacement,
 }
 
 /// Destroys whatever was raised if arming does not complete.
@@ -423,12 +454,39 @@ pub async fn run_detonation(
     )
     .map_err(|e| ArmingRefusal::Chamber(e.to_string()))?;
     arming.cell = Some(cell);
-    arming
-        .cell
-        .as_ref()
-        .expect("just set")
-        .write_file(&sealed_env.anchor_path, sealed_env.ca_pem.as_bytes())
-        .map_err(|e| ArmingRefusal::Chamber(format!("placing the trust anchor: {e}")))?;
+    {
+        let cell = arming.cell.as_ref().expect("just set");
+        let ca_bytes = sealed_env.ca_pem.as_bytes();
+        match &sealed_env.install {
+            TrustInstall::Workspace { anchor_path } => {
+                cell.write_file(anchor_path, ca_bytes).map_err(|e| {
+                    ArmingRefusal::Chamber(format!("placing the trust anchor: {e}"))
+                })?;
+            }
+            TrustInstall::Normalized { dropin_path } => {
+                // Drop the fresh CA into the (tmpfs) drop-in dir, then rebuild
+                // the system trust store from the read-only mozilla source
+                // (145) plus our drop-in (1). Fail-closed: a normalized run that
+                // cannot establish trust must not proceed, or the boundary would
+                // see only failed handshakes rather than decrypted egress.
+                cell.write_file(dropin_path, ca_bytes).map_err(|e| {
+                    ArmingRefusal::Chamber(format!("placing the trust anchor: {e}"))
+                })?;
+                let out = cell
+                    .exec(&["update-ca-certificates"], OP_WINDOW)
+                    .map_err(|e| {
+                        ArmingRefusal::Chamber(format!("rebuilding the trust store: {e}"))
+                    })?;
+                if !out.ok() {
+                    return Err(ArmingRefusal::Chamber(format!(
+                        "update-ca-certificates exited {:?}: {}",
+                        out.status,
+                        out.stderr.trim()
+                    )));
+                }
+            }
+        }
+    }
 
     // Whether the engine will hand back what it captured, asked NOW rather than
     // after the run.
@@ -699,6 +757,7 @@ pub async fn run_detonation(
         trace,
         turns_taken,
         work_diff,
+        trust_placement: plan.trust_placement,
     })
 }
 
@@ -868,9 +927,22 @@ fn arm_warden(plan: &DetonationPlan, fabric: &NetFabric) -> Result<ObservedWarde
     Ok(warden)
 }
 
+/// What the arming step must do, after the cell is up, to place the per-run CA
+/// — the post-start half of the trust placement the sealed env's static
+/// bindings and tmpfs mounts set up.
+enum TrustInstall {
+    /// Write the cert to `anchor_path` (`/work/chamber-ca.pem`). Env vars
+    /// already point at it.
+    Workspace { anchor_path: PathBuf },
+    /// Write the cert into the drop-in dir, then rebuild the system trust store.
+    /// The writable tmpfs mounts and the two steered env vars are already on the
+    /// sealed env.
+    Normalized { dropin_path: PathBuf },
+}
+
 struct CellEnvironment {
     env: chamber_isolation::SealedEnv,
-    anchor_path: PathBuf,
+    install: TrustInstall,
     ca_pem: String,
 }
 
@@ -919,9 +991,15 @@ fn seal_cell_environment(
     if !ca_pem.contains("BEGIN CERTIFICATE") {
         return Err("the observer produced no CA certificate".to_owned());
     }
+    build_cell_env(plan, ca_pem)
+}
 
+/// The Container-free half of [`seal_cell_environment`]: everything after the CA
+/// bytes are in hand. Split out specifically so the trust-placement branch is
+/// testable without a real `Container`, the same reason
+/// [`apply_exec_consequence_env`] is.
+fn build_cell_env(plan: &DetonationPlan, ca_pem: String) -> Result<CellEnvironment, String> {
     let guest_root = GuestRoot::at("/work");
-    let anchor_path = PathBuf::from("/work/chamber-ca.pem");
 
     let mut draft = EnvDraft::empty();
     draft
@@ -929,9 +1007,29 @@ fn seal_cell_environment(
         .map_err(|e| e.to_string())?;
     // Before any other binding: a later variable that would re-point trust is
     // then already a duplicate-name error rather than a silent override.
-    draft
-        .place_trust_anchor(&anchor_path)
-        .map_err(|e| e.to_string())?;
+    let install = match plan.trust_placement {
+        TrustPlacement::Workspace => {
+            let anchor_path = PathBuf::from("/work/chamber-ca.pem");
+            draft
+                .place_trust_anchor(&anchor_path)
+                .map_err(|e| e.to_string())?;
+            TrustInstall::Workspace { anchor_path }
+        }
+        TrustPlacement::Normalized => {
+            // Make the system trust store writable on the read-only rootfs, and
+            // steer only the embedded-bundle runtimes at the standard bundle
+            // path. The cert install itself (drop-in + update-ca-certificates)
+            // happens after the cell is up — see the arming step.
+            draft.mount_writable(std::path::Path::new("/etc/ssl/certs"));
+            draft.mount_writable(std::path::Path::new("/usr/local/share/ca-certificates"));
+            draft.steer_managed_trust().map_err(|e| e.to_string())?;
+            TrustInstall::Normalized {
+                dropin_path: PathBuf::from(
+                    "/usr/local/share/ca-certificates/corporate-proxy-ca.crt",
+                ),
+            }
+        }
+    };
 
     let proxy = Rationale {
         reason: "the artefact's egress must go through the observer to be seen",
@@ -968,7 +1066,7 @@ fn seal_cell_environment(
     let env = draft.seal(&placements).map_err(|e| e.to_string())?;
     Ok(CellEnvironment {
         env,
-        anchor_path,
+        install,
         ca_pem,
     })
 }
@@ -1180,7 +1278,67 @@ mod tests {
                 consequence,
                 exec_consequence: None,
             },
+            trust_placement: TrustPlacement::default(),
         }
+    }
+
+    // ---- trust placement --------------------------------------------------
+
+    /// The default (`Normalized`) placement declares the two writable trust-store
+    /// tmpfs mounts, steers the two embedded-bundle runtimes at the standard
+    /// bundle, and installs via the drop-in dir — with no `/work` anchor and no
+    /// `SSL_CERT_FILE`.
+    #[test]
+    fn normalized_plan_declares_trust_tmpfs_and_managed_steering() {
+        let mut plan = bare_plan(None);
+        plan.trust_placement = TrustPlacement::Normalized;
+        let cell_env = build_cell_env(
+            &plan,
+            "-----BEGIN CERTIFICATE-----\nx\n-----END CERTIFICATE-----\n".to_owned(),
+        )
+        .expect("build env");
+
+        assert!(matches!(
+            cell_env.install,
+            TrustInstall::Normalized { ref dropin_path }
+                if dropin_path == std::path::Path::new(
+                    "/usr/local/share/ca-certificates/corporate-proxy-ca.crt")
+        ));
+        assert_eq!(
+            cell_env.env.extra_tmpfs(),
+            &[
+                PathBuf::from("/etc/ssl/certs"),
+                PathBuf::from("/usr/local/share/ca-certificates"),
+            ]
+        );
+        assert!(cell_env.env.contains_binding("REQUESTS_CA_BUNDLE"));
+        assert!(cell_env.env.contains_binding("NODE_EXTRA_CA_CERTS"));
+        assert!(!cell_env.env.contains_binding("SSL_CERT_FILE"));
+        assert!(!cell_env.env.contains_binding("CURL_CA_BUNDLE"));
+    }
+
+    /// The opt-in `Workspace` placement is today's behaviour: the `/work` anchor
+    /// and the four steering vars, and no extra tmpfs.
+    #[test]
+    fn workspace_plan_places_the_work_anchor() {
+        let mut plan = bare_plan(None);
+        plan.trust_placement = TrustPlacement::Workspace;
+        let cell_env = build_cell_env(
+            &plan,
+            "-----BEGIN CERTIFICATE-----\nx\n-----END CERTIFICATE-----\n".to_owned(),
+        )
+        .expect("build env");
+
+        assert!(matches!(
+            cell_env.install,
+            TrustInstall::Workspace { ref anchor_path }
+                if anchor_path == std::path::Path::new("/work/chamber-ca.pem")
+        ));
+        assert!(cell_env.env.extra_tmpfs().is_empty());
+        assert!(cell_env.env.contains_binding("SSL_CERT_FILE"));
+        assert!(cell_env.env.contains_binding("CURL_CA_BUNDLE"));
+        assert!(cell_env.env.contains_binding("REQUESTS_CA_BUNDLE"));
+        assert!(cell_env.env.contains_binding("NODE_EXTRA_CA_CERTS"));
     }
 
     /// An ordinary run must leave the observer with nothing to find, so it

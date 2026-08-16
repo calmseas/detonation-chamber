@@ -164,6 +164,20 @@ async fn main() -> ExitCode {
         }
     };
 
+    // Value-based, not presence-based: the realistic behaviour is the default,
+    // and the confounded `/work` baseline must be asked for by name. An
+    // unrecognised value is a bad invocation, not a silent fallback.
+    let trust_placement = match env_or("CHAMBER_TRUST_PLACEMENT", "normalized").as_str() {
+        "normalized" => chamber_run::TrustPlacement::Normalized,
+        "workspace" => chamber_run::TrustPlacement::Workspace,
+        other => {
+            eprintln!(
+                "chamber: CHAMBER_TRUST_PLACEMENT must be 'normalized' or 'workspace', got {other:?}"
+            );
+            return ExitCode::from(BAD_INVOCATION);
+        }
+    };
+
     let plan = DetonationPlan {
         images: ImageTags {
             capture: env_or("CHAMBER_IMAGE_CAPTURE", "chamber-capture:test"),
@@ -190,6 +204,7 @@ async fn main() -> ExitCode {
             // Command-consequence is not wired into the live driver.
             exec_consequence: None,
         },
+        trust_placement,
     };
 
     eprintln!("chamber: live run, model {model_id}, up to {max_turns} turns");

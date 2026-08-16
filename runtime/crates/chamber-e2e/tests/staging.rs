@@ -111,6 +111,9 @@ fn a_bundled_script_is_staged_and_detonates() {
         // The containment properties this suite asserts are the ones that must
         // hold on the DEFAULT boundary, which refuses.
         realism: chamber_capture::RealismProfile::default(),
+        // Pinned to the /work placement this suite was written and verified
+        // against; the Normalized default is exercised by tests/trust_placement.rs.
+        trust_placement: chamber_run::TrustPlacement::Workspace,
     };
 
     let ep = block_on(run_detonation(&plan, &mut turns)).unwrap_or_else(|e| panic!("{e}"));

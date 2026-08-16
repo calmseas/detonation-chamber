@@ -2395,6 +2395,9 @@ pub struct DifferentialPlan {
     /// other without, the subtraction would attribute the relay's own effect on
     /// command behaviour to the candidate. `None` is "no exec interception".
     pub exec_consequence: Option<chamber_capture::exec_consequence::ExecConsequencePlan>,
+    /// The trust placement, applied identically to both arms — like
+    /// `consequence`, part of the shared environment, not the artefact.
+    pub trust_placement: crate::run::TrustPlacement,
 }
 
 /// Why no differential happened.
@@ -2523,6 +2526,9 @@ fn arm_detonation_plan(
             // behaviour as the artefact's.
             exec_consequence: plan.exec_consequence.clone(),
         },
+        // Same for both arms — the trust placement is part of the shared
+        // environment, not the artefact.
+        trust_placement: plan.trust_placement,
     }
 }
 
@@ -2646,6 +2652,7 @@ mod plan_tests {
             max_turns: 4,
             consequence: None,
             exec_consequence: None,
+            trust_placement: crate::run::TrustPlacement::default(),
         }
     }
 

@@ -87,6 +87,7 @@ fn a_plan(skill_dir: PathBuf, evidence: PathBuf) -> DetonationPlan {
         max_turns: 6,
         skill_dir: Some(skill_dir),
         realism: chamber_capture::RealismProfile::default(),
+        trust_placement: chamber_run::TrustPlacement::Workspace,
     }
 }
 

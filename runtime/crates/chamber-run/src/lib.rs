@@ -86,7 +86,7 @@ pub use metamorphic::{MetamorphicArm, MetamorphicLead, metamorphic_leads};
 pub use probe::{MIN_ARMS, ProbeArm, ProbeOutcome, ProbePlan, ProbeRefusal, arm_label, run_probe};
 pub use run::{
     ArmingRefusal, DetonationPlan, EXEC_RELAY_GUEST_IMAGE, ImageTags, PlantedCanary, RunEpilogue,
-    run_detonation,
+    TrustPlacement, run_detonation,
 };
 pub use staging::{CellFiles, StagingError, skill_dir_beside, stage_skill_dir};
 pub use supervisor::{Supervision, SupervisorConfig, supervise_run};

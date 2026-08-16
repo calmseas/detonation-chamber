@@ -594,6 +594,59 @@ fn substitute_replaces_the_whole_argv_not_only_argv0() {
     );
 }
 
+/// `append_original_args: true` carries the CALLER's own trailing arguments onto
+/// the replacement — the one behavioural test for the flag (the config parse is
+/// unit-tested in `test_config.c`, but `relayd.c`, which does the appending, is
+/// aarch64-only and compiled by no unit binary). Without it a wrapper rule can
+/// only ever run a fixed argv, silently dropping whatever the caller asked for.
+#[test]
+fn substitute_appends_the_callers_original_arguments() {
+    let Some(_engine) = require_containers() else {
+        return;
+    };
+    let _serialised = chamber_subnet_lock();
+
+    // The requested command name is replaced by /bin/echo, and the caller's own
+    // trailing args (`a b c`) ride along after the configured `wrapped`.
+    let plan = ExecConsequencePlan {
+        rules: vec![ExecConsequenceRule {
+            name: "append".to_owned(),
+            match_argv: ArgvMatcher::Argv0 {
+                name: "/bin/false".to_owned(),
+            },
+            verb: ExecVerb::Substitute {
+                replacement_argv: vec!["/bin/echo".to_owned(), "wrapped".to_owned()],
+                append_original_args: true,
+            },
+        }],
+        timeout_ms: 60_000,
+        max_concurrent_handlers: 32,
+    };
+    let cell = start_cell(&plan);
+    cell.start().expect("start");
+    std::thread::sleep(Duration::from_millis(300));
+
+    let out = cell
+        .exec(&["stub", "/bin/false", "a", "b", "c"], OP_WINDOW)
+        .expect("exec");
+    assert_eq!(out.status, Some(0));
+    assert_eq!(
+        out.stdout, "wrapped a b c\n",
+        "append_original_args did not carry the caller's trailing args onto the replacement"
+    );
+
+    // The record shows the full argv that actually ran, appended args included.
+    let records = disclosure_records(&cell);
+    let subs = records_with_verb(&records, "substitute");
+    assert_eq!(subs.len(), 1, "{records:#?}");
+    assert_eq!(
+        subs[0]["detail"].as_str(),
+        Some("/bin/echo wrapped a b c"),
+        "{:#?}",
+        subs[0]
+    );
+}
+
 #[test]
 fn rewrite_catches_a_find_string_split_across_reads() {
     let Some(_engine) = require_containers() else {
@@ -2895,6 +2948,7 @@ fn a_composed_detonation_arms_the_relay_and_seals_what_it_intercepted() {
                 max_concurrent_handlers: 32,
             }),
         },
+        trust_placement: chamber_run::TrustPlacement::Workspace,
     };
 
     let script = format!(
@@ -3035,6 +3089,7 @@ fn a_composed_detonation_seals_a_record_whose_argv0_is_not_valid_utf8() {
                 max_concurrent_handlers: 32,
             }),
         },
+        trust_placement: chamber_run::TrustPlacement::Workspace,
     };
 
     // JSON `\\377` decodes to the two-character shell escape `\377`, which
@@ -3141,6 +3196,7 @@ fn an_exec_consequence_against_a_relayless_guest_image_refuses_to_arm() {
                 max_concurrent_handlers: 32,
             }),
         },
+        trust_placement: chamber_run::TrustPlacement::Workspace,
     };
     let mut turns =
         ScriptedTurns::from_bytes("refusal", br#"[{"do": "conclude"}]"#).expect("parse");

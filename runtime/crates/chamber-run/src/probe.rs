@@ -229,6 +229,7 @@ pub async fn run_probe(
                 consequence: plan.consequence.clone(),
                 exec_consequence: None,
             },
+            trust_placement: crate::run::TrustPlacement::default(),
         };
 
         let epilogue = crate::run::run_detonation(&arm_plan, driver.as_mut())

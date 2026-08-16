@@ -80,6 +80,9 @@ async fn main() -> ExitCode {
         // The scripted detonator refuses, as it always has. Consequence mode is
         // an instrument for live runs, and belongs to chamber-detonate-live.
         realism: chamber_capture::RealismProfile::default(),
+        // The scripted CI detonator stays on the /work placement its checked-in
+        // scripts and containment asserts were verified against.
+        trust_placement: chamber_run::TrustPlacement::Workspace,
     };
 
     match run_detonation(&plan, &mut turns).await {
