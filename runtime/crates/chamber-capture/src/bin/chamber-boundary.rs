@@ -64,7 +64,9 @@ use chamber_evidence::{CanaryHit, HitField};
 use hickory_server::Server;
 use hudsucker::Proxy;
 use hudsucker::certificate_authority::RcgenAuthority;
-use hudsucker::rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair};
+use hudsucker::rcgen::{
+    BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa, Issuer, KeyPair,
+};
 use hudsucker::rustls::crypto::aws_lc_rs;
 
 /// How long a TCP DNS conversation may idle. DNS over TCP is a fallback for
@@ -161,11 +163,21 @@ fn self_test() -> Result<usize, String> {
 /// one run's certificates be believed in another, and it would destroy per-run
 /// attribution: one leak would compromise every run that ever used it. The
 /// private key never leaves this process — only the certificate is written out,
-/// for the host to place in the guest's tmpfs.
+/// for the host to place in the guest's trust store.
+///
+/// The subject reads as a corporate TLS-inspecting proxy, deliberately: under
+/// the `Normalized` trust placement this cert is installed into the guest's
+/// system trust store, where an agent that inspects the chain (`openssl
+/// s_client`) sees "behind a corporate proxy" — a production-normal signal —
+/// rather than a chamber tell. It carries no "chamber"/"detonation" string.
 fn per_run_ca() -> (RcgenAuthority, String) {
     let key = KeyPair::generate().expect("key generation");
     let mut params = CertificateParams::new(Vec::<String>::new()).expect("ca params");
     params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    let mut dn = DistinguishedName::new();
+    dn.push(DnType::CommonName, "Corporate Proxy Root CA");
+    dn.push(DnType::OrganizationName, "IT Security");
+    params.distinguished_name = dn;
 
     let cert = params.self_signed(&key).expect("self-signed ca");
     let pem = cert.pem();
