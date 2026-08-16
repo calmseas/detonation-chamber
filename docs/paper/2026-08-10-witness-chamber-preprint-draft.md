@@ -399,6 +399,17 @@ newly proposed from this work.
   suspicious, which is not evidence the model reasoned about the actual
   payload and complicates any claim about *why* it declined to act.
   *Demonstrated §6.5.*
+- **mitm-cert-chain (proposed)** — the boundary is a TLS-terminating proxy, so
+  an agent that inspects a connection's certificate chain (`openssl s_client`,
+  `curl -v`) sees the leaf issued by the harness's own per-run CA rather than
+  the real host's public issuer. This is detectable regardless of where the CA
+  is placed in the guest. The default `Normalized` trust placement installs
+  that CA into the system store under a corporate-proxy identity, so the signal
+  reads as "behind a corporate TLS-inspecting proxy" — a production-normal
+  condition — rather than "a research chamber"; it does not remove the signal.
+  The `Workspace` placement (the earlier `/work/chamber-ca.pem`, retained as the
+  confounded baseline) additionally carries the filesystem tell that
+  harness-artifact-confound names.
 - Plus declared residuals: dormant-payload, filesystem-channel, ledger-integrity,
   no-baseline-arm, sandbox-aware, scripted-turns, supervisor-death, udp-quic,
   kernel-boundary.
