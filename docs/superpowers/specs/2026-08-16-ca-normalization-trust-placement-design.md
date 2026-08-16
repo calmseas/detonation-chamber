@@ -108,25 +108,25 @@ the variant unchanged. `Normalized` is the new default.
 
 Building on the verified facts above and the isolation layer's existing
 primitives (`ContainerSpec.tmpfs` is already a list of mount paths; the rootfs
-is `read_only: true` and stays that way):
+is `read_only: true` and stays that way). No guest-image Dockerfile change is
+needed, because `update-ca-certificates` rebuilds the trust store from the
+already-present, read-only source dir `/usr/share/ca-certificates/mozilla`
+(the 145 mozilla certs the `ca-certificates` package ships) plus the local
+drop-in dir — verified live: wiping `/etc/ssl/certs`, adding one drop-in, and
+running `update-ca-certificates` rebuilds a 146-cert bundle.
 
-1. **Build-time backup.** Each guest image bakes a read-only copy of its
-   original trust material at `/opt/ca-baseline` (a shared Dockerfile snippet:
-   `cp -a /etc/ssl/certs /opt/ca-baseline`, plus `/usr/local/share/ca-certificates`
-   if non-empty). This survives the tmpfs shadow in step 2 and is what re-seeds
-   the realistic 145 certs.
-2. **Writable trust dirs via tmpfs.** At cell creation, `AgentCell::start` adds
+1. **Writable trust dirs via tmpfs.** At cell creation, `AgentCell::start` adds
    tmpfs mounts over `/etc/ssl/certs` and `/usr/local/share/ca-certificates` (the
-   same `ContainerSpec.tmpfs` mechanism `/work` already uses). The rootfs
-   remains read-only; only these two dirs become writable, and only in the cell.
-3. **Startup seed + install.** Before the first agent turn — in the same
-   arming-time window that currently writes the `/work` anchor — the harness
-   execs, in order: restore `/opt/ca-baseline` into the now-empty tmpfs
-   `/etc/ssl/certs`; write the fresh per-run CA into
-   `/usr/local/share/ca-certificates/corporate-proxy-ca.crt`; run
-   `update-ca-certificates`. The cert bytes are delivered via the existing
-   `exec_with_stdin` path that writes the `/work` anchor today, not inline in an
-   argv.
+   same `ContainerSpec.tmpfs` mechanism `/work` already uses). Both become empty
+   and writable; the rootfs stays read-only, and the mozilla source dir
+   `/usr/share/ca-certificates` is untouched (not mounted over). Only these two
+   dirs become writable, and only in the cell.
+2. **Startup install.** Before the first agent turn — in the same arming-time
+   window that currently writes the `/work` anchor — the harness writes the
+   fresh per-run CA into `/usr/local/share/ca-certificates/corporate-proxy-ca.crt`
+   (via the existing `write_file`/`exec_with_stdin` path, not inline in an argv)
+   and runs `update-ca-certificates`, which rebuilds `/etc/ssl/certs` from the
+   read-only mozilla source (145) plus our drop-in (1) = 146.
 
 Failure of any step is an `ArmingRefusal` (fail-closed, like the current anchor
 placement) — a normalized run that could not establish trust must not proceed as
@@ -199,7 +199,7 @@ placement path — the layer a `docker exec stub` smoke test bypasses):
    with **no** CA env var (curl via the system store) — proving the install
    established trust, not merely hid a file.
 3. **Corporate-proxy identity:** the installed cert's subject reads as a
-   corporate proxy and sits among the seeded ~145 siblings, not alone.
+   corporate proxy and sits among the ~145 rebuilt siblings, not alone.
 4. **`Workspace` mode intact:** the `/work` placement still holds when explicitly
    selected — the baseline arm is reproducible.
 5. **`append_original_args` behavioral:** a wrapped command receives the caller's
@@ -237,8 +237,17 @@ New gap-taxonomy entry:
 - Motivated by the adversarial review outcome
   (`agenticpractices:observation:0i3batvp599onm09nyat`) and the §6.5
   harness-artifact-confound finding it targets.
-- Touches: `chamber-isolation/src/env.rs` (`place_trust_anchor` → placement
-  modes) and `cell.rs` (tmpfs wiring); `chamber-capture/src/bin/chamber-boundary.rs`
-  (`per_run_ca` identity); `chamber-run` (`RealismProfile`, bundle field, the
-  revert); the two `chamber-model` entrypoints (mode selection); guest image
-  Dockerfiles (`/opt/ca-baseline` backup); `chamber-e2e` tests.
+- Touches: `chamber-isolation/src/env.rs` (a normalized-trust env method +
+  extra-tmpfs declaration) and `cell.rs` (tmpfs wiring);
+  `chamber-capture/src/bin/chamber-boundary.rs` (`per_run_ca` identity);
+  `chamber-run` (`TrustPlacement` enum on `DetonationPlan`, the arming-time
+  install branch, bundle field, the revert); the two `chamber-model` entrypoints
+  (mode selection); `chamber-e2e` tests. No guest-image Dockerfile change — the
+  system trust store rebuilds from the already-present mozilla source dir.
+
+**Crate-boundary note:** `chamber-isolation` does not depend on
+`chamber-capture`, so `TrustPlacement` lives in `chamber-run` (on
+`DetonationPlan`, beside `realism`) rather than on `RealismProfile`. `env.rs`
+exposes the two placement *mechanisms* (the existing `place_trust_anchor` for
+`Workspace`; a new normalized-trust env method for `Normalized`) and `chamber-run`
+owns the *policy* (which mode, from the knob).
