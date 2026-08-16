@@ -297,7 +297,19 @@ pub struct EnvDraft {
     /// Recorded so the cell mounts its tmpfs exactly where these variables
     /// point. See [`EnvDraft::redirect_scratch`].
     scratch_root: Option<PathBuf>,
+    /// Extra writable tmpfs mounts the cell must create, beyond the scratch
+    /// root. Used by the `Normalized` trust placement to make the system trust
+    /// store writable on the otherwise read-only rootfs. See
+    /// [`EnvDraft::mount_writable`].
+    extra_tmpfs: Vec<PathBuf>,
 }
+
+/// The guest's standard system trust bundle. Under the `Normalized` trust
+/// placement the per-run CA is installed into the store that produces this
+/// file, and the runtimes that carry their own bundle
+/// ([`EnvDraft::steer_managed_trust`]) are steered here — a value real
+/// corporate-proxy boxes use, not a `/work` tell.
+pub const SYSTEM_CA_BUNDLE: &str = "/etc/ssl/certs/ca-certificates.crt";
 
 /// Redacted: values here include planted canaries.
 impl fmt::Debug for EnvDraft {
@@ -370,6 +382,45 @@ impl EnvDraft {
         Ok(())
     }
 
+    /// Declares an extra writable tmpfs mount the cell must create.
+    ///
+    /// The rootfs is read-only; a path that must be written during the run —
+    /// the system trust store, under the `Normalized` placement — becomes
+    /// writable only by mounting an (empty) tmpfs over it. Recorded here rather
+    /// than passed separately for the same reason the scratch root is: the
+    /// mount and the code that writes into it must agree, and nothing would
+    /// notice if they drifted. Idempotent by convention; the caller declares
+    /// each path once.
+    pub fn mount_writable(&mut self, path: &Path) {
+        self.extra_tmpfs.push(path.to_owned());
+    }
+
+    /// Steers the runtimes that carry their own trust bundle at the system
+    /// store, for the `Normalized` placement.
+    ///
+    /// `curl`/`wget`/`git`/`openssl` and Python's stdlib `ssl` read the system
+    /// store natively, so they need no variable. `requests`/certifi and Node
+    /// use embedded bundles and must be pointed at it — but at the STANDARD
+    /// bundle path ([`SYSTEM_CA_BUNDLE`]), which now genuinely contains the
+    /// per-run CA and is a value real corporate boxes use. Deliberately does
+    /// NOT bind `SSL_CERT_FILE`/`CURL_CA_BUNDLE`: setting those would re-point
+    /// tools that already trust the store, and a var naming a lone custom cert
+    /// is the tell this placement exists to remove.
+    ///
+    /// # Errors
+    /// [`BindError`] if either variable is already bound.
+    pub fn steer_managed_trust(&mut self) -> Result<(), BindError> {
+        let why = Rationale {
+            reason: "runtimes with an embedded bundle trust the per-run CA via the system store",
+            required_by: "chamber-isolation::EnvDraft::steer_managed_trust",
+        };
+        for var in ["REQUESTS_CA_BUNDLE", "NODE_EXTRA_CA_CERTS"] {
+            let name = VarName::parse(var).expect("literal name is well-formed");
+            self.set(name, SYSTEM_CA_BUNDLE.to_owned(), why)?;
+        }
+        Ok(())
+    }
+
     /// Steers TLS trust at the per-run CA.
     ///
     /// The certificate is written into the cell's tmpfs and pointed at by
@@ -435,6 +486,7 @@ impl EnvDraft {
         Ok(SealedEnv {
             bindings: self.bindings,
             scratch_root: self.scratch_root,
+            extra_tmpfs: self.extra_tmpfs,
         })
     }
 }
@@ -443,6 +495,7 @@ impl EnvDraft {
 pub struct SealedEnv {
     bindings: BTreeMap<VarName, (String, Rationale)>,
     scratch_root: Option<PathBuf>,
+    extra_tmpfs: Vec<PathBuf>,
 }
 
 /// Redacted: this is the type that holds planted canaries.
@@ -506,6 +559,15 @@ impl SealedEnv {
     #[must_use]
     pub fn scratch_root(&self) -> Option<&Path> {
         self.scratch_root.as_deref()
+    }
+
+    /// Extra writable tmpfs mounts the cell must create beyond the scratch
+    /// root — the `Normalized` trust placement's writable system-store dirs.
+    /// The cell reads this rather than being told separately, so the mounts
+    /// and the code that writes into them cannot drift apart.
+    #[must_use]
+    pub fn extra_tmpfs(&self) -> &[PathBuf] {
+        &self.extra_tmpfs
     }
 
     /// Whether a variable of this name is bound, without exposing its value.
@@ -779,6 +841,51 @@ mod tests {
             .seal(&CanaryPlacements::none())
             .expect("seal");
         assert_eq!(sealed.scratch_root(), None);
+    }
+
+    /// The `Normalized` placement steers only the two embedded-bundle runtimes,
+    /// at the STANDARD bundle path — and never `SSL_CERT_FILE`/`CURL_CA_BUNDLE`,
+    /// whose presence naming a lone custom cert is the tell being removed.
+    #[test]
+    fn steer_managed_trust_binds_only_the_two_bundle_vars() {
+        let mut draft = EnvDraft::empty();
+        draft.steer_managed_trust().expect("steer");
+        let sealed = draft.seal(&CanaryPlacements::none()).expect("seal");
+        // Same-crate test: read the private bindings directly to assert the
+        // value, not just presence.
+        let get = |n: &str| {
+            sealed
+                .bindings
+                .iter()
+                .find(|(k, _)| k.as_str() == n)
+                .map(|(_, (v, _))| v.clone())
+        };
+        assert_eq!(get("REQUESTS_CA_BUNDLE").as_deref(), Some(SYSTEM_CA_BUNDLE));
+        assert_eq!(
+            get("NODE_EXTRA_CA_CERTS").as_deref(),
+            Some(SYSTEM_CA_BUNDLE)
+        );
+        // Never SSL_CERT_FILE / CURL_CA_BUNDLE — a var naming a lone custom
+        // cert is the tell this placement removes.
+        assert_eq!(get("SSL_CERT_FILE"), None);
+        assert_eq!(get("CURL_CA_BUNDLE"), None);
+    }
+
+    /// The extra writable-tmpfs mounts survive sealing, so the cell creates the
+    /// `Normalized` placement's system-store dirs.
+    #[test]
+    fn extra_tmpfs_survives_sealing() {
+        let mut draft = EnvDraft::empty();
+        draft.mount_writable(Path::new("/etc/ssl/certs"));
+        draft.mount_writable(Path::new("/usr/local/share/ca-certificates"));
+        let sealed = draft.seal(&CanaryPlacements::none()).expect("seal");
+        assert_eq!(
+            sealed.extra_tmpfs(),
+            &[
+                PathBuf::from("/etc/ssl/certs"),
+                PathBuf::from("/usr/local/share/ca-certificates"),
+            ]
+        );
     }
 
     #[test]

@@ -109,11 +109,15 @@ impl AgentCell {
             // Taken from the sealed environment rather than from a separate
             // parameter: the tmpfs must be exactly where TMPDIR and HOME point,
             // and a mismatch would surface as the artefact failing to write
-            // rather than as the misconfiguration it actually is.
+            // rather than as the misconfiguration it actually is. The extra
+            // mounts carry the `Normalized` trust placement's writable
+            // system-store dirs (/etc/ssl/certs, /usr/local/share/ca-certificates)
+            // on the otherwise read-only rootfs, declared the same way.
             tmpfs: env
                 .scratch_root()
                 .map(|root| root.display().to_string())
                 .into_iter()
+                .chain(env.extra_tmpfs().iter().map(|p| p.display().to_string()))
                 .collect(),
             // Empty, and there is no code path that fills it. A mount here
             // would hand the artefact a handle on host state.
