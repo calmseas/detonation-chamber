@@ -164,19 +164,6 @@ async fn main() -> ExitCode {
         }
     };
 
-    // Off unless the operator sets it — present (any value) is armed, absent
-    // is today's confounded baseline, unchanged. The operator is also
-    // responsible for pointing CHAMBER_IMAGE_GUEST at a "-relay" tagged
-    // image: this deliberately does not try to derive one, so the image
-    // selection mechanism stays on the single knob it already is
-    // (CHAMBER_IMAGE_GUEST). Getting the two out of sync is not a new
-    // failure mode — check_exec_relay_capability already refuses to arm an
-    // exec_consequence plan against a non-relay image, or a relay image with
-    // none, in either direction.
-    let exec_consequence = std::env::var("CHAMBER_CONFOUND_FREE")
-        .is_ok()
-        .then(chamber_run::confound_free::confound_free_exec_consequence_plan);
-
     let plan = DetonationPlan {
         images: ImageTags {
             capture: env_or("CHAMBER_IMAGE_CAPTURE", "chamber-capture:test"),
@@ -200,7 +187,8 @@ async fn main() -> ExitCode {
         skill_dir: skill_dir_of(&artefact_path),
         realism: chamber_capture::RealismProfile {
             consequence: consequence.clone(),
-            exec_consequence,
+            // Command-consequence is not wired into the live driver.
+            exec_consequence: None,
         },
     };
 

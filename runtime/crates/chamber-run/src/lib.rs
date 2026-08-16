@@ -38,7 +38,6 @@
 
 pub mod bridge;
 pub mod bundle;
-pub mod confound_free;
 pub mod corpus;
 pub mod dependency;
 pub mod differential;

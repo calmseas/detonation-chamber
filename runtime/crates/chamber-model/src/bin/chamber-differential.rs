@@ -398,17 +398,8 @@ async fn main() -> ExitCode {
         }],
         max_turns,
         consequence,
-        // Off unless the operator sets it — present (any value) is armed.
-        // Both arms get the identical plan (arm_detonation_plan already
-        // propagates it), for the same reason `consequence` above is one
-        // field, not per-role: the boundary is part of the environment both
-        // arms meet, not the artefact under test. CHAMBER_IMAGE_GUEST must
-        // separately point at a "-relay" tagged image when this is set — see
-        // chamber-detonate-live.rs's identical wiring for why that is not
-        // derived here.
-        exec_consequence: std::env::var("CHAMBER_CONFOUND_FREE")
-            .is_ok()
-            .then(chamber_run::confound_free::confound_free_exec_consequence_plan),
+        // No CLI wiring configures exec-interception for the differential.
+        exec_consequence: None,
     };
 
     if let Err(e) = std::fs::create_dir_all(&evidence_root) {
